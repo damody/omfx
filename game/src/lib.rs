@@ -68,9 +68,15 @@ const ENEMY_SPEED: f32 = 2.0;
 const SPAWN_INTERVAL: f32 = 1.5;
 const ENEMIES_PER_WAVE: i32 = 8;
 
-// Z layers: all at Z=0 like official 2D example.
-// 2D shader uses Forward pass, layering via draw order (node creation order).
-const Z_LAYER: f32 = 0.0;
+// Z layers: smaller Z = closer to camera (near plane) = renders on top.
+// Camera at Z=0, z_near=-0.1. Objects closer to z_near win depth test.
+const Z_BULLET: f32 = 0.000;
+const Z_HP_BAR: f32 = 0.0005;
+const Z_ENEMY: f32 = 0.001;
+const Z_TOWER: f32 = 0.002;
+const Z_GRID_CELL: f32 = 0.003;
+const Z_PATH: f32 = 0.004;
+const Z_BACKGROUND: f32 = 0.005;
 
 // ---------------------------------------------------------------------------
 // Game Plugin
@@ -116,6 +122,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     mouse_world_pos: Vector2<f32>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    window_size: Vector2<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,9 +138,12 @@ struct TowerData {
 struct EnemyData {
     node: Handle<Node>,
     hp: f32,
+    max_hp: f32,
     speed: f32,
     waypoint_index: usize,
     pos: Vector2<f32>,
+    hp_bar_bg: Handle<Node>,
+    hp_bar_fg: Handle<Node>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +169,7 @@ impl Plugin for Game {
         self.enemies_alive = 0;
         self.wave_delay = 2.0;
         self.game_over = false;
+        self.window_size = Vector2::new(800.0, 600.0);
 
         self.grid = vec![vec![true; GRID_COLS]; GRID_ROWS];
         mark_path_cells(&mut self.grid);
@@ -201,7 +214,7 @@ impl Plugin for Game {
         RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
-                    .with_local_position(Vector3::new(0.0, 0.0, Z_LAYER))
+                    .with_local_position(Vector3::new(0.0, 0.0, Z_BACKGROUND))
                     .with_local_scale(Vector3::new(14.0, 10.0, f32::EPSILON))
                     .build(),
             ),
@@ -220,7 +233,7 @@ impl Plugin for Game {
                     RectangleBuilder::new(
                         BaseBuilder::new().with_local_transform(
                             TransformBuilder::new()
-                                .with_local_position(Vector3::new(cx, cy, Z_LAYER))
+                                .with_local_position(Vector3::new(cx, cy, Z_GRID_CELL))
                                 .with_local_scale(Vector3::new(
                                     CELL_SIZE * 0.9,
                                     CELL_SIZE * 0.9,
@@ -307,7 +320,7 @@ impl Plugin for Game {
                 let node = RectangleBuilder::new(
                     BaseBuilder::new().with_local_transform(
                         TransformBuilder::new()
-                            .with_local_position(Vector3::new(start.0, start.1, Z_LAYER))
+                            .with_local_position(Vector3::new(start.0, start.1, Z_ENEMY))
                             .with_local_scale(Vector3::new(0.3, 0.3, f32::EPSILON))
                             .build(),
                     ),
@@ -348,7 +361,7 @@ impl Plugin for Game {
                 enemy.pos += movement;
                 scene.graph[enemy.node]
                     .local_transform_mut()
-                    .set_position(Vector3::new(enemy.pos.x, enemy.pos.y, Z_LAYER));
+                    .set_position(Vector3::new(enemy.pos.x, enemy.pos.y, Z_ENEMY));
             }
         }
 
@@ -381,7 +394,7 @@ impl Plugin for Game {
                                 .with_local_position(Vector3::new(
                                     tower.pos.x,
                                     tower.pos.y,
-                                    Z_LAYER,
+                                    Z_BULLET,
                                 ))
                                 .with_local_scale(Vector3::new(0.1, 0.1, f32::EPSILON))
                                 .build(),
@@ -424,7 +437,7 @@ impl Plugin for Game {
                 bullet.pos += movement;
                 scene.graph[bullet.node]
                     .local_transform_mut()
-                    .set_position(Vector3::new(bullet.pos.x, bullet.pos.y, Z_LAYER));
+                    .set_position(Vector3::new(bullet.pos.x, bullet.pos.y, Z_BULLET));
             }
         }
 
@@ -495,14 +508,20 @@ impl Plugin for Game {
 
         match event {
             Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } => {
+                self.window_size = Vector2::new(size.width as f32, size.height as f32);
+            }
+            Event::WindowEvent {
                 event: WindowEvent::CursorMoved { position, .. },
                 ..
             } => {
                 self.mouse_world_pos = screen_to_world_approx(
                     position.x as f32,
                     position.y as f32,
-                    800.0,
-                    600.0,
+                    self.window_size.x,
+                    self.window_size.y,
                     10.0,
                 );
             }
@@ -527,7 +546,7 @@ impl Plugin for Game {
                             let node: Handle<Node> = RectangleBuilder::new(
                                 BaseBuilder::new().with_local_transform(
                                     TransformBuilder::new()
-                                        .with_local_position(Vector3::new(cx, cy, Z_LAYER))
+                                        .with_local_position(Vector3::new(cx, cy, Z_TOWER))
                                         .with_local_scale(Vector3::new(0.4, 0.4, f32::EPSILON))
                                         .build(),
                                 ),
@@ -590,7 +609,7 @@ fn screen_to_world_approx(
 ) -> Vector2<f32> {
     let aspect = window_w / window_h;
     let world_width = world_height * aspect;
-    let wx = (screen_x / window_w - 0.5) * world_width;
+    let wx = -(screen_x / window_w - 0.5) * world_width;
     let wy = -(screen_y / window_h - 0.5) * world_height;
     Vector2::new(wx, wy)
 }
@@ -635,7 +654,7 @@ fn draw_path(scene: &mut Scene) {
             RectangleBuilder::new(
                 BaseBuilder::new().with_local_transform(
                     TransformBuilder::new()
-                        .with_local_position(Vector3::new(px, py, Z_LAYER))
+                        .with_local_position(Vector3::new(px, py, Z_PATH))
                         .with_local_scale(Vector3::new(0.8, 0.8, f32::EPSILON))
                         .build(),
                 ),
