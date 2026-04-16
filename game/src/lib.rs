@@ -329,12 +329,41 @@ impl Plugin for Game {
                 .build(&mut scene.graph)
                 .transmute();
 
+                let bar_y = start.1 + 0.25;
+                let hp_bar_bg = RectangleBuilder::new(
+                    BaseBuilder::new().with_local_transform(
+                        TransformBuilder::new()
+                            .with_local_position(Vector3::new(start.0, bar_y, Z_HP_BAR))
+                            .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
+                            .build(),
+                    ),
+                )
+                .with_color(Color::from_rgba(40, 40, 40, 200))
+                .build(&mut scene.graph)
+                .transmute();
+
+                let hp_bar_fg = RectangleBuilder::new(
+                    BaseBuilder::new().with_local_transform(
+                        TransformBuilder::new()
+                            .with_local_position(Vector3::new(start.0, bar_y, Z_HP_BAR - 0.0001))
+                            .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
+                            .build(),
+                    ),
+                )
+                .with_color(Color::from_rgba(0, 220, 0, 255))
+                .build(&mut scene.graph)
+                .transmute();
+
+                let enemy_max_hp = ENEMY_HP + (self.wave as f32 - 1.0) * 20.0;
                 self.enemies.push(EnemyData {
                     node,
-                    hp: ENEMY_HP + (self.wave as f32 - 1.0) * 20.0,
+                    hp: enemy_max_hp,
+                    max_hp: enemy_max_hp,
                     speed: ENEMY_SPEED,
                     waypoint_index: 1,
                     pos: Vector2::new(start.0, start.1),
+                    hp_bar_bg,
+                    hp_bar_fg,
                 });
             }
         }
@@ -363,6 +392,29 @@ impl Plugin for Game {
                     .local_transform_mut()
                     .set_position(Vector3::new(enemy.pos.x, enemy.pos.y, Z_ENEMY));
             }
+
+            // Update health bar position & width
+            let bar_y = enemy.pos.y + 0.25;
+            let hp_ratio = (enemy.hp / enemy.max_hp).clamp(0.0, 1.0);
+            let bar_width = 0.4;
+
+            scene.graph[enemy.hp_bar_bg]
+                .local_transform_mut()
+                .set_position(Vector3::new(enemy.pos.x, bar_y, Z_HP_BAR));
+
+            let fg_width = bar_width * hp_ratio;
+            let fg_offset = (bar_width - fg_width) * 0.5;
+            scene.graph[enemy.hp_bar_fg]
+                .local_transform_mut()
+                .set_position(Vector3::new(enemy.pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
+                .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
+
+            // Color: green → yellow → red
+            let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
+            let g = (hp_ratio * 2.0).min(1.0);
+            scene.graph[enemy.hp_bar_fg]
+                .as_rectangle_mut()
+                .set_color(Color::from_rgba((r * 255.0) as u8, (g * 255.0) as u8, 0, 255));
         }
 
         for &i in enemies_to_remove.iter().rev() {
