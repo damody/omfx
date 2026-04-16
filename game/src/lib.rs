@@ -1,4 +1,7 @@
-//! omfx - 2D Tower Defense Game (Fyrox 1.0)
+//! omfx - 2D Tower Defense Network Renderer (Fyrox 1.0)
+//!
+//! Pure network renderer: all game state driven by omb backend via gRPC.
+//! No local game logic — entities are created/moved/deleted by server events.
 #![allow(warnings)]
 
 use fyrox::graph::prelude::*;
@@ -30,20 +33,17 @@ use fyrox::{
     },
 };
 
+use std::collections::{HashMap, BinaryHeap};
+use std::cmp::{Ordering, Reverse};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use omoba_core::GameEventData;
+
 pub use fyrox;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const WAYPOINTS: &[(f32, f32)] = &[
-    (-6.0, 2.0),
-    (-2.0, 2.0),
-    (-2.0, -1.0),
-    (2.0, -1.0),
-    (2.0, 2.0),
-    (6.0, 2.0),
-];
 
 const GRID_COLS: usize = 12;
 const GRID_ROWS: usize = 8;
@@ -51,25 +51,7 @@ const CELL_SIZE: f32 = 1.0;
 const GRID_ORIGIN_X: f32 = -6.0;
 const GRID_ORIGIN_Y: f32 = -4.0;
 
-const TOWER_COST: i32 = 20;
-const ENEMY_REWARD: i32 = 10;
-const INITIAL_GOLD: i32 = 100;
-const INITIAL_LIVES: i32 = 20;
-
-const TOWER_RANGE: f32 = 2.5;
-const TOWER_DAMAGE: f32 = 25.0;
-const TOWER_ATTACK_INTERVAL: f32 = 1.0;
-
-const BULLET_SPEED: f32 = 8.0;
-
-const ENEMY_HP: f32 = 100.0;
-const ENEMY_SPEED: f32 = 2.0;
-
-const SPAWN_INTERVAL: f32 = 1.5;
-const ENEMIES_PER_WAVE: i32 = 8;
-
 // Z layers: smaller Z = closer to camera (near plane) = renders on top.
-// Camera at Z=0, z_near=-0.1. Objects closer to z_near win depth test.
 const Z_BULLET: f32 = 0.000;
 const Z_HP_BAR: f32 = 0.0005;
 const Z_ENEMY: f32 = 0.001;
@@ -79,6 +61,294 @@ const Z_PATH: f32 = 0.004;
 const Z_BACKGROUND: f32 = 0.005;
 
 // ---------------------------------------------------------------------------
+// Network Types
+// ---------------------------------------------------------------------------
+
+/// Frontend → Backend command
+enum NetCommand {
+    PlaceTower { x: f32, y: f32 },
+    HeroMove { x: f32, y: f32 },
+}
+
+/// Timestamped backend event (for sorted buffering)
+#[derive(Debug)]
+struct TimestampedEvent {
+    timestamp_ms: u64,
+    msg_type: String,
+    action: String,
+    data: serde_json::Value,
+}
+
+impl PartialEq for TimestampedEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp_ms == other.timestamp_ms
+    }
+}
+
+impl Eq for TimestampedEvent {}
+
+impl PartialOrd for TimestampedEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimestampedEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp_ms.cmp(&other.timestamp_ms)
+    }
+}
+
+/// Event buffer — sorts by timestamp, delays render_delay before consuming
+#[derive(Debug)]
+struct EventBuffer {
+    heap: BinaryHeap<Reverse<TimestampedEvent>>, // min-heap
+    render_delay_ms: u64,
+    clock_offset_ms: i64,
+    synced: bool,
+}
+
+impl EventBuffer {
+    fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            render_delay_ms: 100,
+            clock_offset_ms: 0,
+            synced: false,
+        }
+    }
+
+    fn push(&mut self, event: TimestampedEvent) {
+        self.heap.push(Reverse(event));
+    }
+
+    /// Calibrate clock using heartbeat timestamp_ms
+    fn sync_clock(&mut self, server_timestamp_ms: u64) {
+        let client_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let new_offset = server_timestamp_ms as i64 - client_now;
+        if self.synced {
+            // Exponential moving average, smooth jitter (alpha = 0.1)
+            self.clock_offset_ms = self.clock_offset_ms + (new_offset - self.clock_offset_ms) / 10;
+        } else {
+            self.clock_offset_ms = new_offset;
+            self.synced = true;
+        }
+    }
+
+    /// Estimate current server time
+    fn server_now_ms(&self) -> u64 {
+        let client_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        (client_now + self.clock_offset_ms) as u64
+    }
+
+    /// Drain all events that are ready to display
+    fn drain_ready(&mut self) -> Vec<TimestampedEvent> {
+        let deadline = self.server_now_ms().saturating_sub(self.render_delay_ms);
+        let mut ready = Vec::new();
+        while let Some(Reverse(evt)) = self.heap.peek() {
+            if evt.timestamp_ms <= deadline {
+                ready.push(self.heap.pop().unwrap().0);
+            } else {
+                break;
+            }
+        }
+        ready
+    }
+}
+
+/// Backend entity → Fyrox scene node mapping
+#[derive(Debug)]
+struct NetworkEntity {
+    entity_type: String,
+    node: Handle<Node>,
+    hp_bar_bg: Option<Handle<Node>>,
+    hp_bar_fg: Option<Handle<Node>>,
+    position: Vector2<f32>,
+    health: Option<(f32, f32)>, // (current, max)
+}
+
+/// Heartbeat info (for UI display)
+#[derive(Default, Debug)]
+struct HeartbeatInfo {
+    tick: u64,
+    game_time: f64,
+    entity_count: u64,
+    hero_count: u64,
+    creep_count: u64,
+}
+
+/// Connection status
+#[derive(Default, Clone, PartialEq, Debug)]
+enum ConnectionStatus {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    Failed(String),
+}
+
+/// Try to spawn the omb backend as a child process.
+fn spawn_backend() -> Option<std::process::Child> {
+    use std::process::{Command, Stdio};
+    use std::path::PathBuf;
+
+    // Find the omb directory (try ../omb and ../../omb relative to exe)
+    let candidates = [
+        PathBuf::from("../omb"),
+        PathBuf::from("../../omb"),
+    ];
+
+    let omb_dir = candidates.iter().find(|p| p.join("game.toml").exists());
+    let omb_dir = match omb_dir {
+        Some(d) => d.clone(),
+        None => {
+            log::warn!("Cannot find omb directory (no game.toml found), skipping backend spawn");
+            return None;
+        }
+    };
+
+    log::info!("Auto-starting backend from {:?}...", omb_dir);
+
+    // Try pre-built binary first
+    let exe_path = omb_dir.join("target/debug/omobab.exe");
+    let result = if exe_path.exists() {
+        Command::new(&exe_path)
+            .current_dir(&omb_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+    } else {
+        log::info!("Pre-built binary not found, falling back to cargo run...");
+        Command::new("cargo")
+            .args(["run", "--features", "grpc"])
+            .current_dir(&omb_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+    };
+
+    match result {
+        Ok(child) => {
+            log::info!("Backend process spawned (PID: {})", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            log::error!("Failed to spawn backend: {}", e);
+            None
+        }
+    }
+}
+
+/// Sync/Async bridge
+#[derive(Debug)]
+struct NetworkBridge {
+    event_rx: crossbeam_channel::Receiver<TimestampedEvent>,
+    cmd_tx: crossbeam_channel::Sender<NetCommand>,
+    status_rx: crossbeam_channel::Receiver<ConnectionStatus>,
+}
+
+impl NetworkBridge {
+    fn spawn(server_addr: String, player_name: String) -> Self {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<NetCommand>();
+        let (status_tx, status_rx) = crossbeam_channel::unbounded();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let _ = status_tx.send(ConnectionStatus::Connecting);
+
+                // Retry connection (backend may still be starting up)
+                let mut client = {
+                    let max_retries = 15;
+                    let mut last_err = String::new();
+                    let mut connected = None;
+                    for attempt in 0..max_retries {
+                        let delay_ms = (500 + attempt * 500).min(2000) as u64;
+                        match omoba_core::GrpcClient::connect(&server_addr, player_name.clone()).await {
+                            Ok(c) => {
+                                connected = Some(c);
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = e.to_string();
+                                log::info!("Connection attempt {}/{} failed: {}, retrying in {}ms...",
+                                    attempt + 1, max_retries, last_err, delay_ms);
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+                        }
+                    }
+                    match connected {
+                        Some(c) => {
+                            let _ = status_tx.send(ConnectionStatus::Connected);
+                            c
+                        }
+                        None => {
+                            let _ = status_tx.send(ConnectionStatus::Failed(
+                                format!("Failed after {} retries: {}", max_retries, last_err)));
+                            return;
+                        }
+                    }
+                };
+
+                let mut grpc_rx = match client.subscribe_events().await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        let _ = status_tx.send(ConnectionStatus::Failed(e.to_string()));
+                        return;
+                    }
+                };
+
+                // Event relay: tokio mpsc → crossbeam
+                let event_tx_clone = event_tx.clone();
+                let relay_events = tokio::spawn(async move {
+                    while let Some(evt) = grpc_rx.recv().await {
+                        if event_tx_clone.send(TimestampedEvent {
+                            timestamp_ms: evt.timestamp_ms,
+                            msg_type: evt.msg_type,
+                            action: evt.action,
+                            data: evt.data,
+                        }).is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Command relay: crossbeam → gRPC
+                let relay_commands = tokio::spawn(async move {
+                    loop {
+                        match cmd_rx.try_recv() {
+                            Ok(cmd) => match cmd {
+                                NetCommand::PlaceTower { x, y } => {
+                                    let _ = client.send_command("tower", "create",
+                                        serde_json::json!({"x": x, "y": y})).await;
+                                }
+                                NetCommand::HeroMove { x, y } => {
+                                    let _ = client.send_command("player", "move",
+                                        serde_json::json!({"x": x, "y": y})).await;
+                                }
+                            },
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                });
+
+                let _ = tokio::join!(relay_events, relay_commands);
+            });
+        });
+
+        NetworkBridge { event_rx, cmd_tx, status_rx }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Game Plugin
 // ---------------------------------------------------------------------------
 
@@ -86,73 +356,31 @@ const Z_BACKGROUND: f32 = 0.005;
 #[reflect(non_cloneable)]
 pub struct Game {
     scene: Handle<Scene>,
-    gold: i32,
-    lives: i32,
-    wave: i32,
-    spawn_timer: f32,
-    enemies_to_spawn: i32,
-    enemies_alive: i32,
-    wave_delay: f32,
-    game_over: bool,
     camera: Handle<Node>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    grid: Vec<Vec<bool>>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    towers: Vec<TowerData>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    enemies: Vec<EnemyData>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    bullets: Vec<BulletData>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    ui_gold_text: Handle<Text>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    ui_lives_text: Handle<Text>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    ui_wave_text: Handle<Text>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    ui_gameover_text: Handle<Text>,
-    #[visit(skip)]
-    #[reflect(hidden)]
+    #[visit(skip)] #[reflect(hidden)]
     mouse_world_pos: Vector2<f32>,
-    #[visit(skip)]
-    #[reflect(hidden)]
+    #[visit(skip)] #[reflect(hidden)]
     window_size: Vector2<f32>,
-}
 
-#[derive(Debug, Clone)]
-struct TowerData {
-    node: Handle<Node>,
-    pos: Vector2<f32>,
-    attack_timer: f32,
-}
+    // --- Network ---
+    #[visit(skip)] #[reflect(hidden)]
+    network: Option<NetworkBridge>,
+    #[visit(skip)] #[reflect(hidden)]
+    connection_status: ConnectionStatus,
+    #[visit(skip)] #[reflect(hidden)]
+    event_buffer: Option<EventBuffer>,
+    #[visit(skip)] #[reflect(hidden)]
+    network_entities: HashMap<u32, NetworkEntity>,
+    #[visit(skip)] #[reflect(hidden)]
+    heartbeat: HeartbeatInfo,
 
-#[derive(Debug, Clone)]
-struct EnemyData {
-    node: Handle<Node>,
-    hp: f32,
-    max_hp: f32,
-    speed: f32,
-    waypoint_index: usize,
-    pos: Vector2<f32>,
-    hp_bar_bg: Handle<Node>,
-    hp_bar_fg: Handle<Node>,
-}
+    // --- Backend Process ---
+    #[visit(skip)] #[reflect(hidden)]
+    backend_process: Option<std::process::Child>,
 
-#[derive(Debug, Clone)]
-struct BulletData {
-    node: Handle<Node>,
-    target_enemy_idx: usize,
-    speed: f32,
-    damage: f32,
-    pos: Vector2<f32>,
+    // --- UI ---
+    #[visit(skip)] #[reflect(hidden)]
+    ui_status_text: Handle<Text>,
 }
 
 impl Plugin for Game {
@@ -161,22 +389,11 @@ impl Plugin for Game {
     }
 
     fn init(&mut self, _scene_path: Option<&str>, mut context: PluginContext) -> GameResult {
-        self.gold = INITIAL_GOLD;
-        self.lives = INITIAL_LIVES;
-        self.wave = 0;
-        self.spawn_timer = 0.0;
-        self.enemies_to_spawn = 0;
-        self.enemies_alive = 0;
-        self.wave_delay = 2.0;
-        self.game_over = false;
         self.window_size = Vector2::new(800.0, 600.0);
-
-        self.grid = vec![vec![true; GRID_COLS]; GRID_ROWS];
-        mark_path_cells(&mut self.grid);
 
         let mut scene = Scene::new();
 
-        // 2D rendering: use ambient color lighting, set clear color
+        // 2D rendering options
         use fyrox::scene::SceneRenderingOptions;
         scene.rendering_options.set_value_and_mark_modified(SceneRenderingOptions {
             clear_color: Some(Color::from_rgba(30, 80, 30, 255)),
@@ -186,7 +403,7 @@ impl Plugin for Game {
             ..Default::default()
         });
 
-        // Orthographic 2D camera at origin (like official 2D example)
+        // Orthographic 2D camera
         self.camera = CameraBuilder::new(BaseBuilder::new())
             .with_projection(Projection::Orthographic(OrthographicProjection {
                 z_near: -0.1,
@@ -210,7 +427,7 @@ impl Plugin for Game {
         .with_radius(20.0)
         .build(&mut scene.graph);
 
-        // Background (dark green, furthest layer)
+        // Background (dark green)
         RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
@@ -222,346 +439,106 @@ impl Plugin for Game {
         .with_color(Color::from_rgba(30, 80, 30, 255))
         .build(&mut scene.graph);
 
-        // Draw path (grey)
-        draw_path(&mut scene);
-
-        // Draw placeable grid cells (light green)
-        for row in 0..GRID_ROWS {
-            for col in 0..GRID_COLS {
-                if self.grid[row][col] {
-                    let (cx, cy) = grid_to_world(col, row);
-                    RectangleBuilder::new(
-                        BaseBuilder::new().with_local_transform(
-                            TransformBuilder::new()
-                                .with_local_position(Vector3::new(cx, cy, Z_GRID_CELL))
-                                .with_local_scale(Vector3::new(
-                                    CELL_SIZE * 0.9,
-                                    CELL_SIZE * 0.9,
-                                    f32::EPSILON,
-                                ))
-                                .build(),
-                        ),
-                    )
-                    .with_color(Color::from_rgba(60, 140, 60, 80))
-                    .build(&mut scene.graph);
-                }
-            }
-        }
-
         self.scene = context.scenes.add(scene);
 
-        // Create a UI instance
+        // UI: status text
         context
             .user_interfaces
             .add(UserInterface::new(Default::default()));
         let ui = context.user_interfaces.first_mut();
 
-        self.ui_gold_text = TextBuilder::new(
+        self.ui_status_text = TextBuilder::new(
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(10.0, 10.0))
-                .with_foreground(Brush::Solid(Color::from_rgba(255, 215, 0, 255)).into()),
+                .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
         )
-        .with_text(format!("Gold: {}", self.gold))
-        .with_font_size(20.0.into())
+        .with_text("Connecting...".to_string())
+        .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
 
-        self.ui_lives_text = TextBuilder::new(
-            WidgetBuilder::new()
-                .with_desired_position(Vector2::new(150.0, 10.0))
-                .with_foreground(Brush::Solid(Color::from_rgba(255, 80, 80, 255)).into()),
-        )
-        .with_text(format!("Lives: {}", self.lives))
-        .with_font_size(20.0.into())
-        .build(&mut ui.build_ctx());
+        // Auto-start backend
+        self.backend_process = spawn_backend();
 
-        self.ui_wave_text = TextBuilder::new(
-            WidgetBuilder::new()
-                .with_desired_position(Vector2::new(300.0, 10.0))
-                .with_foreground(Brush::Solid(Color::WHITE).into()),
-        )
-        .with_text("Wave: 0".to_string())
-        .with_font_size(20.0.into())
-        .build(&mut ui.build_ctx());
+        // Network init
+        let server_addr = std::env::var("OMB_GRPC_ADDR")
+            .unwrap_or_else(|_| "http://127.0.0.1:50061".to_string());
+        let player_name = std::env::var("OMB_PLAYER_NAME")
+            .unwrap_or_else(|_| "omfx_player".to_string());
+
+        self.network = Some(NetworkBridge::spawn(server_addr, player_name));
+        self.connection_status = ConnectionStatus::Connecting;
+        self.event_buffer = Some(EventBuffer::new());
+        self.network_entities = HashMap::new();
 
         Ok(())
     }
 
     fn on_deinit(&mut self, _context: PluginContext) -> GameResult {
+        // Drop network bridge (threads will stop when channels disconnect)
+        self.network = None;
+
+        // Kill backend child process
+        if let Some(mut child) = self.backend_process.take() {
+            log::info!("Killing backend process (PID: {})...", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
         Ok(())
     }
 
     fn update(&mut self, context: &mut PluginContext) -> GameResult {
-        if self.game_over {
-            return Ok(());
-        }
-
-        let dt = context.dt;
         let scene = &mut context.scenes[self.scene];
 
-        // --- Wave spawning ---
-        if self.enemies_to_spawn <= 0 && self.enemies_alive <= 0 {
-            self.wave_delay -= dt;
-            if self.wave_delay <= 0.0 {
-                self.wave += 1;
-                self.enemies_to_spawn = ENEMIES_PER_WAVE + (self.wave - 1) * 2;
-                self.spawn_timer = 0.0;
-                self.wave_delay = 3.0;
+        // 1. Check connection status
+        if let Some(ref network) = self.network {
+            while let Ok(status) = network.status_rx.try_recv() {
+                self.connection_status = status;
             }
         }
 
-        if self.enemies_to_spawn > 0 {
-            self.spawn_timer -= dt;
-            if self.spawn_timer <= 0.0 {
-                self.spawn_timer = SPAWN_INTERVAL;
-                self.enemies_to_spawn -= 1;
-                self.enemies_alive += 1;
-
-                let start = WAYPOINTS[0];
-                let node = RectangleBuilder::new(
-                    BaseBuilder::new().with_local_transform(
-                        TransformBuilder::new()
-                            .with_local_position(Vector3::new(start.0, start.1, Z_ENEMY))
-                            .with_local_scale(Vector3::new(0.3, 0.3, f32::EPSILON))
-                            .build(),
-                    ),
-                )
-                .with_color(Color::from_rgba(220, 40, 40, 255))
-                .build(&mut scene.graph)
-                .transmute();
-
-                let bar_y = start.1 + 0.25;
-                let hp_bar_bg = RectangleBuilder::new(
-                    BaseBuilder::new().with_local_transform(
-                        TransformBuilder::new()
-                            .with_local_position(Vector3::new(start.0, bar_y, Z_HP_BAR))
-                            .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
-                            .build(),
-                    ),
-                )
-                .with_color(Color::from_rgba(40, 40, 40, 200))
-                .build(&mut scene.graph)
-                .transmute();
-
-                let hp_bar_fg = RectangleBuilder::new(
-                    BaseBuilder::new().with_local_transform(
-                        TransformBuilder::new()
-                            .with_local_position(Vector3::new(start.0, bar_y, Z_HP_BAR - 0.0001))
-                            .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
-                            .build(),
-                    ),
-                )
-                .with_color(Color::from_rgba(0, 220, 0, 255))
-                .build(&mut scene.graph)
-                .transmute();
-
-                let enemy_max_hp = ENEMY_HP + (self.wave as f32 - 1.0) * 20.0;
-                self.enemies.push(EnemyData {
-                    node,
-                    hp: enemy_max_hp,
-                    max_hp: enemy_max_hp,
-                    speed: ENEMY_SPEED,
-                    waypoint_index: 1,
-                    pos: Vector2::new(start.0, start.1),
-                    hp_bar_bg,
-                    hp_bar_fg,
-                });
-            }
-        }
-
-        // --- Enemy movement ---
-        let mut enemies_to_remove = Vec::new();
-        for (i, enemy) in self.enemies.iter_mut().enumerate() {
-            if enemy.waypoint_index >= WAYPOINTS.len() {
-                enemies_to_remove.push(i);
-                self.lives -= 1;
-                self.enemies_alive -= 1;
-                continue;
-            }
-
-            let target = WAYPOINTS[enemy.waypoint_index];
-            let target_pos = Vector2::new(target.0, target.1);
-            let dir = target_pos - enemy.pos;
-            let dist = dir.norm();
-
-            if dist < 0.05 {
-                enemy.waypoint_index += 1;
-            } else {
-                let movement = dir.normalize() * enemy.speed * dt;
-                enemy.pos += movement;
-                scene.graph[enemy.node]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(enemy.pos.x, enemy.pos.y, Z_ENEMY));
-            }
-
-            // Update health bar position & width
-            let bar_y = enemy.pos.y + 0.25;
-            let hp_ratio = (enemy.hp / enemy.max_hp).clamp(0.0, 1.0);
-            let bar_width = 0.4;
-
-            scene.graph[enemy.hp_bar_bg]
-                .local_transform_mut()
-                .set_position(Vector3::new(enemy.pos.x, bar_y, Z_HP_BAR));
-
-            let fg_width = bar_width * hp_ratio;
-            let fg_offset = (bar_width - fg_width) * 0.5;
-            scene.graph[enemy.hp_bar_fg]
-                .local_transform_mut()
-                .set_position(Vector3::new(enemy.pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
-                .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
-
-            // Color: green → yellow → red
-            let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
-            let g = (hp_ratio * 2.0).min(1.0);
-            scene.graph[enemy.hp_bar_fg]
-                .as_rectangle_mut()
-                .set_color(Color::from_rgba((r * 255.0) as u8, (g * 255.0) as u8, 0, 255));
-        }
-
-        for &i in enemies_to_remove.iter().rev() {
-            let enemy = self.enemies.remove(i);
-            scene.graph.remove_node(enemy.node);
-            scene.graph.remove_node(enemy.hp_bar_bg);
-            scene.graph.remove_node(enemy.hp_bar_fg);
-        }
-
-        // --- Tower attacks ---
-        for tower in self.towers.iter_mut() {
-            tower.attack_timer -= dt;
-            if tower.attack_timer <= 0.0 {
-                let mut closest_idx = None;
-                let mut closest_dist = f32::MAX;
-
-                for (i, enemy) in self.enemies.iter().enumerate() {
-                    let dist = (enemy.pos - tower.pos).norm();
-                    if dist < TOWER_RANGE && dist < closest_dist {
-                        closest_dist = dist;
-                        closest_idx = Some(i);
+        // 2. Receive events from NetworkBridge, push into EventBuffer
+        if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
+            for evt in network.event_rx.try_iter() {
+                // Heartbeat: calibrate clock immediately, don't buffer
+                if evt.msg_type == "heartbeat" && evt.action == "tick" {
+                    buffer.sync_clock(evt.timestamp_ms);
+                    if let Some(delay) = evt.data.get("render_delay_ms").and_then(|v| v.as_u64()) {
+                        buffer.render_delay_ms = delay;
                     }
-                }
-
-                if let Some(target_idx) = closest_idx {
-                    tower.attack_timer = TOWER_ATTACK_INTERVAL;
-
-                    let bullet_node = RectangleBuilder::new(
-                        BaseBuilder::new().with_local_transform(
-                            TransformBuilder::new()
-                                .with_local_position(Vector3::new(
-                                    tower.pos.x,
-                                    tower.pos.y,
-                                    Z_BULLET,
-                                ))
-                                .with_local_scale(Vector3::new(0.1, 0.1, f32::EPSILON))
-                                .build(),
-                        ),
-                    )
-                    .with_color(Color::from_rgba(255, 230, 50, 255))
-                    .build(&mut scene.graph)
-                    .transmute();
-
-                    self.bullets.push(BulletData {
-                        node: bullet_node,
-                        target_enemy_idx: target_idx,
-                        speed: BULLET_SPEED,
-                        damage: TOWER_DAMAGE,
-                        pos: tower.pos,
-                    });
+                    self.heartbeat = parse_heartbeat(&evt.data);
+                } else {
+                    buffer.push(evt);
                 }
             }
-        }
 
-        // --- Bullet movement ---
-        let mut bullets_to_remove = Vec::new();
-        let mut enemy_damage: Vec<(usize, f32)> = Vec::new();
-
-        for (bi, bullet) in self.bullets.iter_mut().enumerate() {
-            if bullet.target_enemy_idx >= self.enemies.len() {
-                bullets_to_remove.push(bi);
-                continue;
-            }
-
-            let target_pos = self.enemies[bullet.target_enemy_idx].pos;
-            let dir = target_pos - bullet.pos;
-            let dist = dir.norm();
-
-            if dist < 0.15 {
-                enemy_damage.push((bullet.target_enemy_idx, bullet.damage));
-                bullets_to_remove.push(bi);
-            } else {
-                let movement = dir.normalize() * bullet.speed * dt;
-                bullet.pos += movement;
-                scene.graph[bullet.node]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(bullet.pos.x, bullet.pos.y, Z_BULLET));
+            // 3. Drain ready events from buffer and render
+            for evt in buffer.drain_ready() {
+                self.apply_event(evt, scene);
             }
         }
 
-        for &i in bullets_to_remove.iter().rev() {
-            let bullet = self.bullets.remove(i);
-            scene.graph.remove_node(bullet.node);
-        }
-
-        // Apply damage
-        let mut dead_enemies = Vec::new();
-        for (idx, dmg) in enemy_damage {
-            if idx < self.enemies.len() {
-                self.enemies[idx].hp -= dmg;
-                if self.enemies[idx].hp <= 0.0 {
-                    dead_enemies.push(idx);
-                }
-            }
-        }
-
-        dead_enemies.sort_unstable();
-        dead_enemies.dedup();
-        for &i in dead_enemies.iter().rev() {
-            let enemy = self.enemies.remove(i);
-            scene.graph.remove_node(enemy.node);
-            scene.graph.remove_node(enemy.hp_bar_bg);
-            scene.graph.remove_node(enemy.hp_bar_fg);
-            self.gold += ENEMY_REWARD;
-            self.enemies_alive -= 1;
-
-            for bullet in self.bullets.iter_mut() {
-                if bullet.target_enemy_idx == i {
-                    bullet.target_enemy_idx = usize::MAX;
-                } else if bullet.target_enemy_idx > i {
-                    bullet.target_enemy_idx -= 1;
-                }
-            }
-        }
-
-        // --- Check game over ---
-        if self.lives <= 0 {
-            self.game_over = true;
-            let ui = context.user_interfaces.first_mut();
-            self.ui_gameover_text = TextBuilder::new(
-                WidgetBuilder::new()
-                    .with_desired_position(Vector2::new(0.0, 0.0))
-                    .with_width(800.0)
-                    .with_height(600.0)
-                    .with_foreground(Brush::Solid(Color::RED).into()),
-            )
-            .with_text("GAME OVER".to_string())
-            .with_font_size(48.0.into())
-            .with_horizontal_text_alignment(HorizontalAlignment::Center)
-            .with_vertical_text_alignment(VerticalAlignment::Center)
-            .build(&mut ui.build_ctx());
-        }
-
-        // --- Update UI text ---
+        // 4. Update UI
+        let status_str = match &self.connection_status {
+            ConnectionStatus::Disconnected => "Disconnected".to_string(),
+            ConnectionStatus::Connecting => "Connecting...".to_string(),
+            ConnectionStatus::Connected => format!(
+                "Connected | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {}",
+                self.heartbeat.tick,
+                self.heartbeat.game_time,
+                self.heartbeat.entity_count,
+                self.heartbeat.hero_count,
+                self.heartbeat.creep_count,
+            ),
+            ConnectionStatus::Failed(e) => format!("Failed: {}", e),
+        };
         let ui = context.user_interfaces.first_mut();
-        ui.send(self.ui_gold_text, TextMessage::Text(format!("Gold: {}", self.gold)));
-        ui.send(self.ui_lives_text, TextMessage::Text(format!("Lives: {}", self.lives)));
-        ui.send(self.ui_wave_text, TextMessage::Text(format!("Wave: {}", self.wave)));
+        ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
         Ok(())
     }
 
     fn on_os_event(&mut self, event: &Event<()>, mut context: PluginContext) -> GameResult {
-        if self.game_over {
-            return Ok(());
-        }
-
         match event {
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
@@ -590,39 +567,31 @@ impl Plugin for Game {
                     },
                 ..
             } => {
-                if self.gold >= TOWER_COST {
-                    let world_pos = self.mouse_world_pos;
-                    if let Some((col, row)) = world_to_grid(world_pos.x, world_pos.y) {
-                        if row < GRID_ROWS && col < GRID_COLS && self.grid[row][col] {
-                            self.grid[row][col] = false;
-                            self.gold -= TOWER_COST;
-
-                            let (cx, cy) = grid_to_world(col, row);
-                            let scene = &mut context.scenes[self.scene];
-                            let node: Handle<Node> = RectangleBuilder::new(
-                                BaseBuilder::new().with_local_transform(
-                                    TransformBuilder::new()
-                                        .with_local_position(Vector3::new(cx, cy, Z_TOWER))
-                                        .with_local_scale(Vector3::new(0.4, 0.4, f32::EPSILON))
-                                        .build(),
-                                ),
-                            )
-                            .with_color(Color::from_rgba(50, 100, 220, 255))
-                            .build(&mut scene.graph)
-                            .transmute();
-
-                            self.towers.push(TowerData {
-                                node,
-                                pos: Vector2::new(cx, cy),
-                                attack_timer: 0.0,
-                            });
-                        }
+                let world_pos = self.mouse_world_pos;
+                if let Some((col, row)) = world_to_grid(world_pos.x, world_pos.y) {
+                    let (cx, cy) = grid_to_world(col, row);
+                    if let Some(ref network) = self.network {
+                        let _ = network.cmd_tx.send(NetCommand::PlaceTower { x: cx, y: cy });
                     }
+                }
+            }
+            // Right click → hero move (world coordinates, no grid snap)
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        button: MouseButton::Right,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                let world_pos = self.mouse_world_pos;
+                if let Some(ref network) = self.network {
+                    let _ = network.cmd_tx.send(NetCommand::HeroMove { x: world_pos.x, y: world_pos.y });
                 }
             }
             _ => {}
         }
-
         Ok(())
     }
 
@@ -637,8 +606,222 @@ impl Plugin for Game {
 }
 
 // ---------------------------------------------------------------------------
+// Event Processing
+// ---------------------------------------------------------------------------
+
+impl Game {
+    fn apply_event(&mut self, evt: TimestampedEvent, scene: &mut Scene) {
+        match (evt.msg_type.as_str(), evt.action.as_str()) {
+            (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
+            (_, "M" | "move") => self.entity_move(&evt.data, scene),
+            (_, "D" | "delete") => self.entity_delete(&evt.data, scene),
+            _ => {} // "R", "tick" etc. — ignore
+        }
+    }
+
+    fn entity_create(&mut self, entity_type: &str, data: &serde_json::Value, scene: &mut Scene) {
+        let id = data.get("entity_id")
+            .or_else(|| data.get("id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Idempotent: skip if already exists
+        if self.network_entities.contains_key(&id) {
+            return;
+        }
+
+        // Parse position
+        let (x, y) = if let Some(pos) = data.get("position") {
+            (
+                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            )
+        } else {
+            (
+                data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            )
+        };
+
+        // Parse HP
+        let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let max_hp = data.get("max_hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let health = match (hp, max_hp) {
+            (Some(h), Some(m)) => Some((h, m)),
+            _ => None,
+        };
+
+        // Choose color/size/Z based on entity type
+        let (color, size, z) = match entity_type {
+            "hero" => (Color::from_rgba(50, 180, 50, 255), 0.4, Z_ENEMY),
+            "creep" | "enemy" => (Color::from_rgba(220, 40, 40, 255), 0.3, Z_ENEMY),
+            "unit" | "tower" => (Color::from_rgba(50, 100, 220, 255), 0.4, Z_TOWER),
+            "bullet" | "projectile" => (Color::from_rgba(255, 230, 50, 255), 0.1, Z_BULLET),
+            _ => (Color::from_rgba(200, 200, 200, 255), 0.3, Z_ENEMY),
+        };
+
+        let node: Handle<Node> = RectangleBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(x, y, z))
+                    .with_local_scale(Vector3::new(size, size, f32::EPSILON))
+                    .build(),
+            ),
+        )
+        .with_color(color)
+        .build(&mut scene.graph)
+        .transmute();
+
+        // HP bars (if entity has health)
+        let (hp_bar_bg, hp_bar_fg) = if health.is_some() {
+            let bar_y = y + size * 0.5 + 0.1;
+            let bg = RectangleBuilder::new(
+                BaseBuilder::new().with_local_transform(
+                    TransformBuilder::new()
+                        .with_local_position(Vector3::new(x, bar_y, Z_HP_BAR))
+                        .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
+                        .build(),
+                ),
+            )
+            .with_color(Color::from_rgba(40, 40, 40, 200))
+            .build(&mut scene.graph)
+            .transmute();
+
+            let fg = RectangleBuilder::new(
+                BaseBuilder::new().with_local_transform(
+                    TransformBuilder::new()
+                        .with_local_position(Vector3::new(x, bar_y, Z_HP_BAR - 0.0001))
+                        .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
+                        .build(),
+                ),
+            )
+            .with_color(Color::from_rgba(0, 220, 0, 255))
+            .build(&mut scene.graph)
+            .transmute();
+
+            (Some(bg), Some(fg))
+        } else {
+            (None, None)
+        };
+
+        self.network_entities.insert(id, NetworkEntity {
+            entity_type: entity_type.to_string(),
+            node,
+            hp_bar_bg,
+            hp_bar_fg,
+            position: Vector2::new(x, y),
+            health,
+        });
+    }
+
+    fn entity_move(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        let id = data.get("entity_id")
+            .or_else(|| data.get("id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+
+        let entity = match self.network_entities.get_mut(&id) {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Parse new position
+        let (x, y) = if let Some(pos) = data.get("position") {
+            (
+                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(entity.position.x as f64) as f32,
+                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(entity.position.y as f64) as f32,
+            )
+        } else {
+            (
+                data.get("x").and_then(|v| v.as_f64()).unwrap_or(entity.position.x as f64) as f32,
+                data.get("y").and_then(|v| v.as_f64()).unwrap_or(entity.position.y as f64) as f32,
+            )
+        };
+
+        entity.position = Vector2::new(x, y);
+
+        // Update node position (keep same Z)
+        let z = scene.graph[entity.node].local_transform().position().z;
+        scene.graph[entity.node]
+            .local_transform_mut()
+            .set_position(Vector3::new(x, y, z));
+
+        // Update HP if provided
+        let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let max_hp = data.get("max_hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+        if let (Some(h), Some(m)) = (hp, max_hp) {
+            entity.health = Some((h, m));
+        }
+
+        // Update HP bar position & width
+        if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
+            let bar_y = y + 0.3;
+            let hp_ratio = (h / m).clamp(0.0, 1.0);
+            let bar_width = 0.4;
+
+            scene.graph[bg]
+                .local_transform_mut()
+                .set_position(Vector3::new(x, bar_y, Z_HP_BAR));
+
+            let fg_width = bar_width * hp_ratio;
+            let fg_offset = (bar_width - fg_width) * 0.5;
+            scene.graph[fg]
+                .local_transform_mut()
+                .set_position(Vector3::new(x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
+                .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
+
+            // Color: green → yellow → red
+            let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
+            let g = (hp_ratio * 2.0).min(1.0);
+            scene.graph[fg]
+                .as_rectangle_mut()
+                .set_color(Color::from_rgba((r * 255.0) as u8, (g * 255.0) as u8, 0, 255));
+        }
+    }
+
+    fn entity_delete(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        let id = data.get("entity_id")
+            .or_else(|| data.get("id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+
+        if let Some(entity) = self.network_entities.remove(&id) {
+            scene.graph.remove_node(entity.node);
+            if let Some(bg) = entity.hp_bar_bg {
+                scene.graph.remove_node(bg);
+            }
+            if let Some(fg) = entity.hp_bar_fg {
+                scene.graph.remove_node(fg);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+fn parse_heartbeat(data: &serde_json::Value) -> HeartbeatInfo {
+    HeartbeatInfo {
+        tick: data.get("tick").and_then(|v| v.as_u64()).unwrap_or(0),
+        game_time: data.get("game_time").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        entity_count: data.get("entity_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        hero_count: data.get("hero_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        creep_count: data.get("creep_count").and_then(|v| v.as_u64()).unwrap_or(0),
+    }
+}
 
 fn grid_to_world(col: usize, row: usize) -> (f32, f32) {
     let x = GRID_ORIGIN_X + col as f32 * CELL_SIZE + CELL_SIZE * 0.5;
@@ -668,55 +851,4 @@ fn screen_to_world_approx(
     let wx = -(screen_x / window_w - 0.5) * world_width;
     let wy = -(screen_y / window_h - 0.5) * world_height;
     Vector2::new(wx, wy)
-}
-
-fn mark_path_cells(grid: &mut Vec<Vec<bool>>) {
-    for i in 0..WAYPOINTS.len() - 1 {
-        let (x0, y0) = WAYPOINTS[i];
-        let (x1, y1) = WAYPOINTS[i + 1];
-
-        let steps = ((x1 - x0).abs().max((y1 - y0).abs()) / (CELL_SIZE * 0.5)) as usize + 1;
-        for s in 0..=steps {
-            let t = s as f32 / steps as f32;
-            let px = x0 + (x1 - x0) * t;
-            let py = y0 + (y1 - y0) * t;
-
-            if let Some((col, row)) = world_to_grid(px, py) {
-                if row < GRID_ROWS && col < GRID_COLS {
-                    grid[row][col] = false;
-                    if col > 0 {
-                        grid[row][col - 1] = false;
-                    }
-                    if col + 1 < GRID_COLS {
-                        grid[row][col + 1] = false;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn draw_path(scene: &mut Scene) {
-    for i in 0..WAYPOINTS.len() - 1 {
-        let (x0, y0) = WAYPOINTS[i];
-        let (x1, y1) = WAYPOINTS[i + 1];
-
-        let steps = ((x1 - x0).abs().max((y1 - y0).abs()) / 0.3) as usize + 1;
-        for s in 0..=steps {
-            let t = s as f32 / steps as f32;
-            let px = x0 + (x1 - x0) * t;
-            let py = y0 + (y1 - y0) * t;
-
-            RectangleBuilder::new(
-                BaseBuilder::new().with_local_transform(
-                    TransformBuilder::new()
-                        .with_local_position(Vector3::new(px, py, Z_PATH))
-                        .with_local_scale(Vector3::new(0.8, 0.8, f32::EPSILON))
-                        .build(),
-                ),
-            )
-            .with_color(Color::from_rgba(120, 120, 120, 255))
-            .build(&mut scene.graph);
-        }
-    }
 }
