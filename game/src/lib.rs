@@ -170,6 +170,11 @@ struct NetworkEntity {
     hp_bar_fg: Option<Handle<Node>>,
     position: Vector2<f32>,
     health: Option<(f32, f32)>, // (current, max)
+    // Client-side interpolation
+    prev_position: Vector2<f32>,
+    target_position: Vector2<f32>,
+    lerp_elapsed: f32,
+    lerp_duration: f32, // server tick interval (0.1s)
 }
 
 /// Heartbeat info (for UI display)
@@ -522,7 +527,40 @@ impl Plugin for Game {
             }
         }
 
-        // 4. Update UI
+        // 4. Interpolate entity positions (client-side lerp)
+        let dt = context.dt;
+        for entity in self.network_entities.values_mut() {
+            entity.lerp_elapsed += dt;
+            let t = (entity.lerp_elapsed / entity.lerp_duration).clamp(0.0, 1.0);
+            let pos = entity.prev_position.lerp(&entity.target_position, t);
+            entity.position = pos;
+
+            // Update node position (keep same Z)
+            let z = scene.graph[entity.node].local_transform().position().z;
+            scene.graph[entity.node]
+                .local_transform_mut()
+                .set_position(Vector3::new(pos.x, pos.y, z));
+
+            // Update HP bar positions
+            if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
+                let bar_y = pos.y + 0.3;
+                let hp_ratio = (h / m).clamp(0.0, 1.0);
+                let bar_width = 0.4;
+
+                scene.graph[bg]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(pos.x, bar_y, Z_HP_BAR));
+
+                let fg_width = bar_width * hp_ratio;
+                let fg_offset = (bar_width - fg_width) * 0.5;
+                scene.graph[fg]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
+                    .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
+            }
+        }
+
+        // 5. Update UI
         let status_str = match &self.connection_status {
             ConnectionStatus::Disconnected => "Disconnected".to_string(),
             ConnectionStatus::Connecting => "Connecting...".to_string(),
@@ -713,13 +751,18 @@ impl Game {
             (None, None)
         };
 
+        let pos = Vector2::new(x, y);
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
             node,
             hp_bar_bg,
             hp_bar_fg,
-            position: Vector2::new(x, y),
+            position: pos,
             health,
+            prev_position: pos,
+            target_position: pos,
+            lerp_elapsed: 0.1,
+            lerp_duration: 0.1, // already arrived
         });
     }
 
@@ -751,13 +794,10 @@ impl Game {
             )
         };
 
-        entity.position = Vector2::new(x, y);
-
-        // Update node position (keep same Z)
-        let z = scene.graph[entity.node].local_transform().position().z;
-        scene.graph[entity.node]
-            .local_transform_mut()
-            .set_position(Vector3::new(x, y, z));
+        // Start lerp from current interpolated position to new server position
+        entity.prev_position = entity.position;
+        entity.target_position = Vector2::new(x, y);
+        entity.lerp_elapsed = 0.0;
 
         // Update HP if provided
         let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -766,24 +806,9 @@ impl Game {
             entity.health = Some((h, m));
         }
 
-        // Update HP bar position & width
-        if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
-            let bar_y = y + 0.3;
+        // HP bar color update (position is handled by lerp loop)
+        if let (Some(fg), Some((h, m))) = (entity.hp_bar_fg, entity.health) {
             let hp_ratio = (h / m).clamp(0.0, 1.0);
-            let bar_width = 0.4;
-
-            scene.graph[bg]
-                .local_transform_mut()
-                .set_position(Vector3::new(x, bar_y, Z_HP_BAR));
-
-            let fg_width = bar_width * hp_ratio;
-            let fg_offset = (bar_width - fg_width) * 0.5;
-            scene.graph[fg]
-                .local_transform_mut()
-                .set_position(Vector3::new(x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
-                .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
-
-            // Color: green → yellow → red
             let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
             let g = (hp_ratio * 2.0).min(1.0);
             scene.graph[fg]
