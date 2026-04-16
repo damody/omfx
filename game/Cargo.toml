@@ -1,0 +1,13 @@
+
+[package]
+name = "omfx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fyrox = {workspace = true}
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = ["fyrox/default"]
+dylib-engine = ["fyrox/dylib"]

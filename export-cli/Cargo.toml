@@ -1,0 +1,10 @@
+
+[package]
+name = "export-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fyrox = { workspace = true }
+fyrox-build-tools = { workspace = true }
+omfx = { path = "../game" }
