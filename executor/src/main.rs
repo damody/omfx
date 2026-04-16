@@ -10,7 +10,8 @@ fn main() {
         EventLoop::new().ok(),
         fyrox::engine::GraphicsContextParams {
             window_attributes: fyrox::window::WindowAttributes::default()
-                .with_title("omfx - Tower Defense"),
+                .with_title("omfx - Tower Defense")
+                .with_inner_size(fyrox::dpi::LogicalSize::new(1280.0, 720.0)),
             vsync: true,
             msaa_sample_count: None,
             graphics_server_constructor: Default::default(),
