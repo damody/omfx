@@ -420,6 +420,8 @@ impl Plugin for Game {
         for &i in enemies_to_remove.iter().rev() {
             let enemy = self.enemies.remove(i);
             scene.graph.remove_node(enemy.node);
+            scene.graph.remove_node(enemy.hp_bar_bg);
+            scene.graph.remove_node(enemy.hp_bar_fg);
         }
 
         // --- Tower attacks ---
@@ -514,6 +516,8 @@ impl Plugin for Game {
         for &i in dead_enemies.iter().rev() {
             let enemy = self.enemies.remove(i);
             scene.graph.remove_node(enemy.node);
+            scene.graph.remove_node(enemy.hp_bar_bg);
+            scene.graph.remove_node(enemy.hp_bar_fg);
             self.gold += ENEMY_REWARD;
             self.enemies_alive -= 1;
 
