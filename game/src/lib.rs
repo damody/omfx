@@ -51,6 +51,9 @@ const CELL_SIZE: f32 = 1.0;
 const GRID_ORIGIN_X: f32 = -6.0;
 const GRID_ORIGIN_Y: f32 = -4.0;
 
+// Backend → render coordinate scale (backend uses large units like 800)
+const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
+
 // Z layers: smaller Z = closer to camera (near plane) = renders on top.
 const Z_BULLET: f32 = 0.000;
 const Z_HP_BAR: f32 = 0.0005;
@@ -408,7 +411,7 @@ impl Plugin for Game {
             .with_projection(Projection::Orthographic(OrthographicProjection {
                 z_near: -0.1,
                 z_far: 16.0,
-                vertical_size: 5.0,
+                vertical_size: 10.0,
             }))
             .build(&mut scene.graph)
             .transmute();
@@ -424,7 +427,7 @@ impl Plugin for Game {
             )
             .with_scatter_enabled(false),
         )
-        .with_radius(20.0)
+        .with_radius(40.0)
         .build(&mut scene.graph);
 
         // Background (dark green)
@@ -432,7 +435,7 @@ impl Plugin for Game {
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
                     .with_local_position(Vector3::new(0.0, 0.0, Z_BACKGROUND))
-                    .with_local_scale(Vector3::new(14.0, 10.0, f32::EPSILON))
+                    .with_local_scale(Vector3::new(30.0, 22.0, f32::EPSILON))
                     .build(),
             ),
         )
@@ -555,7 +558,7 @@ impl Plugin for Game {
                     position.y as f32,
                     self.window_size.x,
                     self.window_size.y,
-                    10.0,
+                    20.0, // matches camera vertical_size * 2
                 );
             }
             Event::WindowEvent {
@@ -571,7 +574,7 @@ impl Plugin for Game {
                 if let Some((col, row)) = world_to_grid(world_pos.x, world_pos.y) {
                     let (cx, cy) = grid_to_world(col, row);
                     if let Some(ref network) = self.network {
-                        let _ = network.cmd_tx.send(NetCommand::PlaceTower { x: cx, y: cy });
+                        let _ = network.cmd_tx.send(NetCommand::PlaceTower { x: cx / WORLD_SCALE, y: cy / WORLD_SCALE });
                     }
                 }
             }
@@ -587,7 +590,8 @@ impl Plugin for Game {
             } => {
                 let world_pos = self.mouse_world_pos;
                 if let Some(ref network) = self.network {
-                    let _ = network.cmd_tx.send(NetCommand::HeroMove { x: world_pos.x, y: world_pos.y });
+                    // Convert render coords back to backend coords
+                    let _ = network.cmd_tx.send(NetCommand::HeroMove { x: world_pos.x / WORLD_SCALE, y: world_pos.y / WORLD_SCALE });
                 }
             }
             _ => {}
@@ -634,16 +638,16 @@ impl Game {
             return;
         }
 
-        // Parse position
+        // Parse position (scale from backend coords to render coords)
         let (x, y) = if let Some(pos) = data.get("position") {
             (
-                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
+                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
             )
         } else {
             (
-                data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
+                data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
             )
         };
 
@@ -733,16 +737,16 @@ impl Game {
             None => return,
         };
 
-        // Parse new position
+        // Parse new position (scale from backend coords to render coords)
         let (x, y) = if let Some(pos) = data.get("position") {
             (
-                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(entity.position.x as f64) as f32,
-                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(entity.position.y as f64) as f32,
+                pos.get("x").and_then(|v| v.as_f64()).unwrap_or((entity.position.x / WORLD_SCALE) as f64) as f32 * WORLD_SCALE,
+                pos.get("y").and_then(|v| v.as_f64()).unwrap_or((entity.position.y / WORLD_SCALE) as f64) as f32 * WORLD_SCALE,
             )
         } else {
             (
-                data.get("x").and_then(|v| v.as_f64()).unwrap_or(entity.position.x as f64) as f32,
-                data.get("y").and_then(|v| v.as_f64()).unwrap_or(entity.position.y as f64) as f32,
+                data.get("x").and_then(|v| v.as_f64()).unwrap_or((entity.position.x / WORLD_SCALE) as f64) as f32 * WORLD_SCALE,
+                data.get("y").and_then(|v| v.as_f64()).unwrap_or((entity.position.y / WORLD_SCALE) as f64) as f32 * WORLD_SCALE,
             )
         };
 
