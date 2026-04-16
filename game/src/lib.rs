@@ -197,10 +197,11 @@ fn spawn_backend() -> Option<std::process::Child> {
     use std::process::{Command, Stdio};
     use std::path::PathBuf;
 
-    // Find the omb directory (try ../omb and ../../omb relative to exe)
+    // Find the omb directory relative to cwd
     let candidates = [
-        PathBuf::from("../omb"),
-        PathBuf::from("../../omb"),
+        PathBuf::from("omb"),       // cwd = D:\omoba
+        PathBuf::from("../omb"),    // cwd = D:\omoba\omfx
+        PathBuf::from("../../omb"), // cwd = D:\omoba\omfx\executor
     ];
 
     let omb_dir = candidates.iter().find(|p| p.join("game.toml").exists());
