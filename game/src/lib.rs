@@ -7,7 +7,7 @@
 use fyrox::graph::prelude::*;
 use fyrox::{
     core::{
-        algebra::{Vector2, Vector3},
+        algebra::{UnitQuaternion, Vector2, Vector3},
         color::Color,
         pool::Handle,
         reflect::prelude::*,
@@ -178,7 +178,14 @@ struct NetworkEntity {
     target_position: Vector2<f32>,
     lerp_elapsed: f32,
     lerp_duration: f32, // server tick interval (0.1s)
+    // Debug polyline segments (for creep path visualization)
+    path_nodes: Vec<Handle<Node>>,
+    // Seconds since path_nodes were drawn; used to expire them after PATH_VISIBLE_SECS.
+    path_age: f32,
 }
+
+/// Seconds that a newly-spawned creep's debug path stays visible.
+const PATH_VISIBLE_SECS: f32 = 5.0;
 
 /// Heartbeat info (for UI display)
 #[derive(Default, Debug)]
@@ -563,6 +570,16 @@ impl Plugin for Game {
         // 4. Interpolate entity positions (client-side lerp)
         let dt = context.dt;
         for entity in self.network_entities.values_mut() {
+            // Expire creep debug path after PATH_VISIBLE_SECS
+            if !entity.path_nodes.is_empty() {
+                entity.path_age += dt;
+                if entity.path_age >= PATH_VISIBLE_SECS {
+                    for seg in entity.path_nodes.drain(..) {
+                        scene.graph.remove_node(seg);
+                    }
+                }
+            }
+
             entity.lerp_elapsed += dt;
             let t = (entity.lerp_elapsed / entity.lerp_duration).clamp(0.0, 1.0);
             let pos = entity.prev_position.lerp(&entity.target_position, t);
@@ -831,6 +848,28 @@ impl Game {
             .unwrap_or(entity_type).to_string();
 
         let pos = Vector2::new(x, y);
+
+        // For creeps: draw debug polyline from current pos through remaining
+        // waypoints sent by the backend (`path_points`).
+        let path_nodes = if entity_type == "creep" {
+            let mut segments = Vec::new();
+            if let Some(pts) = data.get("path_points").and_then(|v| v.as_array()) {
+                let mut prev = Vector2::new(x, y);
+                for pt in pts.iter() {
+                    let px = pt.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+                    let py = pt.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+                    let next = Vector2::new(px, py);
+                    if let Some(seg) = build_path_segment(scene, prev, next) {
+                        segments.push(seg);
+                    }
+                    prev = next;
+                }
+            }
+            segments
+        } else {
+            Vec::new()
+        };
+
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
             node,
@@ -844,6 +883,8 @@ impl Game {
             target_position: pos,
             lerp_elapsed: 0.1,
             lerp_duration: 0.1, // already arrived
+            path_nodes,
+            path_age: 0.0,
         });
     }
 
@@ -919,8 +960,42 @@ impl Game {
             if let Some(label) = entity.name_label {
                 self.pending_label_deletions.push(label);
             }
+            for seg in entity.path_nodes {
+                scene.graph.remove_node(seg);
+            }
         }
     }
+}
+
+/// Build a thin rotated rectangle representing a line segment from `from` to `to`.
+/// Returns `None` if the segment has zero length.
+fn build_path_segment(
+    scene: &mut Scene,
+    from: Vector2<f32>,
+    to: Vector2<f32>,
+) -> Option<Handle<Node>> {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < f32::EPSILON {
+        return None;
+    }
+    let center = Vector3::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5, Z_PATH);
+    let thickness = 0.05;
+    let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), dy.atan2(dx));
+    let handle = RectangleBuilder::new(
+        BaseBuilder::new().with_local_transform(
+            TransformBuilder::new()
+                .with_local_position(center)
+                .with_local_rotation(rotation)
+                .with_local_scale(Vector3::new(length, thickness, f32::EPSILON))
+                .build(),
+        ),
+    )
+    .with_color(Color::from_rgba(255, 100, 255, 180))
+    .build(&mut scene.graph)
+    .transmute();
+    Some(handle)
 }
 
 // ---------------------------------------------------------------------------
