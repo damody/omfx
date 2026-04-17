@@ -970,19 +970,37 @@ impl Game {
         let pos = Vector2::new(x, y);
 
         // For creeps: draw debug polyline from current pos through remaining
-        // waypoints sent by the backend (`path_points`).
+        // waypoints sent by the backend (`path_points`), AND kick off a lerp
+        // toward `path_points[0]` so a creep that is mid-segment when the client
+        // joins doesn't freeze waiting for the next server M event.
+        let mut initial_target = pos;
+        let mut initial_duration = 0.1_f32;
         let path_nodes = if entity_type == "creep" {
             let mut segments = Vec::new();
             if let Some(pts) = data.get("path_points").and_then(|v| v.as_array()) {
                 let mut prev = Vector2::new(x, y);
+                let mut first_target: Option<Vector2<f32>> = None;
                 for pt in pts.iter() {
                     let px = pt.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
                     let py = pt.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
                     let next = Vector2::new(px, py);
+                    if first_target.is_none() {
+                        first_target = Some(next);
+                    }
                     if let Some(seg) = build_path_segment(scene, prev, next) {
                         segments.push(seg);
                     }
                     prev = next;
+                }
+                if let Some(t) = first_target {
+                    let dx = t.x - x;
+                    let dy = t.y - y;
+                    let dist_render = (dx * dx + dy * dy).sqrt();
+                    let dist_backend = dist_render / WORLD_SCALE;
+                    if move_speed > 1.0 && dist_backend > f32::EPSILON {
+                        initial_target = t;
+                        initial_duration = (dist_backend / move_speed).clamp(0.01, 3600.0);
+                    }
                 }
             }
             segments
@@ -1000,9 +1018,9 @@ impl Game {
             name,
             name_label: None, // created lazily in update()
             prev_position: pos,
-            target_position: pos,
-            lerp_elapsed: 0.1,
-            lerp_duration: 0.1, // already arrived
+            target_position: initial_target,
+            lerp_elapsed: 0.0,
+            lerp_duration: initial_duration,
             move_speed,
             path_nodes,
             path_age: 0.0,
