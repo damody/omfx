@@ -71,6 +71,7 @@ const Z_BACKGROUND: f32 = 0.005;
 enum NetCommand {
     PlaceTower { x: f32, y: f32 },
     HeroMove { x: f32, y: f32 },
+    ViewportUpdate { cx: f32, cy: f32, hw: f32, hh: f32 },
 }
 
 /// Timestamped backend event (for sorted buffering)
@@ -342,6 +343,9 @@ impl NetworkBridge {
                                     let _ = client.send_command("player", "move",
                                         serde_json::json!({"x": x, "y": y})).await;
                                 }
+                                NetCommand::ViewportUpdate { cx, cy, hw, hh } => {
+                                    let _ = client.send_viewport_update(cx, cy, hw, hh).await;
+                                }
                             },
                             Err(crossbeam_channel::TryRecvError::Empty) => {
                                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -522,6 +526,15 @@ impl Plugin for Game {
         // 1. Check connection status
         if let Some(ref network) = self.network {
             while let Ok(status) = network.status_rx.try_recv() {
+                if status == ConnectionStatus::Connected && self.connection_status != ConnectionStatus::Connected {
+                    // Send initial viewport on first connect
+                    let aspect = self.window_size.x / self.window_size.y;
+                    let half_height = 10.0 / WORLD_SCALE; // vertical_size in game coords
+                    let half_width = 10.0 * aspect / WORLD_SCALE;
+                    let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
+                        cx: 0.0, cy: 0.0, hw: half_width, hh: half_height,
+                    });
+                }
                 self.connection_status = status;
             }
         }
