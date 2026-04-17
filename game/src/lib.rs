@@ -177,7 +177,9 @@ struct NetworkEntity {
     prev_position: Vector2<f32>,
     target_position: Vector2<f32>,
     lerp_elapsed: f32,
-    lerp_duration: f32, // server tick interval (0.1s)
+    lerp_duration: f32, // derived from move_speed + segment distance
+    // Backend-reported move speed (backend units per second); 0 for static entities.
+    move_speed: f32,
     // Debug polyline segments (for creep path visualization)
     path_nodes: Vec<Handle<Node>>,
     // Seconds since path_nodes were drawn; used to expire them after PATH_VISIBLE_SECS.
@@ -748,6 +750,7 @@ impl Game {
         match (evt.msg_type.as_str(), evt.action.as_str()) {
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
             (_, "M" | "move") => self.entity_move(&evt.data, scene),
+            (_, "H" | "hp") => self.entity_hp_update(&evt.data, scene),
             (_, "D" | "delete") => self.entity_delete(&evt.data, scene),
             _ => {} // "R", "tick" etc. — ignore
         }
@@ -782,6 +785,11 @@ impl Game {
                 data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
             )
         };
+
+        // Parse move_speed (backend units/sec). Used to compute realistic lerp duration on move events.
+        let move_speed = data.get("move_speed")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32;
 
         // Parse HP
         let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -883,6 +891,7 @@ impl Game {
             target_position: pos,
             lerp_elapsed: 0.1,
             lerp_duration: 0.1, // already arrived
+            move_speed,
             path_nodes,
             path_age: 0.0,
         });
@@ -916,10 +925,29 @@ impl Game {
             )
         };
 
-        // Start lerp from current interpolated position to new server position
-        entity.prev_position = entity.position;
-        entity.target_position = Vector2::new(x, y);
+        // Start lerp from current interpolated position to new server position.
+        // For creeps, anchor prev_position to the PREVIOUS target (i.e. the waypoint
+        // the server said we just arrived at), not the mid-flight interpolated pos.
+        // Otherwise, if the client lerp is still traversing A→B when the server emits
+        // M(→C), we'd lerp from "somewhere on A→B" straight to C — cutting the corner
+        // and making the creep appear to skip the B vertex.
+        let new_target = Vector2::new(x, y);
+        let is_creep = entity.entity_type == "creep";
+        entity.prev_position = if is_creep { entity.target_position } else { entity.position };
+        entity.position = entity.prev_position;
+        entity.target_position = new_target;
         entity.lerp_elapsed = 0.0;
+        entity.lerp_duration = {
+            let dx = entity.target_position.x - entity.prev_position.x;
+            let dy = entity.target_position.y - entity.prev_position.y;
+            let dist_render = (dx * dx + dy * dy).sqrt();
+            let dist_backend = dist_render / WORLD_SCALE;
+            if entity.move_speed > 1.0 && dist_backend > f32::EPSILON {
+                (dist_backend / entity.move_speed).clamp(0.05, 10.0)
+            } else {
+                0.1
+            }
+        };
 
         // Update HP if provided
         let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -929,6 +957,39 @@ impl Game {
         }
 
         // HP bar color update (position is handled by lerp loop)
+        if let (Some(fg), Some((h, m))) = (entity.hp_bar_fg, entity.health) {
+            let hp_ratio = (h / m).clamp(0.0, 1.0);
+            let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
+            let g = (hp_ratio * 2.0).min(1.0);
+            scene.graph[fg]
+                .as_rectangle_mut()
+                .set_color(Color::from_rgba((r * 255.0) as u8, (g * 255.0) as u8, 0, 255));
+        }
+    }
+
+    /// HP-only update (action "H"). Updates health bar without touching position/lerp —
+    /// critical for creeps: a damage event must not reset the ongoing waypoint lerp.
+    fn entity_hp_update(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        let id = data.get("entity_id")
+            .or_else(|| data.get("id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+
+        let entity = match self.network_entities.get_mut(&id) {
+            Some(e) => e,
+            None => return,
+        };
+
+        let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let max_hp = data.get("max_hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+        if let (Some(h), Some(m)) = (hp, max_hp) {
+            entity.health = Some((h, m));
+        }
+
         if let (Some(fg), Some((h, m))) = (entity.hp_bar_fg, entity.health) {
             let hp_ratio = (h / m).clamp(0.0, 1.0);
             let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
