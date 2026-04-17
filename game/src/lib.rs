@@ -300,35 +300,21 @@ impl NetworkBridge {
             rt.block_on(async move {
                 let _ = status_tx.send(ConnectionStatus::Connecting);
 
-                // Retry connection (backend may still be starting up)
+                // Retry forever, once per second, so the frontend can be started
+                // before the backend and will automatically attach when it comes up.
                 let mut client = {
-                    let max_retries = 15;
-                    let mut last_err = String::new();
-                    let mut connected = None;
-                    for attempt in 0..max_retries {
-                        let delay_ms = (500 + attempt * 500).min(2000) as u64;
+                    let mut attempt = 0u32;
+                    loop {
                         match omoba_core::KcpClient::connect(&server_addr, player_name.clone()).await {
                             Ok(c) => {
-                                connected = Some(c);
-                                break;
+                                let _ = status_tx.send(ConnectionStatus::Connected);
+                                break c;
                             }
                             Err(e) => {
-                                last_err = e.to_string();
-                                log::info!("Connection attempt {}/{} failed: {}, retrying in {}ms...",
-                                    attempt + 1, max_retries, last_err, delay_ms);
-                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                attempt += 1;
+                                log::info!("Connection attempt {} failed: {}, retrying in 1s...", attempt, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             }
-                        }
-                    }
-                    match connected {
-                        Some(c) => {
-                            let _ = status_tx.send(ConnectionStatus::Connected);
-                            c
-                        }
-                        None => {
-                            let _ = status_tx.send(ConnectionStatus::Failed(
-                                format!("Failed after {} retries: {}", max_retries, last_err)));
-                            return;
                         }
                     }
                 };
