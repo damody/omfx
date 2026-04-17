@@ -603,7 +603,7 @@ impl Plugin for Game {
             if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
                 let bar_y = pos.y + 0.3;
                 let hp_ratio = (h / m).clamp(0.0, 1.0);
-                let bar_width = 0.4;
+                let bar_width = 0.8;
 
                 scene.graph[bg]
                     .local_transform_mut()
@@ -613,7 +613,7 @@ impl Plugin for Game {
                 let fg_offset = (bar_width - fg_width) * 0.5;
                 scene.graph[fg]
                     .local_transform_mut()
-                    .set_position(Vector3::new(pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
+                    .set_position(Vector3::new(pos.x + fg_offset, bar_y, Z_HP_BAR - 0.0001))
                     .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
             }
         }
@@ -664,11 +664,11 @@ impl Plugin for Game {
                 let label = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(Vector2::new(0.0, 0.0))
-                        .with_width(120.0)
-                        .with_foreground(Brush::Solid(Color::WHITE).into()),
+                        .with_width(180.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
                 )
                 .with_text(entity.name.clone())
-                .with_font_size(14.0.into())
+                .with_font_size(21.0.into())
                 .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .build(&mut ui.build_ctx());
                 entity.name_label = Some(label);
@@ -680,8 +680,8 @@ impl Plugin for Game {
                 let screen_pos = world_to_screen_approx(
                     entity.position.x, name_world_y, win.x, win.y,
                 );
-                // Center the 120px-wide label horizontally
-                let pos = Vector2::new(screen_pos.x - 60.0, screen_pos.y - 16.0);
+                // Center the 180px-wide label horizontally
+                let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
                 ui.send(label, WidgetMessage::DesiredPosition(pos));
             }
         }
@@ -939,11 +939,11 @@ impl Game {
                 BaseBuilder::new().with_local_transform(
                     TransformBuilder::new()
                         .with_local_position(Vector3::new(x, bar_y, Z_HP_BAR))
-                        .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
+                        .with_local_scale(Vector3::new(0.8, 0.06, f32::EPSILON))
                         .build(),
                 ),
             )
-            .with_color(Color::from_rgba(40, 40, 40, 200))
+            .with_color(Color::from_rgba(0, 0, 0, 255))
             .build(&mut scene.graph)
             .transmute();
 
@@ -951,7 +951,7 @@ impl Game {
                 BaseBuilder::new().with_local_transform(
                     TransformBuilder::new()
                         .with_local_position(Vector3::new(x, bar_y, Z_HP_BAR - 0.0001))
-                        .with_local_scale(Vector3::new(0.4, 0.06, f32::EPSILON))
+                        .with_local_scale(Vector3::new(0.8, 0.06, f32::EPSILON))
                         .build(),
                 ),
             )
@@ -1071,15 +1071,7 @@ impl Game {
             entity.health = Some((h, m));
         }
 
-        // HP bar color update (position is handled by lerp loop)
-        if let (Some(fg), Some((h, m))) = (entity.hp_bar_fg, entity.health) {
-            let hp_ratio = (h / m).clamp(0.0, 1.0);
-            let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
-            let g = (hp_ratio * 2.0).min(1.0);
-            scene.graph[fg]
-                .as_rectangle_mut()
-                .set_color(Color::from_rgba((r * 255.0) as u8, (g * 255.0) as u8, 0, 255));
-        }
+        // HP bar stays green; width is recomputed in the update loop.
     }
 
     /// HP-only update (action "H"). Updates health bar without touching position/lerp —
@@ -1105,14 +1097,7 @@ impl Game {
             entity.health = Some((h, m));
         }
 
-        if let (Some(fg), Some((h, m))) = (entity.hp_bar_fg, entity.health) {
-            let hp_ratio = (h / m).clamp(0.0, 1.0);
-            let r = ((1.0 - hp_ratio) * 2.0).min(1.0);
-            let g = (hp_ratio * 2.0).min(1.0);
-            scene.graph[fg]
-                .as_rectangle_mut()
-                .set_color(Color::from_rgba((r * 255.0) as u8, (g * 255.0) as u8, 0, 255));
-        }
+        // HP bar stays green; width is recomputed in the update loop.
     }
 
     fn entity_delete(&mut self, data: &serde_json::Value, scene: &mut Scene) {
