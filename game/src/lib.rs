@@ -461,6 +461,21 @@ impl Plugin for Game {
             .add(UserInterface::new(Default::default()));
         let ui = context.user_interfaces.first_mut();
 
+        // Load CJK font (Microsoft JhengHei) for Chinese text rendering
+        if let Ok(font_data) = std::fs::read("C:/Windows/Fonts/msjh.ttc") {
+            use fyrox::gui::font::{Font, FontResource, FontStyles};
+            use fyrox::asset::untyped::ResourceKind;
+            use fyrox::core::uuid::Uuid;
+            if let Ok(font) = Font::from_memory(font_data, 1024, FontStyles::default(), vec![]) {
+                let font_resource = FontResource::new_ok(
+                    Uuid::new_v4(),
+                    ResourceKind::Embedded,
+                    font,
+                );
+                ui.default_font = font_resource;
+            }
+        }
+
         self.ui_status_text = TextBuilder::new(
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(10.0, 10.0))
