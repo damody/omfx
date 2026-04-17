@@ -752,7 +752,9 @@ impl Game {
         }
 
         // Parse position (scale from backend coords to render coords)
-        let (x, y) = if let Some(pos) = data.get("position") {
+        // projectile create events carry `start_pos` instead of `position`.
+        let pos_source = data.get("position").or_else(|| data.get("start_pos"));
+        let (x, y) = if let Some(pos) = pos_source {
             (
                 pos.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
                 pos.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
