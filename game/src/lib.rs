@@ -231,7 +231,44 @@ enum ConnectionStatus {
 }
 
 /// Try to spawn the omb backend as a child process.
-fn spawn_backend() -> Option<std::process::Child> {
+/// RAII guard that owns the backend `Child` and (on Windows) a Job Object handle.
+///
+/// Kill semantics:
+/// - **Graceful exit** (window close, Ok return, panic unwind): `Drop` runs, calling
+///   `child.kill()` + `child.wait()`.
+/// - **Hard kill** (task manager, log-off, parent crash): Windows closes all our
+///   handles. Because the backend is in a Job Object with
+///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the OS terminates it automatically the
+///   moment our process ends and the job handle is implicitly closed.
+#[derive(Debug)]
+struct BackendGuard {
+    child: Option<std::process::Child>,
+    #[cfg(windows)]
+    job: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            log::info!("BackendGuard dropping — killing backend (PID: {})", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        #[cfg(windows)]
+        {
+            if let Some(job) = self.job.take() {
+                // Closing the last handle to the job triggers KILL_ON_JOB_CLOSE,
+                // which kills any still-alive processes inside.
+                use windows::Win32::Foundation::CloseHandle;
+                unsafe { let _ = CloseHandle(job); }
+            }
+        }
+    }
+}
+
+/// Spawn the backend as a child process, tied to the current process's lifetime.
+/// Returns `None` if we can't find the omb directory or the spawn fails.
+fn spawn_backend() -> Option<BackendGuard> {
     use std::process::{Command, Stdio};
     use std::path::PathBuf;
 
@@ -273,15 +310,73 @@ fn spawn_backend() -> Option<std::process::Child> {
             .spawn()
     };
 
-    match result {
-        Ok(child) => {
-            log::info!("Backend process spawned (PID: {})", child.id());
-            Some(child)
+    let child = match result {
+        Ok(c) => {
+            log::info!("Backend process spawned (PID: {})", c.id());
+            c
         }
         Err(e) => {
             log::error!("Failed to spawn backend: {}", e);
-            None
+            return None;
         }
+    };
+
+    #[cfg(windows)]
+    let job = create_job_and_attach(&child);
+    #[cfg(windows)]
+    {
+        Some(BackendGuard { child: Some(child), job })
+    }
+    #[cfg(not(windows))]
+    {
+        Some(BackendGuard { child: Some(child) })
+    }
+}
+
+/// Create a Windows Job Object with KILL_ON_JOB_CLOSE, attach the given child,
+/// and return the job handle. On failure, returns `None` — the `BackendGuard`
+/// falls back to `Drop`-time kill only.
+#[cfg(windows)]
+fn create_job_and_attach(child: &std::process::Child) -> Option<windows::Win32::Foundation::HANDLE> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = match CreateJobObjectW(None, None) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                log::warn!("CreateJobObjectW failed; falling back to Drop-only cleanup");
+                return None;
+            }
+        };
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .is_err()
+        {
+            log::warn!("SetInformationJobObject failed; job won't auto-kill children");
+        }
+
+        let child_handle = HANDLE(child.as_raw_handle());
+        if AssignProcessToJobObject(job, child_handle).is_err() {
+            log::warn!("AssignProcessToJobObject failed; backend not tied to our lifetime");
+        } else {
+            log::info!("Backend process attached to Job Object (auto-kill on exit)");
+        }
+
+        Some(job)
     }
 }
 
@@ -408,8 +503,11 @@ pub struct Game {
     heartbeat: HeartbeatInfo,
 
     // --- Backend Process ---
+    /// Drops → kills backend. Held for the whole Game lifetime so that any exit
+    /// path (normal, panic, force-close on Windows via Job Object) brings the
+    /// backend down with us.
     #[visit(skip)] #[reflect(hidden)]
-    backend_process: Option<std::process::Child>,
+    backend_guard: Option<BackendGuard>,
 
     #[visit(skip)] #[reflect(hidden)]
     pending_label_deletions: Vec<Handle<Text>>,
@@ -507,8 +605,8 @@ impl Plugin for Game {
         .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
 
-        // Auto-start backend
-        self.backend_process = spawn_backend();
+        // Auto-start backend (tied to our lifetime via BackendGuard + Job Object)
+        self.backend_guard = spawn_backend();
 
         // Network init
         let server_addr = std::env::var("OMB_KCP_ADDR")
@@ -529,12 +627,10 @@ impl Plugin for Game {
         // Drop network bridge (threads will stop when channels disconnect)
         self.network = None;
 
-        // Kill backend child process
-        if let Some(mut child) = self.backend_process.take() {
-            log::info!("Killing backend process (PID: {})...", child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        // Drop the backend guard — its Drop impl kills the child and closes the Job Object.
+        // (If Drop doesn't run, e.g. on hard kill, the OS still terminates the backend
+        // thanks to JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.)
+        self.backend_guard = None;
 
         Ok(())
     }
