@@ -204,6 +204,10 @@ struct ClientProjectile {
     last_target_pos: Vector2<f32>,
     elapsed: f32,
     flight_time: f32,
+    // Predicted damage applied client-side when the bullet visually hits;
+    // heartbeat HP snapshot reconciles drift every 2s.
+    damage: f32,
+    applied: bool,
 }
 
 /// Heartbeat info (for UI display)
@@ -620,7 +624,11 @@ impl Plugin for Game {
 
         // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
         //     current interpolated position; t forced to 1 at flight_time).
+        //     On visual impact (t>=1.0) we optimistically subtract `damage`
+        //     from the target's HP so the bar shrinks immediately; the 2-second
+        //     heartbeat carries an authoritative hp_snapshot that reconciles.
         let mut finished: Vec<u32> = Vec::new();
+        let mut predicted_damage: Vec<(u32, f32)> = Vec::new();
         for (id, proj) in self.client_projectiles.iter_mut() {
             proj.elapsed += dt;
             let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
@@ -635,7 +643,19 @@ impl Plugin for Game {
                 .local_transform_mut()
                 .set_position(Vector3::new(pos.x, pos.y, Z_BULLET));
             if t >= 1.0 {
+                if !proj.applied && proj.damage > 0.0 {
+                    predicted_damage.push((proj.target_id, proj.damage));
+                    proj.applied = true;
+                }
                 finished.push(*id);
+            }
+        }
+        for (target_id, dmg) in predicted_damage {
+            if let Some(entity) = self.network_entities.get_mut(&target_id) {
+                if let Some((h, m)) = entity.health {
+                    let new_h = (h - dmg).max(0.0);
+                    entity.health = Some((new_h, m));
+                }
             }
         }
         for id in finished {
@@ -832,6 +852,10 @@ impl Game {
             .unwrap_or(200);
         let flight_time = (flight_time_ms as f32 / 1000.0).max(0.016); // avoid div-by-zero
 
+        let damage = data.get("damage")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32;
+
         let node: Handle<Node> = RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
@@ -851,6 +875,8 @@ impl Game {
             last_target_pos: start_pos,
             elapsed: 0.0,
             flight_time,
+            damage,
+            applied: false,
         });
     }
 
