@@ -189,6 +189,23 @@ struct NetworkEntity {
 /// Seconds that a newly-spawned creep's debug path stays visible.
 const PATH_VISIBLE_SECS: f32 = 5.0;
 
+/// Client-side projectile simulation.
+///
+/// Backend only sends a single C event with `target_id` + `flight_time_ms`;
+/// the bullet's position is computed locally each frame as a pursuit lerp
+/// from `start_pos` toward the target entity's CURRENT client-side position.
+/// This eliminates the per-tick network round-trip lag that made bullets
+/// visually trail the creep.
+#[derive(Debug)]
+struct ClientProjectile {
+    node: Handle<Node>,
+    target_id: u32,
+    start_pos: Vector2<f32>,
+    last_target_pos: Vector2<f32>,
+    elapsed: f32,
+    flight_time: f32,
+}
+
 /// Heartbeat info (for UI display)
 #[derive(Default, Debug)]
 struct HeartbeatInfo {
@@ -396,6 +413,8 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     network_entities: HashMap<u32, NetworkEntity>,
     #[visit(skip)] #[reflect(hidden)]
+    client_projectiles: HashMap<u32, ClientProjectile>,
+    #[visit(skip)] #[reflect(hidden)]
     heartbeat: HeartbeatInfo,
 
     // --- Backend Process ---
@@ -511,6 +530,7 @@ impl Plugin for Game {
         self.connection_status = ConnectionStatus::Connecting;
         self.event_buffer = Some(EventBuffer::new());
         self.network_entities = HashMap::new();
+        self.client_projectiles = HashMap::new();
 
         Ok(())
     }
@@ -609,6 +629,32 @@ impl Plugin for Game {
                     .local_transform_mut()
                     .set_position(Vector3::new(pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
                     .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
+            }
+        }
+
+        // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
+        //     current interpolated position; t forced to 1 at flight_time).
+        let mut finished: Vec<u32> = Vec::new();
+        for (id, proj) in self.client_projectiles.iter_mut() {
+            proj.elapsed += dt;
+            let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
+            let target_pos = self
+                .network_entities
+                .get(&proj.target_id)
+                .map(|e| e.position)
+                .unwrap_or(proj.last_target_pos);
+            proj.last_target_pos = target_pos;
+            let pos = proj.start_pos + (target_pos - proj.start_pos) * t;
+            scene.graph[proj.node]
+                .local_transform_mut()
+                .set_position(Vector3::new(pos.x, pos.y, Z_BULLET));
+            if t >= 1.0 {
+                finished.push(*id);
+            }
+        }
+        for id in finished {
+            if let Some(proj) = self.client_projectiles.remove(&id) {
+                scene.graph.remove_node(proj.node);
             }
         }
 
@@ -748,11 +794,91 @@ impl Plugin for Game {
 impl Game {
     fn apply_event(&mut self, evt: TimestampedEvent, scene: &mut Scene) {
         match (evt.msg_type.as_str(), evt.action.as_str()) {
+            // Projectiles are simulated client-side (pursuit + flight_time).
+            ("projectile", "C" | "create") => self.projectile_create(&evt.data, scene),
+            ("projectile", "D" | "delete") => self.projectile_delete(&evt.data, scene),
+            ("projectile", _) => {} // ignore stray M events (legacy compat)
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
             (_, "M" | "move") => self.entity_move(&evt.data, scene),
             (_, "H" | "hp") => self.entity_hp_update(&evt.data, scene),
             (_, "D" | "delete") => self.entity_delete(&evt.data, scene),
             _ => {} // "R", "tick" etc. — ignore
+        }
+    }
+
+    /// Handle projectile spawn: build a scene node at start_pos and register a
+    /// client-side simulation entry. The bullet's motion is computed each frame
+    /// in `update()` — backend does NOT stream per-tick projectile M events.
+    fn projectile_create(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        let id = data.get("id")
+            .or_else(|| data.get("entity_id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+        if self.client_projectiles.contains_key(&id) {
+            return;
+        }
+        let target_id = data.get("target_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let target_id = match target_id {
+            Some(t) => t,
+            None => return, // can't pursue without a target
+        };
+
+        let start = data.get("start_pos")
+            .or_else(|| data.get("position"));
+        let (sx, sy) = if let Some(pos) = start {
+            (
+                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
+                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let start_pos = Vector2::new(sx, sy);
+
+        let flight_time_ms = data.get("flight_time_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200);
+        let flight_time = (flight_time_ms as f32 / 1000.0).max(0.016); // avoid div-by-zero
+
+        let node: Handle<Node> = RectangleBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(sx, sy, Z_BULLET))
+                    .with_local_scale(Vector3::new(0.1, 0.1, f32::EPSILON))
+                    .build(),
+            ),
+        )
+        .with_color(Color::from_rgba(255, 230, 50, 255))
+        .build(&mut scene.graph)
+        .transmute();
+
+        self.client_projectiles.insert(id, ClientProjectile {
+            node,
+            target_id,
+            start_pos,
+            last_target_pos: start_pos,
+            elapsed: 0.0,
+            flight_time,
+        });
+    }
+
+    fn projectile_delete(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        let id = data.get("id")
+            .or_else(|| data.get("entity_id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let id = match id {
+            Some(id) => id,
+            None => return,
+        };
+        if let Some(proj) = self.client_projectiles.remove(&id) {
+            scene.graph.remove_node(proj.node);
         }
     }
 
@@ -943,7 +1069,10 @@ impl Game {
             let dist_render = (dx * dx + dy * dy).sqrt();
             let dist_backend = dist_render / WORLD_SCALE;
             if entity.move_speed > 1.0 && dist_backend > f32::EPSILON {
-                (dist_backend / entity.move_speed).clamp(0.05, 10.0)
+                // Min clamp 0.01s: projectiles get M events every backend tick (~17ms)
+                // — anything larger would make the client lerp over-shoot the inter-M
+                // interval and add visible lag on top of the 100ms render buffer.
+                (dist_backend / entity.move_speed).clamp(0.01, 10.0)
             } else {
                 0.1
             }
