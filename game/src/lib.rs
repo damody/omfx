@@ -560,6 +560,7 @@ impl Plugin for Game {
 
         // 2. Receive events from NetworkBridge, push into EventBuffer
         if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
+            let mut pending_hp_sync: Option<serde_json::Value> = None;
             for evt in network.event_rx.try_iter() {
                 // Heartbeat: calibrate clock immediately, don't buffer
                 if evt.msg_type == "heartbeat" && evt.action == "tick" {
@@ -568,6 +569,9 @@ impl Plugin for Game {
                         buffer.render_delay_ms = delay;
                     }
                     self.heartbeat = parse_heartbeat(&evt.data);
+                    if let Some(snap) = evt.data.get("hp_snapshot").cloned() {
+                        pending_hp_sync = Some(snap);
+                    }
                 } else {
                     buffer.push(evt);
                 }
@@ -576,6 +580,24 @@ impl Plugin for Game {
             // 3. Drain ready events from buffer and render
             for evt in buffer.drain_ready() {
                 self.apply_event(evt, scene);
+            }
+
+            // Heartbeat HP reconciliation: overwrite client-predicted HP with the
+            // authoritative backend snapshot (corrects drift accumulated from
+            // optimistic damage prediction + missed/overshot hits).
+            if let Some(snap) = pending_hp_sync {
+                if let Some(arr) = snap.as_array() {
+                    for item in arr {
+                        let id = item.get("id").and_then(|v| v.as_u64()).map(|v| v as u32);
+                        let hp = item.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+                        let max_hp = item.get("max_hp").and_then(|v| v.as_f64()).map(|v| v as f32);
+                        if let (Some(id), Some(h), Some(m)) = (id, hp, max_hp) {
+                            if let Some(entity) = self.network_entities.get_mut(&id) {
+                                entity.health = Some((h, m));
+                            }
+                        }
+                    }
+                }
             }
         }
 
