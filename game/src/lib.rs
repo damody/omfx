@@ -234,7 +234,7 @@ fn spawn_backend() -> Option<std::process::Child> {
     } else {
         log::info!("Pre-built binary not found, falling back to cargo run...");
         Command::new("cargo")
-            .args(["run", "--features", "grpc"])
+            .args(["run", "--features", "kcp"])
             .current_dir(&omb_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -280,7 +280,7 @@ impl NetworkBridge {
                     let mut connected = None;
                     for attempt in 0..max_retries {
                         let delay_ms = (500 + attempt * 500).min(2000) as u64;
-                        match omoba_core::GrpcClient::connect(&server_addr, player_name.clone()).await {
+                        match omoba_core::KcpClient::connect(&server_addr, player_name.clone()).await {
                             Ok(c) => {
                                 connected = Some(c);
                                 break;
@@ -489,8 +489,8 @@ impl Plugin for Game {
         self.backend_process = spawn_backend();
 
         // Network init
-        let server_addr = std::env::var("OMB_GRPC_ADDR")
-            .unwrap_or_else(|_| "http://127.0.0.1:50061".to_string());
+        let server_addr = std::env::var("OMB_KCP_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:50061".to_string());
         let player_name = std::env::var("OMB_PLAYER_NAME")
             .unwrap_or_else(|_| "omfx_player".to_string());
 
