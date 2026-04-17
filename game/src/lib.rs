@@ -1069,10 +1069,10 @@ impl Game {
             let dist_render = (dx * dx + dy * dy).sqrt();
             let dist_backend = dist_render / WORLD_SCALE;
             if entity.move_speed > 1.0 && dist_backend > f32::EPSILON {
-                // Min clamp 0.01s: projectiles get M events every backend tick (~17ms)
-                // — anything larger would make the client lerp over-shoot the inter-M
-                // interval and add visible lag on top of the 100ms render buffer.
-                (dist_backend / entity.move_speed).clamp(0.01, 10.0)
+                // Min clamp 0.01s for dense event streams. Max clamp generous so that
+                // slow creeps (e.g. msd=50 walking 800 units = 16s) aren't truncated
+                // and forced to idle at waypoints waiting for the next M event.
+                (dist_backend / entity.move_speed).clamp(0.01, 3600.0)
             } else {
                 0.1
             }
