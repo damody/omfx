@@ -18,7 +18,7 @@ use fyrox::{
         brush::Brush,
         message::UiMessage,
         text::{Text, TextBuilder, TextMessage},
-        widget::WidgetBuilder,
+        widget::{WidgetBuilder, WidgetMessage},
         HorizontalAlignment, UserInterface, VerticalAlignment,
     },
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
@@ -170,6 +170,8 @@ struct NetworkEntity {
     hp_bar_fg: Option<Handle<Node>>,
     position: Vector2<f32>,
     health: Option<(f32, f32)>, // (current, max)
+    name: String,
+    name_label: Option<Handle<Text>>,
     // Client-side interpolation
     prev_position: Vector2<f32>,
     target_position: Vector2<f32>,
@@ -387,6 +389,9 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     backend_process: Option<std::process::Child>,
 
+    #[visit(skip)] #[reflect(hidden)]
+    pending_label_deletions: Vec<Handle<Text>>,
+
     // --- UI ---
     #[visit(skip)] #[reflect(hidden)]
     ui_status_text: Handle<Text>,
@@ -560,7 +565,49 @@ impl Plugin for Game {
             }
         }
 
-        // 5. Update UI
+        // 5. Update name labels (UI layer)
+        let ui = context.user_interfaces.first_mut();
+        let win = self.window_size;
+
+        // Delete labels for removed entities
+        for label in self.pending_label_deletions.drain(..) {
+            ui.send(label, WidgetMessage::Remove);
+        }
+
+        // Create missing labels & update positions
+        for entity in self.network_entities.values_mut() {
+            if entity.health.is_none() {
+                continue; // only show names for entities with HP bars
+            }
+
+            // Lazily create label
+            if entity.name_label.is_none() {
+                let label = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(0.0, 0.0))
+                        .with_width(120.0)
+                        .with_foreground(Brush::Solid(Color::WHITE).into()),
+                )
+                .with_text(entity.name.clone())
+                .with_font_size(14.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                entity.name_label = Some(label);
+            }
+
+            // Update label screen position (above HP bar)
+            if let Some(label) = entity.name_label {
+                let name_world_y = entity.position.y + 0.5;
+                let screen_pos = world_to_screen_approx(
+                    entity.position.x, name_world_y, win.x, win.y,
+                );
+                // Center the 120px-wide label horizontally
+                let pos = Vector2::new(screen_pos.x - 60.0, screen_pos.y - 16.0);
+                ui.send(label, WidgetMessage::DesiredPosition(pos));
+            }
+        }
+
+        // 6. Update status text
         let status_str = match &self.connection_status {
             ConnectionStatus::Disconnected => "Disconnected".to_string(),
             ConnectionStatus::Connecting => "Connecting...".to_string(),
@@ -574,7 +621,6 @@ impl Plugin for Game {
             ),
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
         };
-        let ui = context.user_interfaces.first_mut();
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
         Ok(())
@@ -751,6 +797,9 @@ impl Game {
             (None, None)
         };
 
+        let name = data.get("name").and_then(|v| v.as_str())
+            .unwrap_or(entity_type).to_string();
+
         let pos = Vector2::new(x, y);
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
@@ -759,6 +808,8 @@ impl Game {
             hp_bar_fg,
             position: pos,
             health,
+            name,
+            name_label: None, // created lazily in update()
             prev_position: pos,
             target_position: pos,
             lerp_elapsed: 0.1,
@@ -835,6 +886,9 @@ impl Game {
             if let Some(fg) = entity.hp_bar_fg {
                 scene.graph.remove_node(fg);
             }
+            if let Some(label) = entity.name_label {
+                self.pending_label_deletions.push(label);
+            }
         }
     }
 }
@@ -867,6 +921,15 @@ fn world_to_grid(wx: f32, wy: f32) -> Option<(usize, usize)> {
     } else {
         None
     }
+}
+
+fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32) -> Vector2<f32> {
+    let world_height = 20.0;
+    let aspect = window_w / window_h;
+    let world_width = world_height * aspect;
+    let sx = (-wx / world_width + 0.5) * window_w;
+    let sy = (-wy / world_height + 0.5) * window_h;
+    Vector2::new(sx, sy)
 }
 
 fn screen_to_world_approx(
