@@ -189,6 +189,10 @@ struct NetworkEntity {
     path_nodes: Vec<Handle<Node>>,
     // Seconds since path_nodes were drawn; used to expire them after PATH_VISIBLE_SECS.
     path_age: f32,
+    // 面向角度（radians，0 = +X，CCW 正）
+    facing: f32,
+    // 箭頭指示面向的子節點
+    facing_arrow: Option<Handle<Node>>,
 }
 
 /// Seconds that a newly-spawned creep's debug path stays visible.
@@ -856,6 +860,20 @@ impl Plugin for Game {
                     .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
                     .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
             }
+
+            // 更新面向箭頭位置與角度
+            if let Some(arrow) = entity.facing_arrow {
+                let render_angle = std::f32::consts::PI - entity.facing;
+                let scale = scene.graph[arrow].local_transform().scale();
+                let length = scale.x;
+                let offset_x = (length * 0.5) * render_angle.cos();
+                let offset_y = (length * 0.5) * render_angle.sin();
+                let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
+                scene.graph[arrow]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, 0.0007))
+                    .set_rotation(rotation);
+            }
         }
 
         // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
@@ -1482,6 +1500,16 @@ impl Game {
             Vec::new()
         };
 
+        // 讀取初始 facing（若 create payload 有帶）
+        let initial_facing = data.get("facing").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+        // 建立面向箭頭（只為有 health 的單位做，tower/creep/hero 都有）
+        let facing_arrow = if health.is_some() {
+            Some(build_facing_arrow(scene, x, y, size, initial_facing))
+        } else {
+            None
+        };
+
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
             node,
@@ -1498,6 +1526,8 @@ impl Game {
             move_speed,
             path_nodes,
             path_age: 0.0,
+            facing: initial_facing,
+            facing_arrow,
         });
     }
 
@@ -1563,7 +1593,10 @@ impl Game {
             entity.health = Some((h, m));
         }
 
-        // HP bar stays green; width is recomputed in the update loop.
+        // 更新 facing（若 payload 有帶）
+        if let Some(f) = data.get("facing").and_then(|v| v.as_f64()) {
+            entity.facing = f as f32;
+        }
     }
 
     /// HP-only update (action "H"). Updates health bar without touching position/lerp —
@@ -1610,6 +1643,9 @@ impl Game {
             if let Some(fg) = entity.hp_bar_fg {
                 scene.graph.remove_node(fg);
             }
+            if let Some(arrow) = entity.facing_arrow {
+                scene.graph.remove_node(arrow);
+            }
             if let Some(label) = entity.name_label {
                 self.pending_label_deletions.push(label);
             }
@@ -1622,6 +1658,36 @@ impl Game {
 
 /// Build a thin rotated rectangle representing a line segment from `from` to `to`.
 /// Returns `None` if the segment has zero length.
+/// 為單位建立一個指向面向方向的箭頭（偏離中心一半 length，讓箭頭伸出單位外）
+/// `pos_x/pos_y` 是 backend world 座標（未翻轉），內部會套 `-x` 配合渲染鏡像。
+fn build_facing_arrow(
+    scene: &mut Scene,
+    pos_x: f32,
+    pos_y: f32,
+    entity_size: f32,
+    facing: f32,
+) -> Handle<Node> {
+    let length = (entity_size * 0.7).max(0.12);
+    let thickness = (entity_size * 0.15).max(0.04);
+    // 渲染時 X 軸鏡像 → 角度用 π - facing 補回
+    let render_angle = std::f32::consts::PI - facing;
+    let offset_x = (length * 0.5) * render_angle.cos();
+    let offset_y = (length * 0.5) * render_angle.sin();
+    let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
+    RectangleBuilder::new(
+        BaseBuilder::new().with_local_transform(
+            TransformBuilder::new()
+                .with_local_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, 0.0007))
+                .with_local_rotation(rotation)
+                .with_local_scale(Vector3::new(length, thickness, f32::EPSILON))
+                .build(),
+        ),
+    )
+    .with_color(Color::from_rgba(255, 200, 0, 255))
+    .build(&mut scene.graph)
+    .transmute()
+}
+
 fn build_path_segment(
     scene: &mut Scene,
     from: Vector2<f32>,
