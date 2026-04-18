@@ -832,11 +832,11 @@ impl Plugin for Game {
             let pos = entity.prev_position.lerp(&entity.target_position, t);
             entity.position = pos;
 
-            // Update node position (keep same Z)
+            // Update node position (keep same Z) — X 取負讓 +X world 投到螢幕右
             let z = scene.graph[entity.node].local_transform().position().z;
             scene.graph[entity.node]
                 .local_transform_mut()
-                .set_position(Vector3::new(pos.x, pos.y, z));
+                .set_position(Vector3::new(-pos.x, pos.y, z));
 
             // Update HP bar positions
             if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
@@ -846,24 +846,24 @@ impl Plugin for Game {
 
                 scene.graph[bg]
                     .local_transform_mut()
-                    .set_position(Vector3::new(pos.x, bar_y, Z_HP_BAR));
+                    .set_position(Vector3::new(-pos.x, bar_y, Z_HP_BAR));
 
                 let fg_width = bar_width * hp_ratio;
                 let fg_offset = (bar_width - fg_width) * 0.5;
+                // 注意 fg_offset 在 X 方向偏移；X 翻轉後 offset 也要反向
                 scene.graph[fg]
                     .local_transform_mut()
-                    .set_position(Vector3::new(pos.x + fg_offset, bar_y, Z_HP_BAR - 0.0001))
+                    .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
                     .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
             }
         }
 
         // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
         //     current interpolated position; t forced to 1 at flight_time).
-        //     On visual impact (t>=1.0) we optimistically subtract `damage`
-        //     from the target's HP so the bar shrinks immediately; the 2-second
-        //     heartbeat carries an authoritative hp_snapshot that reconciles.
+        //     HP 改為完全由後端 "H" 事件 / heartbeat hp_snapshot 驅動，不做 optimistic 扣血 —
+        //     因為後端 projectile 有 homing + 時間限制，實際命中時間可能比前端 flight_time 長，
+        //     會造成 heartbeat 把前端已預測的 HP 往上拉 → 肉眼可見 bouncing。
         let mut finished: Vec<u32> = Vec::new();
-        let mut predicted_damage: Vec<(u32, f32)> = Vec::new();
         for (id, proj) in self.client_projectiles.iter_mut() {
             proj.elapsed += dt;
             let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
@@ -876,21 +876,9 @@ impl Plugin for Game {
             let pos = proj.start_pos + (target_pos - proj.start_pos) * t;
             scene.graph[proj.node]
                 .local_transform_mut()
-                .set_position(Vector3::new(pos.x, pos.y, Z_BULLET));
+                .set_position(Vector3::new(-pos.x, pos.y, Z_BULLET));
             if t >= 1.0 {
-                if !proj.applied && proj.damage > 0.0 {
-                    predicted_damage.push((proj.target_id, proj.damage));
-                    proj.applied = true;
-                }
                 finished.push(*id);
-            }
-        }
-        for (target_id, dmg) in predicted_damage {
-            if let Some(entity) = self.network_entities.get_mut(&target_id) {
-                if let Some((h, m)) = entity.health {
-                    let new_h = (h - dmg).max(0.0);
-                    entity.health = Some((new_h, m));
-                }
             }
         }
         for id in finished {
@@ -904,9 +892,10 @@ impl Plugin for Game {
             if let Some(hero_ent) = self.network_entities.get(&hero_id) {
                 let pos = hero_ent.position;
                 let z = scene.graph[self.camera].local_transform().position().z;
+                // 渲染時 X 負號：Fyrox 預設 +X 到螢幕左，我們希望 +X 到右，所以 entity/camera X 都反向
                 scene.graph[self.camera]
                     .local_transform_mut()
-                    .set_position(Vector3::new(pos.x, pos.y, z));
+                    .set_position(Vector3::new(-pos.x, pos.y, z));
                 self.camera_world_pos = pos;
 
                 // 週期性同步 viewport 給後端（~2 Hz）
@@ -958,18 +947,23 @@ impl Plugin for Game {
                 entity.name_label = Some(label);
             }
 
-            // Update label screen position (above HP bar)
+            // Update label screen position (above HP bar) + 文字含 HP 數字
             if let Some(label) = entity.name_label {
                 let name_world_y = entity.position.y + 0.5;
-                // 扣除 camera 位移，轉回 local-world 給 approx 函式
                 let screen_pos = world_to_screen_approx(
                     entity.position.x - self.camera_world_pos.x,
                     name_world_y - self.camera_world_pos.y,
                     win.x, win.y,
                 );
-                // Center the 180px-wide label horizontally
                 let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
                 ui.send(label, WidgetMessage::DesiredPosition(pos));
+
+                // 顯示「名字 HP/MaxHP」讓 HP bouncing 肉眼可見
+                let text = match entity.health {
+                    Some((h, m)) => format!("{} {:.0}/{:.0}", entity.name, h, m),
+                    None => entity.name.clone(),
+                };
+                ui.send(label, TextMessage::Text(text));
             }
         }
 
@@ -1313,7 +1307,7 @@ impl Game {
         let node: Handle<Node> = RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
-                    .with_local_position(Vector3::new(sx, sy, Z_BULLET))
+                    .with_local_position(Vector3::new(-sx, sy, Z_BULLET))
                     .with_local_scale(Vector3::new(0.1, 0.1, f32::EPSILON))
                     .build(),
             ),
@@ -1403,7 +1397,7 @@ impl Game {
         let node: Handle<Node> = RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
-                    .with_local_position(Vector3::new(x, y, z))
+                    .with_local_position(Vector3::new(-x, y, z))
                     .with_local_scale(Vector3::new(size, size, f32::EPSILON))
                     .build(),
             ),
@@ -1418,7 +1412,7 @@ impl Game {
             let bg = RectangleBuilder::new(
                 BaseBuilder::new().with_local_transform(
                     TransformBuilder::new()
-                        .with_local_position(Vector3::new(x, bar_y, Z_HP_BAR))
+                        .with_local_position(Vector3::new(-x, bar_y, Z_HP_BAR))
                         .with_local_scale(Vector3::new(0.8, 0.06, f32::EPSILON))
                         .build(),
                 ),
@@ -1430,7 +1424,7 @@ impl Game {
             let fg = RectangleBuilder::new(
                 BaseBuilder::new().with_local_transform(
                     TransformBuilder::new()
-                        .with_local_position(Vector3::new(x, bar_y, Z_HP_BAR - 0.0001))
+                        .with_local_position(Vector3::new(-x, bar_y, Z_HP_BAR - 0.0001))
                         .with_local_scale(Vector3::new(0.8, 0.06, f32::EPSILON))
                         .build(),
                 ),
@@ -1639,9 +1633,11 @@ fn build_path_segment(
     if length < f32::EPSILON {
         return None;
     }
-    let center = Vector3::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5, Z_PATH);
+    // X 軸渲染取負（配合 entity 翻轉）；rotation 也要跟著反向
+    let center = Vector3::new(-(from.x + to.x) * 0.5, (from.y + to.y) * 0.5, Z_PATH);
     let thickness = 0.05;
-    let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), dy.atan2(dx));
+    // atan2 裡 dx 要取負，讓旋轉方向與翻轉後一致
+    let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), dy.atan2(-dx));
     let handle = RectangleBuilder::new(
         BaseBuilder::new().with_local_transform(
             TransformBuilder::new()
@@ -1691,7 +1687,9 @@ fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32) -> Vec
     let world_height = 20.0;
     let aspect = window_w / window_h;
     let world_width = world_height * aspect;
-    let sx = (-wx / world_width + 0.5) * window_w;
+    // +X world → +X screen（camera 的 -1 X scale 已把原本的翻轉抵消）
+    let sx = (wx / world_width + 0.5) * window_w;
+    // +Y world → 螢幕上方（螢幕 pixel Y 向下，所以要反向）
     let sy = (-wy / world_height + 0.5) * window_h;
     Vector2::new(sx, sy)
 }
@@ -1705,7 +1703,9 @@ fn screen_to_world_approx(
 ) -> Vector2<f32> {
     let aspect = window_w / window_h;
     let world_width = world_height * aspect;
-    let wx = -(screen_x / window_w - 0.5) * world_width;
+    // 螢幕 +X → 世界 +X
+    let wx = (screen_x / window_w - 0.5) * world_width;
+    // 螢幕 +Y（向下）→ 世界 -Y
     let wy = -(screen_y / window_h - 0.5) * world_height;
     Vector2::new(wx, wy)
 }
