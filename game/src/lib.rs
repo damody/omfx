@@ -1223,11 +1223,20 @@ impl Game {
             ("hero", "stats") => self.hero_stats_update(&evt.data),
             ("hero", "inventory") => self.hero_inventory_update(&evt.data),
             ("game", "end") => self.game_end(&evt.data),
+            (_, "F" | "facing") => self.entity_facing_update(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
             (_, "M" | "move") => self.entity_move(&evt.data, scene),
             (_, "H" | "hp") => self.entity_hp_update(&evt.data, scene),
             (_, "D" | "delete") => self.entity_delete(&evt.data, scene),
             _ => {} // "R", "tick" etc. — ignore
+        }
+    }
+
+    fn entity_facing_update(&mut self, data: &serde_json::Value) {
+        let Some(id) = data.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else { return };
+        let Some(f) = data.get("facing").and_then(|v| v.as_f64()) else { return };
+        if let Some(entity) = self.network_entities.get_mut(&id) {
+            entity.facing = f as f32;
         }
     }
 
