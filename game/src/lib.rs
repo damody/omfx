@@ -72,6 +72,11 @@ enum NetCommand {
     PlaceTower { x: f32, y: f32 },
     HeroMove { x: f32, y: f32 },
     ViewportUpdate { cx: f32, cy: f32, hw: f32, hh: f32 },
+    CastAbility { slot: String, x: f32, y: f32 },
+    UpgradeSkill { slot: String },
+    BuyItem { item_id: String },
+    SellItem { slot: usize },
+    UseItem { slot: usize },
 }
 
 /// Timestamped backend event (for sorted buffering)
@@ -457,6 +462,26 @@ impl NetworkBridge {
                                 NetCommand::ViewportUpdate { cx, cy, hw, hh } => {
                                     let _ = client.send_viewport_update(cx, cy, hw, hh).await;
                                 }
+                                NetCommand::CastAbility { slot, x, y } => {
+                                    let _ = client.send_command("player", "cast_ability",
+                                        serde_json::json!({"slot": slot, "target_pos": [x, y]})).await;
+                                }
+                                NetCommand::UpgradeSkill { slot } => {
+                                    let _ = client.send_command("player", "upgrade_skill",
+                                        serde_json::json!({"slot": slot})).await;
+                                }
+                                NetCommand::BuyItem { item_id } => {
+                                    let _ = client.send_command("player", "buy_item",
+                                        serde_json::json!({"item_id": item_id})).await;
+                                }
+                                NetCommand::SellItem { slot } => {
+                                    let _ = client.send_command("player", "sell_item",
+                                        serde_json::json!({"slot": slot})).await;
+                                }
+                                NetCommand::UseItem { slot } => {
+                                    let _ = client.send_command("player", "use_item",
+                                        serde_json::json!({"slot": slot})).await;
+                                }
                             },
                             Err(crossbeam_channel::TryRecvError::Empty) => {
                                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -515,7 +540,60 @@ pub struct Game {
     // --- UI ---
     #[visit(skip)] #[reflect(hidden)]
     ui_status_text: Handle<Text>,
+    #[visit(skip)] #[reflect(hidden)]
+    ui_hud_text: Handle<Text>,
+    #[visit(skip)] #[reflect(hidden)]
+    ui_shop_text: Handle<Text>,
+    #[visit(skip)] #[reflect(hidden)]
+    ui_end_text: Handle<Text>,
+
+    // --- LoL MVP: Local Hero state cached from hero.* events ---
+    #[visit(skip)] #[reflect(hidden)]
+    hero_state: LocalHeroState,
+    #[visit(skip)] #[reflect(hidden)]
+    shop_visible: bool,
+    #[visit(skip)] #[reflect(hidden)]
+    shift_held: bool,
+    #[visit(skip)] #[reflect(hidden)]
+    game_ended: bool,
+    #[visit(skip)] #[reflect(hidden)]
+    viewport_sync_elapsed: f32,
+    /// Camera 目前所在 render-world 座標（用於滑鼠座標換算與 label 螢幕換算）
+    #[visit(skip)] #[reflect(hidden)]
+    camera_world_pos: Vector2<f32>,
 }
+
+/// 前端緩存的 hero 狀態（由 hero.stats / hero.inventory 事件驅動）
+#[derive(Default, Debug, Clone)]
+struct LocalHeroState {
+    /// 英雄在後端的 entity id，camera 跟隨用
+    entity_id: Option<u32>,
+    level: i32,
+    xp: i32,
+    xp_next: i32,
+    skill_points: i32,
+    gold: i32,
+    hp: f32,
+    max_hp: f32,
+    abilities: Vec<String>,          // ability ids, index 0=Q, 1=W, 2=E, 3=R
+    ability_levels: HashMap<String, i32>,
+    /// 6 個 slot，每個 (item_id, cd)
+    inventory: Vec<Option<(String, f32)>>,
+}
+
+/// MVP 商店清單（前端固定順序，對應後端 item id）
+const SHOP_ITEMS: &[(&str, &str, i32)] = &[
+    ("dmg_sword",    "長劍",       500),
+    ("dmg_rifle",    "無雙鐵炮",   1600),
+    ("hp_vest",      "皮甲",       450),
+    ("hp_armor",     "重裝甲",     1400),
+    ("mp_orb",       "法力珠",     400),
+    ("mp_staff",     "秘法杖",     1200),
+    ("ms_boots",     "戰靴",       400),
+    ("ms_swift",     "疾風之靴",   1300),
+    ("def_plate",    "鎖子甲",     500),
+    ("def_bulwark",  "堡壘之盾",   1500),
+];
 
 impl Plugin for Game {
     fn register(&self, _context: PluginRegistrationContext) -> GameResult {
@@ -526,6 +604,9 @@ impl Plugin for Game {
         self.window_size = Vector2::new(800.0, 600.0);
 
         let mut scene = Scene::new();
+
+        // Remove the default built-in skybox (shows as a blue/white gradient behind 2D content)
+        scene.set_skybox(None);
 
         // 2D rendering options
         use fyrox::scene::SceneRenderingOptions;
@@ -604,6 +685,42 @@ impl Plugin for Game {
         .with_text("Connecting...".to_string())
         .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
+
+        // LoL MVP HUD 文字（底部一行）
+        self.ui_hud_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(10.0, 540.0))
+                .with_width(1900.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(255, 240, 150, 255)).into()),
+        )
+        .with_text("".to_string())
+        .with_font_size(18.0.into())
+        .build(&mut ui.build_ctx());
+
+        // 商店面板（初始空字串；按 B 切換顯示內容）
+        self.ui_shop_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(40.0, 80.0))
+                .with_width(500.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(200, 220, 255, 255)).into()),
+        )
+        .with_text("".to_string())
+        .with_font_size(20.0.into())
+        .build(&mut ui.build_ctx());
+
+        // 結束 overlay（初始隱藏，以空文字表達）
+        self.ui_end_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(600.0, 250.0))
+                .with_width(800.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(255, 80, 80, 255)).into()),
+        )
+        .with_text("".to_string())
+        .with_font_size(72.0.into())
+        .build(&mut ui.build_ctx());
+
+        // Inventory 初始 6 格
+        self.hero_state.inventory = vec![None; 6];
 
         // Auto-start backend (tied to our lifetime via BackendGuard + Job Object)
         self.backend_guard = spawn_backend();
@@ -782,6 +899,35 @@ impl Plugin for Game {
             }
         }
 
+        // 4c. Camera follow hero
+        if let Some(hero_id) = self.hero_state.entity_id {
+            if let Some(hero_ent) = self.network_entities.get(&hero_id) {
+                let pos = hero_ent.position;
+                let z = scene.graph[self.camera].local_transform().position().z;
+                scene.graph[self.camera]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(pos.x, pos.y, z));
+                self.camera_world_pos = pos;
+
+                // 週期性同步 viewport 給後端（~2 Hz）
+                self.viewport_sync_elapsed += dt;
+                if self.viewport_sync_elapsed >= 0.5 {
+                    self.viewport_sync_elapsed = 0.0;
+                    if let Some(ref network) = self.network {
+                        let aspect = self.window_size.x / self.window_size.y.max(1.0);
+                        let half_height = 10.0 / WORLD_SCALE;
+                        let half_width = 10.0 * aspect / WORLD_SCALE;
+                        let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
+                            cx: pos.x / WORLD_SCALE,
+                            cy: pos.y / WORLD_SCALE,
+                            hw: half_width,
+                            hh: half_height,
+                        });
+                    }
+                }
+            }
+        }
+
         // 5. Update name labels (UI layer)
         let ui = context.user_interfaces.first_mut();
         let win = self.window_size;
@@ -815,8 +961,11 @@ impl Plugin for Game {
             // Update label screen position (above HP bar)
             if let Some(label) = entity.name_label {
                 let name_world_y = entity.position.y + 0.5;
+                // 扣除 camera 位移，轉回 local-world 給 approx 函式
                 let screen_pos = world_to_screen_approx(
-                    entity.position.x, name_world_y, win.x, win.y,
+                    entity.position.x - self.camera_world_pos.x,
+                    name_world_y - self.camera_world_pos.y,
+                    win.x, win.y,
                 );
                 // Center the 180px-wide label horizontally
                 let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
@@ -840,6 +989,61 @@ impl Plugin for Game {
         };
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
+        // LoL MVP HUD: 本地 CD 平滑遞減 + 組 HUD 文字
+        {
+            for slot in self.hero_state.inventory.iter_mut() {
+                if let Some((_, cd)) = slot.as_mut() {
+                    if *cd > 0.0 {
+                        *cd = (*cd - dt).max(0.0);
+                    }
+                }
+            }
+            let hs = &self.hero_state;
+            // 組技能 Q/W/E/R 顯示
+            let slot_names = ["Q", "W", "E", "R"];
+            let mut qwer = String::new();
+            for (i, n) in slot_names.iter().enumerate() {
+                let id = hs.abilities.get(i).cloned().unwrap_or_default();
+                let lvl = hs.ability_levels.get(&id).copied().unwrap_or(0);
+                qwer.push_str(&format!("{}:L{} ", n, lvl));
+            }
+            // Inventory 顯示
+            let mut inv = String::new();
+            for (i, slot) in hs.inventory.iter().enumerate() {
+                match slot {
+                    Some((id, cd)) => {
+                        if *cd > 0.0 {
+                            inv.push_str(&format!("[{}]{}({:.0}s) ", i + 1, id, cd));
+                        } else {
+                            inv.push_str(&format!("[{}]{} ", i + 1, id));
+                        }
+                    }
+                    None => inv.push_str(&format!("[{}]- ", i + 1)),
+                }
+            }
+            let hud = format!(
+                "HP {:.0}/{:.0}  LV {}  XP {}/{}  GOLD {}  SP {}  |  {}|  {}",
+                hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.gold, hs.skill_points, qwer, inv,
+            );
+            ui.send(self.ui_hud_text, TextMessage::Text(hud));
+
+            // 商店顯示 / 隱藏
+            let shop = if self.shop_visible {
+                let mut s = String::from("=== SHOP (按 B 關閉) ===\n");
+                for (i, (id, name, cost)) in SHOP_ITEMS.iter().enumerate() {
+                    s.push_str(&format!("{}. {} ({}) — {}g\n", i, name, id, cost));
+                }
+                s.push_str("按 0-9 購買對應編號裝備（需靠近基地）");
+                s
+            } else {
+                String::new()
+            };
+            ui.send(self.ui_shop_text, TextMessage::Text(shop));
+
+            let end_str = if self.game_ended { "VICTORY!".to_string() } else { String::new() };
+            ui.send(self.ui_end_text, TextMessage::Text(end_str));
+        }
+
         Ok(())
     }
 
@@ -855,13 +1059,15 @@ impl Plugin for Game {
                 event: WindowEvent::CursorMoved { position, .. },
                 ..
             } => {
-                self.mouse_world_pos = screen_to_world_approx(
+                let local = screen_to_world_approx(
                     position.x as f32,
                     position.y as f32,
                     self.window_size.x,
                     self.window_size.y,
                     20.0, // matches camera vertical_size * 2
                 );
+                // 加上 camera 位移，得到絕對 render-world 座標
+                self.mouse_world_pos = local + self.camera_world_pos;
             }
             Event::WindowEvent {
                 event:
@@ -896,6 +1102,86 @@ impl Plugin for Game {
                     let _ = network.cmd_tx.send(NetCommand::HeroMove { x: world_pos.x / WORLD_SCALE, y: world_pos.y / WORLD_SCALE });
                 }
             }
+            // LoL MVP 鍵盤輸入
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event: key_event, .. },
+                ..
+            } => {
+                use fyrox::event::ElementState as ES;
+                use fyrox::keyboard::{KeyCode, PhysicalKey};
+                let pressed = key_event.state == ES::Pressed;
+                let key = match key_event.physical_key {
+                    PhysicalKey::Code(c) => c,
+                    _ => return Ok(()),
+                };
+
+                // Shift 狀態追蹤
+                match key {
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                        self.shift_held = pressed;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if !pressed { return Ok(()); }
+
+                let world = self.mouse_world_pos;
+                let tx = self.network.as_ref().map(|n| n.cmd_tx.clone());
+                let send = |cmd: NetCommand| {
+                    if let Some(ref t) = tx { let _ = t.send(cmd); }
+                };
+
+                match key {
+                    KeyCode::KeyQ | KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR => {
+                        let slot = match key {
+                            KeyCode::KeyQ => "Q",
+                            KeyCode::KeyW => "W",
+                            KeyCode::KeyE => "E",
+                            KeyCode::KeyR => "R",
+                            _ => unreachable!(),
+                        }.to_string();
+                        if self.shift_held {
+                            send(NetCommand::UpgradeSkill { slot });
+                        } else {
+                            send(NetCommand::CastAbility {
+                                slot,
+                                x: world.x / WORLD_SCALE,
+                                y: world.y / WORLD_SCALE,
+                            });
+                        }
+                    }
+                    KeyCode::KeyB => {
+                        self.shop_visible = !self.shop_visible;
+                    }
+                    // 數字鍵: shop 開啟時購買對應 index 裝備；否則使用對應背包 slot
+                    KeyCode::Digit0 | KeyCode::Digit1 | KeyCode::Digit2
+                    | KeyCode::Digit3 | KeyCode::Digit4 | KeyCode::Digit5
+                    | KeyCode::Digit6 | KeyCode::Digit7 | KeyCode::Digit8
+                    | KeyCode::Digit9 => {
+                        let idx: usize = match key {
+                            KeyCode::Digit0 => 0, KeyCode::Digit1 => 1,
+                            KeyCode::Digit2 => 2, KeyCode::Digit3 => 3,
+                            KeyCode::Digit4 => 4, KeyCode::Digit5 => 5,
+                            KeyCode::Digit6 => 6, KeyCode::Digit7 => 7,
+                            KeyCode::Digit8 => 8, KeyCode::Digit9 => 9,
+                            _ => unreachable!(),
+                        };
+                        if self.shop_visible {
+                            if let Some((id, _, _)) = SHOP_ITEMS.get(idx) {
+                                send(NetCommand::BuyItem { item_id: id.to_string() });
+                            }
+                        } else if idx >= 1 && idx <= 6 {
+                            // 使用 inventory slot (1-6 → 0-5)
+                            if self.shift_held {
+                                send(NetCommand::SellItem { slot: idx - 1 });
+                            } else {
+                                send(NetCommand::UseItem { slot: idx - 1 });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -922,12 +1208,62 @@ impl Game {
             ("projectile", "C" | "create") => self.projectile_create(&evt.data, scene),
             ("projectile", "D" | "delete") => self.projectile_delete(&evt.data, scene),
             ("projectile", _) => {} // ignore stray M events (legacy compat)
+            ("hero", "stats") => self.hero_stats_update(&evt.data),
+            ("hero", "inventory") => self.hero_inventory_update(&evt.data),
+            ("game", "end") => self.game_end(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
             (_, "M" | "move") => self.entity_move(&evt.data, scene),
             (_, "H" | "hp") => self.entity_hp_update(&evt.data, scene),
             (_, "D" | "delete") => self.entity_delete(&evt.data, scene),
             _ => {} // "R", "tick" etc. — ignore
         }
+    }
+
+    fn hero_stats_update(&mut self, data: &serde_json::Value) {
+        let hs = &mut self.hero_state;
+        if let Some(v) = data.get("id").and_then(|v| v.as_u64()) { hs.entity_id = Some(v as u32); }
+        if let Some(v) = data.get("level").and_then(|v| v.as_i64()) { hs.level = v as i32; }
+        if let Some(v) = data.get("xp").and_then(|v| v.as_i64()) { hs.xp = v as i32; }
+        if let Some(v) = data.get("xp_next").and_then(|v| v.as_i64()) { hs.xp_next = v as i32; }
+        if let Some(v) = data.get("skill_points").and_then(|v| v.as_i64()) { hs.skill_points = v as i32; }
+        if let Some(v) = data.get("gold").and_then(|v| v.as_i64()) { hs.gold = v as i32; }
+        if let Some(v) = data.get("hp").and_then(|v| v.as_f64()) { hs.hp = v as f32; }
+        if let Some(v) = data.get("max_hp").and_then(|v| v.as_f64()) { hs.max_hp = v as f32; }
+        if let Some(arr) = data.get("abilities").and_then(|v| v.as_array()) {
+            hs.abilities = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+        if let Some(obj) = data.get("ability_levels").and_then(|v| v.as_object()) {
+            hs.ability_levels.clear();
+            for (k, v) in obj {
+                if let Some(lvl) = v.as_i64() {
+                    hs.ability_levels.insert(k.clone(), lvl as i32);
+                }
+            }
+        }
+    }
+
+    fn hero_inventory_update(&mut self, data: &serde_json::Value) {
+        if let Some(arr) = data.get("slots").and_then(|v| v.as_array()) {
+            let mut slots: Vec<Option<(String, f32)>> = vec![None; 6];
+            for (i, v) in arr.iter().enumerate().take(6) {
+                if v.is_null() { slots[i] = None; continue; }
+                let id = v.get("item_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let cd = v.get("cd").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                if !id.is_empty() { slots[i] = Some((id, cd)); }
+            }
+            self.hero_state.inventory = slots;
+        }
+    }
+
+    fn game_end(&mut self, data: &serde_json::Value) {
+        let winner = data.get("winner").and_then(|v| v.as_str()).unwrap_or("?");
+        self.game_ended = true;
+        let msg = if winner == "player" { "VICTORY!" } else { "DEFEAT" };
+        log::info!("🏆 game.end received: winner={}", winner);
+        // 本 frame update 再 push 字串，這裡僅存標記
+        // 透過 ui_end_text 欄位於 update 迴圈更新字
+        // 為簡化 — 在 update 直接檢查 game_ended
+        let _ = msg; // suppress unused
     }
 
     /// Handle projectile spawn: build a scene node at start_pos and register a
