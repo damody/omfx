@@ -16,10 +16,11 @@ use fyrox::{
     event::{ElementState, Event, MouseButton, WindowEvent},
     gui::{
         brush::Brush,
-        message::UiMessage,
+        image::{ImageBuilder, ImageMessage},
+        message::{MessageDirection, UiMessage},
         text::{Text, TextBuilder, TextMessage},
         widget::{WidgetBuilder, WidgetMessage},
-        HorizontalAlignment, UserInterface, VerticalAlignment,
+        HorizontalAlignment, UiNode, UserInterface, VerticalAlignment,
     },
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
     scene::{
@@ -547,6 +548,31 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     ui_hud_text: Handle<Text>,
     #[visit(skip)] #[reflect(hidden)]
+    ui_ability_icons: [Handle<UiNode>; 4],
+    #[visit(skip)] #[reflect(hidden)]
+    ui_ability_level_text: [Handle<Text>; 4],
+    /// 4 技能圖片資源（HUD icon + tooltip icon 共用）
+    #[visit(skip)] #[reflect(hidden)]
+    ability_textures: [Option<fyrox::resource::texture::TextureResource>; 4],
+    /// 4 icon 的 screen AABB (x, y, w, h) — 供滑鼠 hit-test
+    #[visit(skip)] #[reflect(hidden)]
+    ability_icon_rects: [(f32, f32, f32, f32); 4],
+    /// 技能詳細資訊 map（key = ability id），由 hero.abilities_info 事件填入
+    #[visit(skip)] #[reflect(hidden)]
+    ability_info_map: HashMap<String, AbilityInfo>,
+    /// 原始滑鼠螢幕座標（pixel）
+    #[visit(skip)] #[reflect(hidden)]
+    mouse_screen_pos: Vector2<f32>,
+    /// 目前 hover 的 ability slot index（0-3）
+    #[visit(skip)] #[reflect(hidden)]
+    hovered_ability: Option<usize>,
+    #[visit(skip)] #[reflect(hidden)]
+    ui_tooltip_bg: Handle<UiNode>,
+    #[visit(skip)] #[reflect(hidden)]
+    ui_tooltip_icon: Handle<UiNode>,
+    #[visit(skip)] #[reflect(hidden)]
+    ui_tooltip_text: Handle<Text>,
+    #[visit(skip)] #[reflect(hidden)]
     ui_shop_text: Handle<Text>,
     #[visit(skip)] #[reflect(hidden)]
     ui_end_text: Handle<Text>,
@@ -565,6 +591,29 @@ pub struct Game {
     /// Camera 目前所在 render-world 座標（用於滑鼠座標換算與 label 螢幕換算）
     #[visit(skip)] #[reflect(hidden)]
     camera_world_pos: Vector2<f32>,
+    /// 本秒累計的網路事件 payload bytes
+    #[visit(skip)] #[reflect(hidden)]
+    net_bytes_current: u64,
+    /// 上一秒的總 bytes，供顯示用
+    #[visit(skip)] #[reflect(hidden)]
+    net_bytes_last_sec: u64,
+    /// 計時：每滿 1 秒 roll over
+    #[visit(skip)] #[reflect(hidden)]
+    net_stats_elapsed: f32,
+}
+
+/// 技能詳細資訊（後端一次性廣播，用於 tooltip）
+#[derive(Debug, Clone, Default)]
+struct AbilityInfo {
+    id: String,
+    name: String,
+    description: String,
+    key_binding: String,
+    max_level: i32,
+    cooldown: Vec<f32>,
+    mana_cost: Vec<i32>,
+    cast_range: Vec<f32>,
+    effects: HashMap<String, serde_json::Value>,
 }
 
 /// 前端緩存的 hero 狀態（由 hero.stats / hero.inventory 事件驅動）
@@ -681,10 +730,98 @@ impl Plugin for Game {
             }
         }
 
+        // 載入孫市四技能圖示（hero1_1..4）放到底部 HUD；失敗時退到純色方塊 fallback。
+        {
+            use fyrox::asset::untyped::ResourceKind;
+            use fyrox::core::uuid::Uuid;
+            use fyrox::resource::texture::{Texture, TextureResource};
+
+            let base_x = 500.0f32;
+            let icon_y = 620.0f32;
+            let icon_size = 56.0f32;
+            let spacing = 64.0f32;
+            let slot_label = ["W", "E", "R", "T"];
+
+            for i in 0..4 {
+                let path = format!("data/hero1_{}.png", i + 1);
+                let x = base_x + (i as f32) * spacing;
+                self.ability_icon_rects[i] = (x, icon_y, icon_size, icon_size);
+
+                let resource_opt: Option<TextureResource> = match std::fs::read(&path) {
+                    Ok(bytes) => match Texture::load_from_memory(&bytes, Default::default()) {
+                        Ok(tex) => Some(TextureResource::new_ok(
+                            Uuid::new_v4(),
+                            ResourceKind::Embedded,
+                            tex,
+                        )),
+                        Err(e) => {
+                            log::warn!("{} 解碼失敗 ({:?})", path, e);
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("讀不到 {}（{}）", path, e);
+                        None
+                    }
+                };
+
+                let icon_handle: Handle<UiNode> = if let Some(ref resource) = resource_opt {
+                    let h: Handle<fyrox::gui::image::Image> = ImageBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(x, icon_y))
+                            .with_width(icon_size)
+                            .with_height(icon_size),
+                    )
+                    .with_texture(resource.clone().into())
+                    .build(&mut ui.build_ctx());
+                    h.transmute()
+                } else {
+                    Handle::NONE
+                };
+                self.ui_ability_icons[i] = icon_handle;
+                self.ability_textures[i] = resource_opt;
+
+                // Icon 右下角疊等級/CD 文字
+                let lvl = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(x + 36.0, icon_y + 36.0))
+                        .with_width(40.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                )
+                .with_text(format!("{} L0", slot_label[i]))
+                .with_font_size(14.0.into())
+                .build(&mut ui.build_ctx());
+                self.ui_ability_level_text[i] = lvl;
+            }
+
+            // Tooltip：icon + text，初始位置在螢幕外（隱藏）
+            // 背景先跳過（text 黑字在淺綠背景已夠清楚），未來有需要再加
+            self.ui_tooltip_bg = Handle::NONE;
+            self.ui_tooltip_icon = {
+                let h: Handle<fyrox::gui::image::Image> = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                        .with_width(80.0)
+                        .with_height(80.0),
+                )
+                .build(&mut ui.build_ctx());
+                h.transmute()
+            };
+            self.ui_tooltip_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                    .with_width(360.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+            )
+            .with_text("".to_string())
+            .with_font_size(14.0.into())
+            .build(&mut ui.build_ctx());
+        }
+
         self.ui_status_text = TextBuilder::new(
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(10.0, 10.0))
-                .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("Connecting...".to_string())
         .with_font_size(18.0.into())
@@ -695,7 +832,7 @@ impl Plugin for Game {
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(10.0, 540.0))
                 .with_width(1900.0)
-                .with_foreground(Brush::Solid(Color::from_rgba(255, 240, 150, 255)).into()),
+                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("".to_string())
         .with_font_size(18.0.into())
@@ -706,7 +843,7 @@ impl Plugin for Game {
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(40.0, 80.0))
                 .with_width(500.0)
-                .with_foreground(Brush::Solid(Color::from_rgba(200, 220, 255, 255)).into()),
+                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("".to_string())
         .with_font_size(20.0.into())
@@ -717,7 +854,7 @@ impl Plugin for Game {
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(600.0, 250.0))
                 .with_width(800.0)
-                .with_foreground(Brush::Solid(Color::from_rgba(255, 80, 80, 255)).into()),
+                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("".to_string())
         .with_font_size(72.0.into())
@@ -775,10 +912,21 @@ impl Plugin for Game {
             }
         }
 
+        // 網路流量統計：每秒 roll over
+        self.net_stats_elapsed += context.dt;
+        if self.net_stats_elapsed >= 1.0 {
+            self.net_bytes_last_sec = self.net_bytes_current;
+            self.net_bytes_current = 0;
+            self.net_stats_elapsed -= 1.0;
+        }
+
         // 2. Receive events from NetworkBridge, push into EventBuffer
         if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
             let mut pending_hp_sync: Option<serde_json::Value> = None;
             for evt in network.event_rx.try_iter() {
+                // 估算 event 位元數：msg_type + action + JSON payload + 固定 overhead (~16 for timestamp)
+                let payload_bytes = serde_json::to_string(&evt.data).map(|s| s.len()).unwrap_or(0);
+                self.net_bytes_current += (evt.msg_type.len() + evt.action.len() + payload_bytes + 16) as u64;
                 // Heartbeat: calibrate clock immediately, don't buffer
                 if evt.msg_type == "heartbeat" && evt.action == "tick" {
                     buffer.sync_clock(evt.timestamp_ms);
@@ -878,10 +1026,11 @@ impl Plugin for Game {
 
         // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
         //     current interpolated position; t forced to 1 at flight_time).
-        //     HP 改為完全由後端 "H" 事件 / heartbeat hp_snapshot 驅動，不做 optimistic 扣血 —
-        //     因為後端 projectile 有 homing + 時間限制，實際命中時間可能比前端 flight_time 長，
-        //     會造成 heartbeat 把前端已預測的 HP 往上拉 → 肉眼可見 bouncing。
+        //     後端改為 100ms batch 發送，client flight_time 與 backend projectile time 已對齊
+        //     (game_processor.rs 裡用 initial_dist / bullet_speed 設 safety_time_left 的 1/3)，
+        //     所以彈落時 optimistic 扣血與 100ms 內到達的 backend "H" 事件幾乎 sync，不會 bouncing。
         let mut finished: Vec<u32> = Vec::new();
+        let mut predicted_damage: Vec<(u32, f32)> = Vec::new();
         for (id, proj) in self.client_projectiles.iter_mut() {
             proj.elapsed += dt;
             let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
@@ -896,7 +1045,20 @@ impl Plugin for Game {
                 .local_transform_mut()
                 .set_position(Vector3::new(-pos.x, pos.y, Z_BULLET));
             if t >= 1.0 {
+                if !proj.applied && proj.damage > 0.0 {
+                    predicted_damage.push((proj.target_id, proj.damage));
+                    proj.applied = true;
+                }
                 finished.push(*id);
+            }
+        }
+        // Optimistic 扣血：等後續 backend "H" 事件（約 0~100ms 內）reconcile
+        for (target_id, dmg) in predicted_damage {
+            if let Some(entity) = self.network_entities.get_mut(&target_id) {
+                if let Some((h, m)) = entity.health {
+                    let new_h = (h - dmg).max(0.0);
+                    entity.health = Some((new_h, m));
+                }
             }
         }
         for id in finished {
@@ -989,14 +1151,25 @@ impl Plugin for Game {
         let status_str = match &self.connection_status {
             ConnectionStatus::Disconnected => "Disconnected".to_string(),
             ConnectionStatus::Connecting => "Connecting...".to_string(),
-            ConnectionStatus::Connected => format!(
-                "Connected | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {}",
-                self.heartbeat.tick,
-                self.heartbeat.game_time,
-                self.heartbeat.entity_count,
-                self.heartbeat.hero_count,
-                self.heartbeat.creep_count,
-            ),
+            ConnectionStatus::Connected => {
+                let bps = self.net_bytes_last_sec;
+                let net_str = if bps >= 1_000_000 {
+                    format!("{:.2} MB/s", bps as f64 / 1_000_000.0)
+                } else if bps >= 1_000 {
+                    format!("{:.1} KB/s", bps as f64 / 1_000.0)
+                } else {
+                    format!("{} B/s", bps)
+                };
+                format!(
+                    "Connected | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {}",
+                    self.heartbeat.tick,
+                    self.heartbeat.game_time,
+                    self.heartbeat.entity_count,
+                    self.heartbeat.hero_count,
+                    self.heartbeat.creep_count,
+                    net_str,
+                )
+            }
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
         };
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
@@ -1011,13 +1184,13 @@ impl Plugin for Game {
                 }
             }
             let hs = &self.hero_state;
-            // 組技能 Q/W/E/R 顯示
-            let slot_names = ["Q", "W", "E", "R"];
-            let mut qwer = String::new();
+            // 更新技能 icon 右下的等級文字（WERT）
+            let slot_names = ["W", "E", "R", "T"];
             for (i, n) in slot_names.iter().enumerate() {
                 let id = hs.abilities.get(i).cloned().unwrap_or_default();
                 let lvl = hs.ability_levels.get(&id).copied().unwrap_or(0);
-                qwer.push_str(&format!("{}:L{} ", n, lvl));
+                let lvl_handle = self.ui_ability_level_text[i];
+                ui.send(lvl_handle, TextMessage::Text(format!("{} L{}", n, lvl)));
             }
             // Inventory 顯示
             let mut inv = String::new();
@@ -1034,8 +1207,8 @@ impl Plugin for Game {
                 }
             }
             let hud = format!(
-                "HP {:.0}/{:.0}  LV {}  XP {}/{}  GOLD {}  SP {}  |  {}|  {}",
-                hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.gold, hs.skill_points, qwer, inv,
+                "HP {:.0}/{:.0}  LV {}  XP {}/{}  GOLD {}  SP {}  |  {}",
+                hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.gold, hs.skill_points, inv,
             );
             ui.send(self.ui_hud_text, TextMessage::Text(hud));
 
@@ -1054,6 +1227,66 @@ impl Plugin for Game {
 
             let end_str = if self.game_ended { "VICTORY!".to_string() } else { String::new() };
             ui.send(self.ui_end_text, TextMessage::Text(end_str));
+
+            // ===== 技能 tooltip hit-test + 更新 =====
+            let mouse = self.mouse_screen_pos;
+            let mut new_hover: Option<usize> = None;
+            for (i, rect) in self.ability_icon_rects.iter().enumerate() {
+                let (rx, ry, rw, rh) = *rect;
+                if mouse.x >= rx && mouse.x <= rx + rw && mouse.y >= ry && mouse.y <= ry + rh {
+                    new_hover = Some(i);
+                    break;
+                }
+            }
+            // 只在 hover 變化時才 rebuild tooltip，並每 frame 重新定位
+            if new_hover != self.hovered_ability {
+                self.hovered_ability = new_hover;
+                match new_hover {
+                    Some(idx) => {
+                        // 更新 tooltip icon texture
+                        if let Some(tex) = self.ability_textures[idx].as_ref() {
+                            ui.send(self.ui_tooltip_icon, ImageMessage::Texture(Some(tex.clone().into())));
+                        }
+                        // 查 ability info 組 tooltip 字串
+                        let hs = &self.hero_state;
+                        let ability_id = hs.abilities.get(idx).cloned().unwrap_or_default();
+                        let cur_lvl = hs.ability_levels.get(&ability_id).copied().unwrap_or(0);
+                        let tooltip_str = if let Some(info) = self.ability_info_map.get(&ability_id) {
+                            format_ability_tooltip(info, cur_lvl)
+                        } else {
+                            format!("(尚未收到技能資訊)\nSlot {}", idx)
+                        };
+                        ui.send(self.ui_tooltip_text, TextMessage::Text(tooltip_str));
+                    }
+                    None => {
+                        // 隱藏：文字清空 + 移到螢幕外
+                        ui.send(self.ui_tooltip_text, TextMessage::Text(String::new()));
+                        ui.send(
+                            self.ui_tooltip_icon,
+                            WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)),
+                        );
+                        ui.send(
+                            self.ui_tooltip_text,
+                            WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)),
+                        );
+                    }
+                }
+            }
+            // 每 frame 定位（若有 hover）
+            if self.hovered_ability.is_some() {
+                let mut tx = mouse.x + 16.0;
+                let mut ty = mouse.y - 190.0;
+                if tx + 460.0 > win.x { tx = (win.x - 460.0).max(0.0); }
+                if ty < 0.0 { ty = 0.0; }
+                ui.send(
+                    self.ui_tooltip_icon,
+                    WidgetMessage::DesiredPosition(Vector2::new(tx, ty)),
+                );
+                ui.send(
+                    self.ui_tooltip_text,
+                    WidgetMessage::DesiredPosition(Vector2::new(tx + 88.0, ty)),
+                );
+            }
         }
 
         Ok(())
@@ -1080,6 +1313,8 @@ impl Plugin for Game {
                 );
                 // 加上 camera 位移，得到絕對 render-world 座標
                 self.mouse_world_pos = local + self.camera_world_pos;
+                // 原始 pixel 座標，供 tooltip hit-test 用
+                self.mouse_screen_pos = Vector2::new(position.x as f32, position.y as f32);
             }
             Event::WindowEvent {
                 event:
@@ -1144,12 +1379,12 @@ impl Plugin for Game {
                 };
 
                 match key {
-                    KeyCode::KeyQ | KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR => {
+                    KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR | KeyCode::KeyT => {
                         let slot = match key {
-                            KeyCode::KeyQ => "Q",
                             KeyCode::KeyW => "W",
                             KeyCode::KeyE => "E",
                             KeyCode::KeyR => "R",
+                            KeyCode::KeyT => "T",
                             _ => unreachable!(),
                         }.to_string();
                         if self.shift_held {
@@ -1222,6 +1457,7 @@ impl Game {
             ("projectile", _) => {} // ignore stray M events (legacy compat)
             ("hero", "stats") => self.hero_stats_update(&evt.data),
             ("hero", "inventory") => self.hero_inventory_update(&evt.data),
+            ("hero", "abilities_info") => self.hero_abilities_info_update(&evt.data),
             ("game", "end") => self.game_end(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
@@ -1274,6 +1510,39 @@ impl Game {
             }
             self.hero_state.inventory = slots;
         }
+    }
+
+    fn hero_abilities_info_update(&mut self, data: &serde_json::Value) {
+        let arr = match data.get("abilities").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return,
+        };
+        self.ability_info_map.clear();
+        for v in arr {
+            let info = AbilityInfo {
+                id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                description: v.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                key_binding: v.get("key_binding").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                max_level: v.get("max_level").and_then(|x| x.as_i64()).unwrap_or(4) as i32,
+                cooldown: v.get("cooldown").and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|e| e.as_f64()).map(|f| f as f32).collect())
+                    .unwrap_or_default(),
+                mana_cost: v.get("mana_cost").and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|e| e.as_i64()).map(|f| f as i32).collect())
+                    .unwrap_or_default(),
+                cast_range: v.get("cast_range").and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|e| e.as_f64()).map(|f| f as f32).collect())
+                    .unwrap_or_default(),
+                effects: v.get("effects").and_then(|x| x.as_object())
+                    .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default(),
+            };
+            if !info.id.is_empty() {
+                self.ability_info_map.insert(info.id.clone(), info);
+            }
+        }
+        log::info!("收到 {} 個技能詳細資訊", self.ability_info_map.len());
     }
 
     fn game_end(&mut self, data: &serde_json::Value) {
@@ -1669,6 +1938,83 @@ impl Game {
 /// Returns `None` if the segment has zero length.
 /// 為單位建立一個指向面向方向的箭頭（偏離中心一半 length，讓箭頭伸出單位外）
 /// `pos_x/pos_y` 是 backend world 座標（未翻轉），內部會套 `-x` 配合渲染鏡像。
+/// 組 tooltip 文字：名稱 + 描述 + 當前 vs 下一級數值
+fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
+    let max = info.max_level;
+    let mut out = String::new();
+    out.push_str(&format!("{}    [{}]\n", info.name, info.key_binding));
+    out.push_str("──────────────────────────\n");
+    out.push_str(&format!("{}\n", info.description));
+    out.push_str("──────────────────────────\n");
+    out.push_str(&format!("當前等級 {}/{}\n", cur_lvl, max));
+
+    // 取 array[idx]，idx 越界回傳 last 值
+    fn at_f32(arr: &[f32], idx: usize) -> Option<f32> {
+        if arr.is_empty() { None } else { Some(arr[idx.min(arr.len() - 1)]) }
+    }
+    fn at_i32(arr: &[i32], idx: usize) -> Option<i32> {
+        if arr.is_empty() { None } else { Some(arr[idx.min(arr.len() - 1)]) }
+    }
+
+    // 顯示欄位：cur 是指「當前等級對應的 array index」；若 cur_lvl=0 就看 array[0] 作為 L1 預覽
+    let show_idx = (cur_lvl.max(1) - 1) as usize;
+    let next_idx = (cur_lvl as usize).min((max as usize).saturating_sub(1));
+    let show_next = cur_lvl < max;
+
+    if let (Some(c), Some(n)) = (at_f32(&info.cooldown, show_idx), at_f32(&info.cooldown, next_idx)) {
+        if show_next && (c - n).abs() > f32::EPSILON {
+            out.push_str(&format!("冷卻: {:.1}s → {:.1}s\n", c, n));
+        } else {
+            out.push_str(&format!("冷卻: {:.1}s\n", c));
+        }
+    }
+    if let (Some(c), Some(n)) = (at_i32(&info.mana_cost, show_idx), at_i32(&info.mana_cost, next_idx)) {
+        if show_next && c != n {
+            out.push_str(&format!("魔力: {} → {}\n", c, n));
+        } else {
+            out.push_str(&format!("魔力: {}\n", c));
+        }
+    }
+    if let (Some(c), Some(n)) = (at_f32(&info.cast_range, show_idx), at_f32(&info.cast_range, next_idx)) {
+        if c > 0.0 {
+            if show_next && (c - n).abs() > f32::EPSILON {
+                out.push_str(&format!("射程: {:.0} → {:.0}\n", c, n));
+            } else {
+                out.push_str(&format!("射程: {:.0}\n", c));
+            }
+        }
+    }
+    // effects：每個 key 若 value 是 array，取 cur/next；是 scalar 直接印
+    if !info.effects.is_empty() {
+        out.push_str("效果:\n");
+        for (k, v) in info.effects.iter() {
+            if let Some(arr) = v.as_array() {
+                let cur = arr.get(show_idx).and_then(|e| e.as_f64());
+                let nxt = arr.get(next_idx).and_then(|e| e.as_f64());
+                match (cur, nxt) {
+                    (Some(c), Some(n)) => {
+                        if show_next && (c - n).abs() > f64::EPSILON {
+                            out.push_str(&format!("  {}: {} → {}\n", k, c, n));
+                        } else {
+                            out.push_str(&format!("  {}: {}\n", k, c));
+                        }
+                    }
+                    (Some(c), None) => out.push_str(&format!("  {}: {}\n", k, c)),
+                    _ => {}
+                }
+            } else if let Some(n) = v.as_f64() {
+                out.push_str(&format!("  {}: {}\n", k, n));
+            } else if let Some(s) = v.as_str() {
+                out.push_str(&format!("  {}: {}\n", k, s));
+            }
+        }
+    }
+    if cur_lvl < max {
+        out.push_str(&format!("Shift+{} 升級（需 1 技能點）\n", info.key_binding));
+    }
+    out
+}
+
 fn build_facing_arrow(
     scene: &mut Scene,
     pos_x: f32,
