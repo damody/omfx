@@ -1069,7 +1069,6 @@ dependencies = [
  "fyrox",
  "fyroxed_base",
  "omfx",
- "serde_json",
 ]
 
 [[package]]
