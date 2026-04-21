@@ -551,6 +551,12 @@ pub struct Game {
     ui_ability_icons: [Handle<UiNode>; 4],
     #[visit(skip)] #[reflect(hidden)]
     ui_ability_level_text: [Handle<Text>; 4],
+    /// 冷卻中央大數字
+    #[visit(skip)] #[reflect(hidden)]
+    ui_ability_cd_text: [Handle<Text>; 4],
+    /// 快捷鍵 cap [W] [E] [R] [T]
+    #[visit(skip)] #[reflect(hidden)]
+    ui_ability_key_text: [Handle<Text>; 4],
     /// 4 技能圖片資源（HUD icon + tooltip icon 共用）
     #[visit(skip)] #[reflect(hidden)]
     ability_textures: [Option<fyrox::resource::texture::TextureResource>; 4],
@@ -630,6 +636,8 @@ struct LocalHeroState {
     max_hp: f32,
     abilities: Vec<String>,          // ability ids, index 0=Q, 1=W, 2=E, 3=R
     ability_levels: HashMap<String, i32>,
+    /// 技能剩餘冷卻秒數（key = ability id），本地遞減
+    ability_cd: HashMap<String, f32>,
     /// 6 個 slot，每個 (item_id, cd)
     inventory: Vec<Option<(String, f32)>>,
 }
@@ -817,17 +825,41 @@ impl Plugin for Game {
                 self.ui_ability_icons[i] = icon_handle;
                 self.ability_textures[i] = texture_opt;
 
-                // Icon 右下角顯示等級（update() 會每 frame 更新）
+                // Icon 下方顯示等級點（● ○ ○ ○ ○）—— 由 update() 每 frame 更新文字
                 let lvl = TextBuilder::new(
                     WidgetBuilder::new()
-                        .with_desired_position(Vector2::new(init_x + 44.0, init_y + 44.0))
-                        .with_width(40.0)
+                        .with_desired_position(Vector2::new(init_x, init_y + 64.0))
+                        .with_width(64.0)
                         .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
                 )
-                .with_text(format!("{} L0", slot_label[i]))
-                .with_font_size(14.0.into())
+                .with_text("○ ○ ○ ○ ○".to_string())
+                .with_font_size(12.0.into())
                 .build(&mut ui.build_ctx());
                 self.ui_ability_level_text[i] = lvl;
+
+                // Icon 上方顯示快捷鍵 cap [W]
+                let key = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(init_x + 20.0, init_y - 18.0))
+                        .with_width(40.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 40, 255)).into()),
+                )
+                .with_text(format!("[{}]", slot_label[i]))
+                .with_font_size(16.0.into())
+                .build(&mut ui.build_ctx());
+                self.ui_ability_key_text[i] = key;
+
+                // Icon 中央的冷卻大數字（CD 結束時清空）
+                let cd = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(init_x + 12.0, init_y + 14.0))
+                        .with_width(40.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+                )
+                .with_text("".to_string())
+                .with_font_size(32.0.into())
+                .build(&mut ui.build_ctx());
+                self.ui_ability_cd_text[i] = cd;
             }
 
             // Tooltip：icon + text，初始位置在螢幕外（隱藏）
@@ -1225,7 +1257,7 @@ impl Plugin for Game {
                 let spacing = 72.0f32;
                 let total_w = spacing * 3.0 + icon_size;
                 let base_x = (self.window_size.x - total_w) * 0.5;
-                let icon_y = self.window_size.y - icon_size - 16.0;
+                let icon_y = self.window_size.y - icon_size - 32.0;
                 for i in 0..4 {
                     let x = base_x + (i as f32) * spacing;
                     self.ability_icon_rects[i] = (x, icon_y, icon_size, icon_size);
@@ -1238,20 +1270,52 @@ impl Plugin for Game {
                     if self.ui_ability_level_text[i] != Handle::<Text>::NONE {
                         ui.send(
                             self.ui_ability_level_text[i],
-                            WidgetMessage::DesiredPosition(Vector2::new(x + 44.0, icon_y + 44.0)),
+                            WidgetMessage::DesiredPosition(Vector2::new(x, icon_y + icon_size)),
+                        );
+                    }
+                    if self.ui_ability_key_text[i] != Handle::<Text>::NONE {
+                        ui.send(
+                            self.ui_ability_key_text[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(x + 20.0, icon_y - 18.0)),
+                        );
+                    }
+                    if self.ui_ability_cd_text[i] != Handle::<Text>::NONE {
+                        ui.send(
+                            self.ui_ability_cd_text[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(x + 12.0, icon_y + 14.0)),
                         );
                     }
                 }
             }
 
+            // 技能冷卻每 frame 遞減
+            for cd in self.hero_state.ability_cd.values_mut() {
+                if *cd > 0.0 { *cd = (*cd - dt).max(0.0); }
+            }
+
             let hs = &self.hero_state;
-            // 更新技能 icon 右下的等級文字（WERT）
-            let slot_names = ["W", "E", "R", "T"];
-            for (i, n) in slot_names.iter().enumerate() {
+            // 更新技能 icon 下方的等級點 + 中央 CD 數字
+            for i in 0..4 {
                 let id = hs.abilities.get(i).cloned().unwrap_or_default();
                 let lvl = hs.ability_levels.get(&id).copied().unwrap_or(0);
-                let lvl_handle = self.ui_ability_level_text[i];
-                ui.send(lvl_handle, TextMessage::Text(format!("{} L{}", n, lvl)));
+                let max = self.ability_info_map.get(&id).map(|a| a.max_level).unwrap_or(4);
+                // 等級點 ● ○
+                let dots: String = (0..max.max(1))
+                    .map(|n| if n < lvl { "●" } else { "○" })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                ui.send(self.ui_ability_level_text[i], TextMessage::Text(dots));
+
+                // CD 數字
+                let remaining = hs.ability_cd.get(&id).copied().unwrap_or(0.0);
+                let cd_str = if remaining >= 1.0 {
+                    format!("{:.0}", remaining.ceil())
+                } else if remaining > 0.0 {
+                    format!("{:.1}", remaining)
+                } else {
+                    String::new()
+                };
+                ui.send(self.ui_ability_cd_text[i], TextMessage::Text(cd_str));
             }
             // Inventory 顯示
             let mut inv = String::new();
@@ -1451,6 +1515,24 @@ impl Plugin for Game {
                         if self.shift_held {
                             send(NetCommand::UpgradeSkill { slot });
                         } else {
+                            // 本地樂觀啟動冷卻（後端真正拒絕時後續事件會校正）
+                            let slot_idx = match slot.as_str() {
+                                "W" => 0, "E" => 1, "R" => 2, "T" => 3, _ => 0,
+                            };
+                            let id = self.hero_state.abilities.get(slot_idx).cloned().unwrap_or_default();
+                            if !id.is_empty() {
+                                let cur_lvl = self.hero_state.ability_levels.get(&id).copied().unwrap_or(0);
+                                if cur_lvl > 0 {
+                                    if let Some(info) = self.ability_info_map.get(&id) {
+                                        let idx = (cur_lvl as usize - 1).min(info.cooldown.len().saturating_sub(1));
+                                        if let Some(&cd) = info.cooldown.get(idx) {
+                                            if cd > 0.0 {
+                                                self.hero_state.ability_cd.insert(id.clone(), cd);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             send(NetCommand::CastAbility {
                                 slot,
                                 x: world.x / WORLD_SCALE,
