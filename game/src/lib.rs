@@ -730,61 +730,97 @@ impl Plugin for Game {
             }
         }
 
-        // 載入孫市四技能圖示（hero1_1..4）放到底部 HUD；失敗時退到純色方塊 fallback。
+        // 載入孫市四技能圖示（hero1_1..4）
+        // 用 Fyrox UI 內建 check.png / add.png 等的同套 pattern：
+        //   TextureResource::load_from_memory + CompressionOptions::NoCompression
+        // 壓縮 texture 會造成 UI renderer 拿不到可顯示的 GPU 格式 → 空白。
+        // 實際位置在 update() 依當前 window_size 置底中央。
         {
             use fyrox::asset::untyped::ResourceKind;
             use fyrox::core::uuid::Uuid;
-            use fyrox::resource::texture::{Texture, TextureResource};
+            use fyrox::resource::texture::{
+                CompressionOptions, TextureImportOptions, TextureMinificationFilter,
+                TextureResource, TextureResourceExtension,
+            };
 
-            let base_x = 500.0f32;
-            let icon_y = 620.0f32;
-            let icon_size = 56.0f32;
-            let spacing = 64.0f32;
             let slot_label = ["W", "E", "R", "T"];
+            let icon_size = 64.0f32;
 
             for i in 0..4 {
                 let path = format!("data/hero1_{}.png", i + 1);
-                let x = base_x + (i as f32) * spacing;
-                self.ability_icon_rects[i] = (x, icon_y, icon_size, icon_size);
+                let init_x = 500.0 + (i as f32) * 72.0;
+                let init_y = 620.0;
+                self.ability_icon_rects[i] = (init_x, init_y, icon_size, icon_size);
 
-                let resource_opt: Option<TextureResource> = match std::fs::read(&path) {
-                    Ok(bytes) => match Texture::load_from_memory(&bytes, Default::default()) {
-                        Ok(tex) => Some(TextureResource::new_ok(
+                let mut debug_state: &'static str = "?";
+                // 路徑候選：
+                //   1. data/... （CWD=omfx 時，cargo run -p omfx）
+                //   2. omfx/data/... （CWD=repo root 時，cargo run --manifest-path omfx\Cargo.toml）
+                //   3. ../data/... （備援，CWD 深一層時）
+                //   4. {exe_dir}/data/... （打包後 release，exe 與 data 同層）
+                let mut candidate_paths: Vec<String> = vec![
+                    path.clone(),
+                    format!("omfx/{}", path),
+                    format!("../{}", path),
+                ];
+                if let Ok(exe_path) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe_path.parent() {
+                        candidate_paths.push(
+                            exe_dir.join(&path).to_string_lossy().into_owned(),
+                        );
+                    }
+                }
+                let read_result = candidate_paths.iter().find_map(|p| {
+                    std::fs::read(p).ok().map(|b| (p.clone(), b))
+                });
+                let texture_opt: Option<TextureResource> = match read_result.as_ref().map(|(_, b)| b) {
+                    Some(bytes) => {
+                        let opts = TextureImportOptions::default()
+                            .with_compression(CompressionOptions::NoCompression)
+                            .with_minification_filter(TextureMinificationFilter::LinearMipMapLinear);
+                        match TextureResource::load_from_memory(
                             Uuid::new_v4(),
                             ResourceKind::Embedded,
-                            tex,
-                        )),
-                        Err(e) => {
-                            log::warn!("{} 解碼失敗 ({:?})", path, e);
-                            None
+                            bytes,
+                            opts,
+                        ) {
+                            Ok(res) => {
+                                debug_state = "OK";
+                                Some(res)
+                            }
+                            Err(_) => {
+                                debug_state = "DECODE";
+                                None
+                            }
                         }
-                    },
-                    Err(e) => {
-                        log::warn!("讀不到 {}（{}）", path, e);
+                    }
+                    None => {
+                        debug_state = "READ";
                         None
                     }
                 };
 
-                let icon_handle: Handle<UiNode> = if let Some(ref resource) = resource_opt {
+                let _ = debug_state; // reserved for future logging
+                let icon_handle: Handle<UiNode> = if let Some(ref resource) = texture_opt {
                     let h: Handle<fyrox::gui::image::Image> = ImageBuilder::new(
                         WidgetBuilder::new()
-                            .with_desired_position(Vector2::new(x, icon_y))
+                            .with_desired_position(Vector2::new(init_x, init_y))
                             .with_width(icon_size)
                             .with_height(icon_size),
                     )
-                    .with_texture(resource.clone().into())
+                    .with_texture(resource.clone())
                     .build(&mut ui.build_ctx());
                     h.transmute()
                 } else {
                     Handle::NONE
                 };
                 self.ui_ability_icons[i] = icon_handle;
-                self.ability_textures[i] = resource_opt;
+                self.ability_textures[i] = texture_opt;
 
-                // Icon 右下角疊等級/CD 文字
+                // Icon 右下角顯示等級（update() 會每 frame 更新）
                 let lvl = TextBuilder::new(
                     WidgetBuilder::new()
-                        .with_desired_position(Vector2::new(x + 36.0, icon_y + 36.0))
+                        .with_desired_position(Vector2::new(init_x + 44.0, init_y + 44.0))
                         .with_width(40.0)
                         .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
                 )
@@ -1183,6 +1219,31 @@ impl Plugin for Game {
                     }
                 }
             }
+            // ===== 依當前 window_size 置底中央定位 4 個技能 icon =====
+            {
+                let icon_size = 64.0f32;
+                let spacing = 72.0f32;
+                let total_w = spacing * 3.0 + icon_size;
+                let base_x = (self.window_size.x - total_w) * 0.5;
+                let icon_y = self.window_size.y - icon_size - 16.0;
+                for i in 0..4 {
+                    let x = base_x + (i as f32) * spacing;
+                    self.ability_icon_rects[i] = (x, icon_y, icon_size, icon_size);
+                    if self.ui_ability_icons[i] != Handle::<UiNode>::NONE {
+                        ui.send(
+                            self.ui_ability_icons[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(x, icon_y)),
+                        );
+                    }
+                    if self.ui_ability_level_text[i] != Handle::<Text>::NONE {
+                        ui.send(
+                            self.ui_ability_level_text[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(x + 44.0, icon_y + 44.0)),
+                        );
+                    }
+                }
+            }
+
             let hs = &self.hero_state;
             // 更新技能 icon 右下的等級文字（WERT）
             let slot_names = ["W", "E", "R", "T"];
@@ -1245,7 +1306,7 @@ impl Plugin for Game {
                     Some(idx) => {
                         // 更新 tooltip icon texture
                         if let Some(tex) = self.ability_textures[idx].as_ref() {
-                            ui.send(self.ui_tooltip_icon, ImageMessage::Texture(Some(tex.clone().into())));
+                            ui.send(self.ui_tooltip_icon, ImageMessage::Texture(Some(tex.clone())));
                         }
                         // 查 ability info 組 tooltip 字串
                         let hs = &self.hero_state;
