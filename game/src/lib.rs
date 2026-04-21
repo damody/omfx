@@ -58,11 +58,19 @@ const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
 // Z layers: smaller Z = closer to camera (near plane) = renders on top.
 const Z_BULLET: f32 = 0.000;
 const Z_HP_BAR: f32 = 0.0005;
+const Z_RING: f32 = 0.00075;
 const Z_ENEMY: f32 = 0.001;
 const Z_TOWER: f32 = 0.002;
+const Z_REGION: f32 = 0.00225;
 const Z_GRID_CELL: f32 = 0.003;
 const Z_PATH: f32 = 0.004;
 const Z_BACKGROUND: f32 = 0.005;
+
+const COLLISION_RING_SEGMENTS: usize = 24;
+const COLLISION_RING_THICKNESS: f32 = 0.025;
+const REGION_LINE_THICKNESS: f32 = 0.04;
+const REGION_BLOCKER_SEGMENTS: usize = 12;
+const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 
 // ---------------------------------------------------------------------------
 // Network Types
@@ -194,6 +202,10 @@ struct NetworkEntity {
     facing: f32,
     // 箭頭指示面向的子節點
     facing_arrow: Option<Handle<Node>>,
+    // 碰撞半徑（render 單位 = backend * WORLD_SCALE）
+    collision_radius_render: f32,
+    // 碰撞半徑視覺化圓環段：Handle + ring-local 偏移（相對 entity 中心）
+    collision_ring: Vec<(Handle<Node>, Vector2<f32>)>,
 }
 
 /// Seconds that a newly-spawned creep's debug path stays visible.
@@ -527,6 +539,12 @@ pub struct Game {
     event_buffer: Option<EventBuffer>,
     #[visit(skip)] #[reflect(hidden)]
     network_entities: HashMap<u32, NetworkEntity>,
+    /// BlockedRegion 線框 scene node（每個 region 一組 polygon outline segments）。
+    #[visit(skip)] #[reflect(hidden)]
+    region_line_nodes: Vec<Handle<Node>>,
+    /// Region blocker 近似圓 scene node（debug 視覺化；與 region 線框一起在 init 時畫）。
+    #[visit(skip)] #[reflect(hidden)]
+    region_blocker_nodes: Vec<Handle<Node>>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -1101,6 +1119,13 @@ impl Plugin for Game {
                     .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, 0.0007))
                     .set_rotation(rotation);
             }
+
+            // 碰撞半徑圓環：跟隨 entity 中心平移（旋轉/長度不變）
+            for (handle, offset) in &entity.collision_ring {
+                scene.graph[*handle]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_RING));
+            }
         }
 
         // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
@@ -1613,6 +1638,9 @@ impl Game {
             ("hero", "inventory") => self.hero_inventory_update(&evt.data),
             ("hero", "abilities_info") => self.hero_abilities_info_update(&evt.data),
             ("game", "end") => self.game_end(&evt.data),
+            ("map", "regions") => self.map_regions_update(&evt.data, scene),
+            ("map", "region_blockers") => self.map_region_blockers_update(&evt.data, scene),
+            (_, "stall") => self.entity_stall(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
             (_, "M" | "move") => self.entity_move(&evt.data, scene),
@@ -1628,6 +1656,86 @@ impl Game {
         if let Some(entity) = self.network_entities.get_mut(&id) {
             entity.facing = f as f32;
         }
+    }
+
+    /// 後端因碰撞停止移動時發來的事件：凍結此 entity 的 lerp 並對齊到後端位置，
+    /// 避免前端插值穿過其他單位。不改動 prev_position，因此不會回彈到舊 waypoint。
+    fn entity_stall(&mut self, data: &serde_json::Value) {
+        let Some(id) = data.get("id")
+            .or_else(|| data.get("entity_id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32) else { return };
+        let Some(entity) = self.network_entities.get_mut(&id) else { return };
+        let x = data.get("x").and_then(|v| v.as_f64())
+            .map(|v| v as f32 * WORLD_SCALE)
+            .unwrap_or(entity.position.x);
+        let y = data.get("y").and_then(|v| v.as_f64())
+            .map(|v| v as f32 * WORLD_SCALE)
+            .unwrap_or(entity.position.y);
+        let stall_pos = Vector2::new(x, y);
+        entity.prev_position = stall_pos;
+        entity.position = stall_pos;
+        entity.target_position = stall_pos;
+        entity.lerp_elapsed = entity.lerp_duration;
+        if let Some(f) = data.get("facing").and_then(|v| v.as_f64()) {
+            entity.facing = f as f32;
+        }
+    }
+
+    /// 接收後端送來的 BlockedRegion 列表（`map/regions` 事件），繪製為紅色線框多邊形。
+    /// 每次收到會先清掉舊線段、重新建立，避免 region 重配後殘留。
+    fn map_regions_update(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        // 清理先前的 region 線段
+        for handle in self.region_line_nodes.drain(..) {
+            scene.graph.remove_node(handle);
+        }
+        let Some(regions) = data.get("regions").and_then(|v| v.as_array()) else { return };
+        let color = Color::from_rgba(255, 60, 60, 255);
+        let mut total_points = 0usize;
+        for r in regions {
+            let Some(arr) = r.get("points").and_then(|v| v.as_array()) else { continue };
+            if arr.len() < 3 { continue; }
+            let pts: Vec<Vector2<f32>> = arr.iter().map(|p| {
+                let x = p.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+                let y = p.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+                Vector2::new(x, y)
+            }).collect();
+            total_points += pts.len();
+            let handles = build_polygon_outline(scene, &pts, REGION_LINE_THICKNESS, color, Z_REGION);
+            self.region_line_nodes.extend(handles);
+        }
+        log::info!("📍 BlockedRegions updated: {} regions, {} points", regions.len(), total_points);
+    }
+
+    /// 接收後端 Region Blocker 近似圓列表並繪製為橘色圓環（debug 視覺化，與紅色 region 線框並存）。
+    /// Payload: `{ "blockers": [{"x":..., "y":..., "r":...}, ...] }`。`x/y/r` 皆為 backend 座標單位。
+    fn map_region_blockers_update(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        for handle in self.region_blocker_nodes.drain(..) {
+            scene.graph.remove_node(handle);
+        }
+        let Some(list) = data.get("blockers").and_then(|v| v.as_array()) else { return };
+        let color = Color::from_rgba(255, 165, 0, 180);
+        let mut count = 0usize;
+        for b in list {
+            let x = b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+            let y = b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+            let r = b.get("r").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+            if r <= 0.0 { continue; }
+            let segs = build_circle_outline(
+                scene,
+                Vector2::new(x, y),
+                r,
+                REGION_BLOCKER_SEGMENTS,
+                REGION_BLOCKER_THICKNESS,
+                color,
+                Z_REGION,
+            );
+            for (h, _) in segs {
+                self.region_blocker_nodes.push(h);
+            }
+            count += 1;
+        }
+        log::info!("🟠 Region blockers updated: {} circles", count);
     }
 
     fn hero_stats_update(&mut self, data: &serde_json::Value) {
@@ -1827,6 +1935,20 @@ impl Game {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
 
+        // Parse collision_radius (backend units). 轉為 render 單位 (× WORLD_SCALE)。
+        // 預設值按 entity type 對齊 omb: hero=30, creep=20, unit=20, tower=50。
+        let default_cr_backend: f32 = match entity_type {
+            "hero" => 30.0,
+            "tower" => 50.0,
+            "creep" | "unit" => 20.0,
+            _ => 0.0,
+        };
+        let collision_radius_backend = data.get("collision_radius")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(default_cr_backend);
+        let collision_radius_render = collision_radius_backend * WORLD_SCALE;
+
         // Parse HP
         let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
         let max_hp = data.get("max_hp").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -1942,6 +2064,22 @@ impl Game {
             None
         };
 
+        // 建立碰撞半徑紅色圓環（跳過 projectile/未知類型）
+        let collision_ring = if matches!(entity_type, "hero" | "creep" | "unit" | "tower")
+            && collision_radius_render > 0.0 {
+            build_circle_outline(
+                scene,
+                pos,
+                collision_radius_render,
+                COLLISION_RING_SEGMENTS,
+                COLLISION_RING_THICKNESS,
+                Color::from_rgba(255, 60, 60, 255),
+                Z_RING,
+            )
+        } else {
+            Vec::new()
+        };
+
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
             node,
@@ -1960,6 +2098,8 @@ impl Game {
             path_age: 0.0,
             facing: initial_facing,
             facing_arrow,
+            collision_radius_render,
+            collision_ring,
         });
     }
 
@@ -2083,6 +2223,9 @@ impl Game {
             }
             for seg in entity.path_nodes {
                 scene.graph.remove_node(seg);
+            }
+            for (handle, _) in entity.collision_ring {
+                scene.graph.remove_node(handle);
             }
         }
     }
@@ -2296,16 +2439,26 @@ fn build_path_segment(
     from: Vector2<f32>,
     to: Vector2<f32>,
 ) -> Option<Handle<Node>> {
+    build_line_segment(scene, from, to, 0.05, Color::from_rgba(255, 100, 255, 180), Z_PATH)
+}
+
+/// 建立一條在 world 座標 (from → to) 的細長線段矩形。
+/// 位置/角度皆已套用 X 軸翻轉，與 `build_path_segment` 邏輯一致。
+fn build_line_segment(
+    scene: &mut Scene,
+    from: Vector2<f32>,
+    to: Vector2<f32>,
+    thickness: f32,
+    color: Color,
+    z: f32,
+) -> Option<Handle<Node>> {
     let dx = to.x - from.x;
     let dy = to.y - from.y;
     let length = (dx * dx + dy * dy).sqrt();
     if length < f32::EPSILON {
         return None;
     }
-    // X 軸渲染取負（配合 entity 翻轉）；rotation 也要跟著反向
-    let center = Vector3::new(-(from.x + to.x) * 0.5, (from.y + to.y) * 0.5, Z_PATH);
-    let thickness = 0.05;
-    // atan2 裡 dx 要取負，讓旋轉方向與翻轉後一致
+    let center = Vector3::new(-(from.x + to.x) * 0.5, (from.y + to.y) * 0.5, z);
     let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), dy.atan2(-dx));
     let handle = RectangleBuilder::new(
         BaseBuilder::new().with_local_transform(
@@ -2316,10 +2469,69 @@ fn build_path_segment(
                 .build(),
         ),
     )
-    .with_color(Color::from_rgba(255, 100, 255, 180))
+    .with_color(color)
     .build(&mut scene.graph)
     .transmute();
     Some(handle)
+}
+
+/// 把多邊形頂點以首尾相連的線段描出邊框。回傳每段的 scene handle。
+fn build_polygon_outline(
+    scene: &mut Scene,
+    points: &[Vector2<f32>],
+    thickness: f32,
+    color: Color,
+    z: f32,
+) -> Vec<Handle<Node>> {
+    let n = points.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        if let Some(h) = build_line_segment(scene, a, b, thickness, color, z) {
+            handles.push(h);
+        }
+    }
+    handles
+}
+
+/// 建立圓環：以 `segments` 個等分線段近似。以 `center` 為中心、半徑 `radius`。
+/// 回傳 (handle, ring-local offset) 對，供 per-frame 追蹤 entity 位置用。
+fn build_circle_outline(
+    scene: &mut Scene,
+    center: Vector2<f32>,
+    radius: f32,
+    segments: usize,
+    thickness: f32,
+    color: Color,
+    z: f32,
+) -> Vec<(Handle<Node>, Vector2<f32>)> {
+    if radius <= 0.0 || segments < 3 {
+        return Vec::new();
+    }
+    let mut pts: Vec<Vector2<f32>> = Vec::with_capacity(segments);
+    for i in 0..segments {
+        let angle = (i as f32) * std::f32::consts::TAU / (segments as f32);
+        pts.push(Vector2::new(radius * angle.cos(), radius * angle.sin()));
+    }
+    let mut result: Vec<(Handle<Node>, Vector2<f32>)> = Vec::with_capacity(segments);
+    for i in 0..segments {
+        let a_local = pts[i];
+        let b_local = pts[(i + 1) % segments];
+        let a_world = Vector2::new(center.x + a_local.x, center.y + a_local.y);
+        let b_world = Vector2::new(center.x + b_local.x, center.y + b_local.y);
+        let offset = Vector2::new(
+            (a_local.x + b_local.x) * 0.5,
+            (a_local.y + b_local.y) * 0.5,
+        );
+        if let Some(h) = build_line_segment(scene, a_world, b_world, thickness, color, z) {
+            result.push((h, offset));
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
