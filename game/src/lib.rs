@@ -837,14 +837,25 @@ impl Plugin for Game {
                 .build(&mut ui.build_ctx());
                 self.ui_ability_level_text[i] = lvl;
 
-                // Icon 上方顯示快捷鍵 cap [W]
+                // Icon 上方顯示快捷鍵 cap — T 槽（終極）金色加星，其餘白色
+                let is_ultimate = i == 3; // T
+                let key_color = if is_ultimate {
+                    Color::from_rgba(255, 210, 40, 255)
+                } else {
+                    Color::from_rgba(240, 240, 240, 255)
+                };
+                let key_str = if is_ultimate {
+                    format!("★ {} ★", slot_label[i])
+                } else {
+                    format!("[{}]", slot_label[i])
+                };
                 let key = TextBuilder::new(
                     WidgetBuilder::new()
-                        .with_desired_position(Vector2::new(init_x + 20.0, init_y - 18.0))
-                        .with_width(40.0)
-                        .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 40, 255)).into()),
+                        .with_desired_position(Vector2::new(init_x + 12.0, init_y - 20.0))
+                        .with_width(60.0)
+                        .with_foreground(Brush::Solid(key_color).into()),
                 )
-                .with_text(format!("[{}]", slot_label[i]))
+                .with_text(key_str)
                 .with_font_size(16.0.into())
                 .build(&mut ui.build_ctx());
                 self.ui_ability_key_text[i] = key;
@@ -2081,17 +2092,28 @@ impl Game {
 /// Returns `None` if the segment has zero length.
 /// 為單位建立一個指向面向方向的箭頭（偏離中心一半 length，讓箭頭伸出單位外）
 /// `pos_x/pos_y` 是 backend world 座標（未翻轉），內部會套 `-x` 配合渲染鏡像。
-/// 組 tooltip 文字：名稱 + 描述 + 當前 vs 下一級數值
+/// 組 tooltip 文字：LoL 風格分區
+/// ┌───────────────────────────┐
+/// │ 技能名 ★ 終極技            [W] │
+/// │ 等級 3 / 5                      │
+/// ├─ 描述 ──────────────────── │
+/// │ ...                             │
+/// ├─ 屬性 ──────────────────── │
+/// │ 冷卻 / 魔力 / 射程              │
+/// ├─ 效果 ──────────────────── │
+/// │ 傷害 / 持續 ...                 │
+/// ├─ 下一級 ───────────────── │
+/// │ 提升項目                        │
+/// └───────────────────────────┘
 fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
     let max = info.max_level;
-    let mut out = String::new();
-    out.push_str(&format!("{}    [{}]\n", info.name, info.key_binding));
-    out.push_str("──────────────────────────\n");
-    out.push_str(&format!("{}\n", info.description));
-    out.push_str("──────────────────────────\n");
-    out.push_str(&format!("當前等級 {}/{}\n", cur_lvl, max));
+    let is_ultimate = info.key_binding == "T";
+    let bar = "──────────────────────────\n";
 
-    // 取 array[idx]，idx 越界回傳 last 值
+    let show_idx = (cur_lvl.max(1) - 1) as usize;
+    let next_idx = (cur_lvl as usize).min((max as usize).saturating_sub(1));
+    let show_next = cur_lvl < max;
+
     fn at_f32(arr: &[f32], idx: usize) -> Option<f32> {
         if arr.is_empty() { None } else { Some(arr[idx.min(arr.len() - 1)]) }
     }
@@ -2099,63 +2121,146 @@ fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
         if arr.is_empty() { None } else { Some(arr[idx.min(arr.len() - 1)]) }
     }
 
-    // 顯示欄位：cur 是指「當前等級對應的 array index」；若 cur_lvl=0 就看 array[0] 作為 L1 預覽
-    let show_idx = (cur_lvl.max(1) - 1) as usize;
-    let next_idx = (cur_lvl as usize).min((max as usize).saturating_sub(1));
-    let show_next = cur_lvl < max;
+    let mut out = String::new();
 
-    if let (Some(c), Some(n)) = (at_f32(&info.cooldown, show_idx), at_f32(&info.cooldown, next_idx)) {
-        if show_next && (c - n).abs() > f32::EPSILON {
-            out.push_str(&format!("冷卻: {:.1}s → {:.1}s\n", c, n));
-        } else {
-            out.push_str(&format!("冷卻: {:.1}s\n", c));
-        }
+    // ===== 標題列 =====
+    if is_ultimate {
+        out.push_str(&format!("★ {}  (終極)   [{}]\n", info.name, info.key_binding));
+    } else {
+        out.push_str(&format!("{}   [{}]\n", info.name, info.key_binding));
     }
-    if let (Some(c), Some(n)) = (at_i32(&info.mana_cost, show_idx), at_i32(&info.mana_cost, next_idx)) {
-        if show_next && c != n {
-            out.push_str(&format!("魔力: {} → {}\n", c, n));
-        } else {
-            out.push_str(&format!("魔力: {}\n", c));
-        }
+    if cur_lvl == 0 {
+        out.push_str(&format!("未學習  (0/{})\n", max));
+    } else {
+        out.push_str(&format!("等級 {} / {}\n", cur_lvl, max));
     }
-    if let (Some(c), Some(n)) = (at_f32(&info.cast_range, show_idx), at_f32(&info.cast_range, next_idx)) {
-        if c > 0.0 {
-            if show_next && (c - n).abs() > f32::EPSILON {
-                out.push_str(&format!("射程: {:.0} → {:.0}\n", c, n));
-            } else {
-                out.push_str(&format!("射程: {:.0}\n", c));
+
+    // ===== 描述 =====
+    out.push_str(bar);
+    out.push_str("【說明】\n");
+    out.push_str(&format!("{}\n", info.description));
+
+    // ===== 當前屬性（核心數值）=====
+    out.push_str(bar);
+    out.push_str("【屬性】\n");
+    if let Some(c) = at_f32(&info.cooldown, show_idx) {
+        out.push_str(&format!("  冷卻時間：{:.1} 秒\n", c));
+    }
+    if let Some(c) = at_i32(&info.mana_cost, show_idx) {
+        out.push_str(&format!("  魔力消耗：{}\n", c));
+    }
+    if let Some(c) = at_f32(&info.cast_range, show_idx) {
+        if c > 0.0 { out.push_str(&format!("  施放範圍：{:.0}\n", c)); }
+    }
+
+    // ===== 效果（傷害 / 其他）=====
+    if !info.effects.is_empty() {
+        out.push_str(bar);
+        out.push_str("【效果】\n");
+        // 優先顯示常見欄位（damage / heal / ratio / duration / stun / slow）
+        let priority_keys = [
+            "damage", "heal", "shield", "duration",
+            "stun", "slow", "ad_ratio", "ap_ratio", "ratio",
+        ];
+        let mut shown: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for pk in priority_keys.iter() {
+            if let Some(v) = info.effects.get(*pk) {
+                push_effect_line(&mut out, pk, v, show_idx);
+                shown.insert(*pk);
+            }
+        }
+        for (k, v) in info.effects.iter() {
+            if !shown.contains(k.as_str()) {
+                push_effect_line(&mut out, k, v, show_idx);
             }
         }
     }
-    // effects：每個 key 若 value 是 array，取 cur/next；是 scalar 直接印
-    if !info.effects.is_empty() {
-        out.push_str("效果:\n");
+
+    // ===== 下一級提升 =====
+    if show_next {
+        let mut delta_lines: Vec<String> = Vec::new();
+        if let (Some(c), Some(n)) = (at_f32(&info.cooldown, show_idx), at_f32(&info.cooldown, next_idx)) {
+            if (c - n).abs() > f32::EPSILON {
+                delta_lines.push(format!("  冷卻 {:.1}s → {:.1}s", c, n));
+            }
+        }
+        if let (Some(c), Some(n)) = (at_i32(&info.mana_cost, show_idx), at_i32(&info.mana_cost, next_idx)) {
+            if c != n {
+                delta_lines.push(format!("  魔力 {} → {}", c, n));
+            }
+        }
+        if let (Some(c), Some(n)) = (at_f32(&info.cast_range, show_idx), at_f32(&info.cast_range, next_idx)) {
+            if c > 0.0 && (c - n).abs() > f32::EPSILON {
+                delta_lines.push(format!("  射程 {:.0} → {:.0}", c, n));
+            }
+        }
         for (k, v) in info.effects.iter() {
             if let Some(arr) = v.as_array() {
                 let cur = arr.get(show_idx).and_then(|e| e.as_f64());
                 let nxt = arr.get(next_idx).and_then(|e| e.as_f64());
-                match (cur, nxt) {
-                    (Some(c), Some(n)) => {
-                        if show_next && (c - n).abs() > f64::EPSILON {
-                            out.push_str(&format!("  {}: {} → {}\n", k, c, n));
-                        } else {
-                            out.push_str(&format!("  {}: {}\n", k, c));
-                        }
+                if let (Some(c), Some(n)) = (cur, nxt) {
+                    if (c - n).abs() > f64::EPSILON {
+                        delta_lines.push(format!("  {} {} → {}", k, fmt_num(c), fmt_num(n)));
                     }
-                    (Some(c), None) => out.push_str(&format!("  {}: {}\n", k, c)),
-                    _ => {}
                 }
-            } else if let Some(n) = v.as_f64() {
-                out.push_str(&format!("  {}: {}\n", k, n));
-            } else if let Some(s) = v.as_str() {
-                out.push_str(&format!("  {}: {}\n", k, s));
             }
         }
+        if !delta_lines.is_empty() {
+            out.push_str(bar);
+            out.push_str("【下一級】\n");
+            for l in &delta_lines { out.push_str(l); out.push('\n'); }
+        }
     }
+
+    // ===== 升級提示 =====
+    out.push_str(bar);
     if cur_lvl < max {
-        out.push_str(&format!("Shift+{} 升級（需 1 技能點）\n", info.key_binding));
+        out.push_str(&format!("Shift + {} 升級（需 1 技能點）\n", info.key_binding));
+    } else {
+        out.push_str("已達最高等級\n");
     }
     out
+}
+
+/// 格式化一個 effect line：array 取 show_idx；scalar 直接印
+fn push_effect_line(out: &mut String, key: &str, v: &serde_json::Value, show_idx: usize) {
+    let label = effect_label(key);
+    if let Some(arr) = v.as_array() {
+        if let Some(val) = arr.get(show_idx).and_then(|e| e.as_f64()) {
+            out.push_str(&format!("  {}：{}\n", label, fmt_num(val)));
+            return;
+        }
+        if let Some(val) = arr.last().and_then(|e| e.as_f64()) {
+            out.push_str(&format!("  {}：{}\n", label, fmt_num(val)));
+        }
+    } else if let Some(n) = v.as_f64() {
+        out.push_str(&format!("  {}：{}\n", label, fmt_num(n)));
+    } else if let Some(s) = v.as_str() {
+        out.push_str(&format!("  {}：{}\n", label, s));
+    } else if let Some(b) = v.as_bool() {
+        out.push_str(&format!("  {}：{}\n", label, if b { "是" } else { "否" }));
+    }
+}
+
+fn fmt_num(n: f64) -> String {
+    if (n - n.round()).abs() < 1e-6 { format!("{:.0}", n) } else { format!("{:.2}", n) }
+}
+
+fn effect_label(key: &str) -> &str {
+    match key {
+        "damage" => "傷害",
+        "heal" => "治療",
+        "shield" => "護盾",
+        "duration" => "持續時間",
+        "stun" => "暈眩時間",
+        "slow" => "減速",
+        "ad_ratio" => "攻擊加成",
+        "ap_ratio" => "法強加成",
+        "ratio" => "係數",
+        "radius" => "範圍半徑",
+        "speed" => "速度",
+        _ => key,
+    }
 }
 
 fn build_facing_arrow(
