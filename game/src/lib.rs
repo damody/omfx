@@ -581,6 +581,13 @@ pub struct Game {
     /// TD 本波是否正在跑（true = 按鈕變灰；false = 按鈕可按）。
     #[visit(skip)] #[reflect(hidden)]
     round_is_running: bool,
+    /// 是否為 TD 模式：由首次收到 hero.stats 有 lives>0 時設 true。
+    /// 影響相機（固定不跟隨英雄）、zoom（拉遠讓整張路徑可見）。
+    #[visit(skip)] #[reflect(hidden)]
+    is_td_mode: bool,
+    /// 是否已經針對 TD 模式調整過相機 ortho（避免每 tick 重設）。
+    #[visit(skip)] #[reflect(hidden)]
+    td_camera_configured: bool,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -2027,26 +2034,37 @@ impl Game {
     }
 
     fn hero_stats_update(&mut self, data: &serde_json::Value) {
-        let hs = &mut self.hero_state;
-        if let Some(v) = data.get("id").and_then(|v| v.as_u64()) { hs.entity_id = Some(v as u32); }
-        if let Some(v) = data.get("level").and_then(|v| v.as_i64()) { hs.level = v as i32; }
-        if let Some(v) = data.get("xp").and_then(|v| v.as_i64()) { hs.xp = v as i32; }
-        if let Some(v) = data.get("xp_next").and_then(|v| v.as_i64()) { hs.xp_next = v as i32; }
-        if let Some(v) = data.get("skill_points").and_then(|v| v.as_i64()) { hs.skill_points = v as i32; }
-        if let Some(v) = data.get("gold").and_then(|v| v.as_i64()) { hs.gold = v as i32; }
-        if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) { hs.lives = v as i32; }
-        if let Some(v) = data.get("hp").and_then(|v| v.as_f64()) { hs.hp = v as f32; }
-        if let Some(v) = data.get("max_hp").and_then(|v| v.as_f64()) { hs.max_hp = v as f32; }
-        if let Some(arr) = data.get("abilities").and_then(|v| v.as_array()) {
-            hs.abilities = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-        }
-        if let Some(obj) = data.get("ability_levels").and_then(|v| v.as_object()) {
-            hs.ability_levels.clear();
-            for (k, v) in obj {
-                if let Some(lvl) = v.as_i64() {
-                    hs.ability_levels.insert(k.clone(), lvl as i32);
+        let mut td_detected = false;
+        {
+            let hs = &mut self.hero_state;
+            if let Some(v) = data.get("id").and_then(|v| v.as_u64()) { hs.entity_id = Some(v as u32); }
+            if let Some(v) = data.get("level").and_then(|v| v.as_i64()) { hs.level = v as i32; }
+            if let Some(v) = data.get("xp").and_then(|v| v.as_i64()) { hs.xp = v as i32; }
+            if let Some(v) = data.get("xp_next").and_then(|v| v.as_i64()) { hs.xp_next = v as i32; }
+            if let Some(v) = data.get("skill_points").and_then(|v| v.as_i64()) { hs.skill_points = v as i32; }
+            if let Some(v) = data.get("gold").and_then(|v| v.as_i64()) { hs.gold = v as i32; }
+            if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) {
+                hs.lives = v as i32;
+                if hs.lives > 0 {
+                    td_detected = true;
                 }
             }
+            if let Some(v) = data.get("hp").and_then(|v| v.as_f64()) { hs.hp = v as f32; }
+            if let Some(v) = data.get("max_hp").and_then(|v| v.as_f64()) { hs.max_hp = v as f32; }
+            if let Some(arr) = data.get("abilities").and_then(|v| v.as_array()) {
+                hs.abilities = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            }
+            if let Some(obj) = data.get("ability_levels").and_then(|v| v.as_object()) {
+                hs.ability_levels.clear();
+                for (k, v) in obj {
+                    if let Some(lvl) = v.as_i64() {
+                        hs.ability_levels.insert(k.clone(), lvl as i32);
+                    }
+                }
+            }
+        }
+        if td_detected {
+            self.is_td_mode = true;
         }
     }
 
