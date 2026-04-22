@@ -217,6 +217,19 @@ struct NetworkEntity {
 /// Seconds that a newly-spawned creep's debug path stays visible.
 const PATH_VISIBLE_SECS: f32 = 5.0;
 
+/// TD 塔的完整元資料（host + script 合併；前端快取一份，供預覽 / 按鈕 / sell 使用）。
+#[derive(Clone, Debug)]
+struct TdTemplate {
+    label: String,
+    cost: i32,
+    footprint_backend: f32,
+    range_backend: f32,
+    splash_radius_backend: f32,
+    hit_radius_backend: f32,
+    slow_factor: f32,
+    slow_duration: f32,
+}
+
 /// Bomb 爆炸紅圈特效：由 0 半徑膨脹到 `max_radius`，`duration` 秒後消失。
 /// 每 frame 在 update() 重建線段節點以表現成長動畫。
 #[derive(Debug)]
@@ -639,6 +652,9 @@ pub struct Game {
     /// TD 禁止通行多邊形（render 座標）— 供 placement 預覽計算是否壓到 region
     #[visit(skip)] #[reflect(hidden)]
     td_regions_render: Vec<Vec<Vector2<f32>>>,
+    /// 後端送來的 TD 塔 template 快取（kind → TdTemplate）
+    #[visit(skip)] #[reflect(hidden)]
+    td_templates: HashMap<String, TdTemplate>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -1294,14 +1310,10 @@ impl Plugin for Game {
                 scene.graph.remove_node(h);
             }
             if let Some(kind) = self.selected_tower_kind {
-                // (footprint_backend, range_backend, cost) — 與 tower_template.rs 的模板同步
-                let (footprint_backend, range_backend, cost): (f32, f32, i32) = match kind {
-                    "dart" => (40.0, 350.0, 200),
-                    "bomb" => (50.0, 400.0, 650),
-                    "tack" => (40.0, 380.0, 400),
-                    "ice"  => (40.0, 180.0, 400),
-                    _      => (40.0, 300.0, 0),
-                };
+              if let Some(tpl) = self.td_templates.get(kind).cloned() {
+                let footprint_backend = tpl.footprint_backend;
+                let range_backend = tpl.range_backend;
+                let cost = tpl.cost;
                 let mwp = self.mouse_world_pos;
                 // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
                 const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
@@ -1380,6 +1392,7 @@ impl Plugin for Game {
                 for (h, _) in segs {
                     self.td_preview_nodes.push(h);
                 }
+              } // end of `if let Some(tpl) = ...`
             }
         }
 
@@ -1714,6 +1727,8 @@ impl Plugin for Game {
             }
 
             // ===== TD 模式右側 4 塔按鈕（每 frame 依 window_size 置右） =====
+            // 按鈕 label 從後端 tower_templates 讀（單一事實來源）；templates 還沒到
+            // 就顯示 kind 大寫字串當佔位
             {
                 let btn_w = 240.0f32;
                 let btn_h = 36.0f32;
@@ -1721,12 +1736,6 @@ impl Plugin for Game {
                 let right_margin = 20.0f32;
                 let x = self.window_size.x - btn_w - right_margin;
                 let base_y = 80.0f32;
-                let labels = [
-                    "[1] Dart Monkey  $200",
-                    "[2] Bomb Shooter $650",
-                    "[3] Tack Shooter $400",
-                    "[4] Ice Monkey   $400",
-                ];
                 let selected = self.selected_tower_kind;
                 let kinds = ["dart", "bomb", "tack", "ice"];
                 for i in 0..4 {
@@ -1737,9 +1746,12 @@ impl Plugin for Game {
                             self.ui_td_tower_buttons[i],
                             WidgetMessage::DesiredPosition(Vector2::new(x, y)),
                         );
-                        // 選中的按鈕前面加 ▶ 提示
                         let prefix = if selected == Some(kinds[i]) { "▶ " } else { "  " };
-                        let text = format!("{}{}", prefix, labels[i]);
+                        let label_cost = match self.td_templates.get(kinds[i]) {
+                            Some(tpl) => format!("{}  ${}", tpl.label, tpl.cost),
+                            None      => format!("({})", kinds[i]),
+                        };
+                        let text = format!("{}[{}] {}", prefix, i + 1, label_cost);
                         ui.send(self.ui_td_tower_buttons[i], TextMessage::Text(text));
                     }
                 }
@@ -2274,6 +2286,7 @@ impl Game {
             ("map", "paths") => self.map_paths_update(&evt.data, scene),
             ("game", "round") => self.td_round_update(&evt.data),
             ("game", "lives") => self.td_lives_update(&evt.data),
+            ("game", "tower_templates") => self.td_tower_templates_update(&evt.data),
             ("game", "explosion") => self.td_explosion_spawn(&evt.data),
             (_, "stall") => self.entity_stall(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
@@ -2349,6 +2362,36 @@ impl Game {
         if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) {
             self.hero_state.lives = v as i32;
         }
+    }
+
+    /// 接收後端 TD 塔 templates（`game/tower_templates` 事件）。
+    /// 來源：腳本 tower_metadata() + host TowerKind::template() 合併。
+    /// 前端用這份快取：placement 預覽、4 塔按鈕、sell 退款、範圍圈都從這讀。
+    fn td_tower_templates_update(&mut self, data: &serde_json::Value) {
+        self.td_templates.clear();
+        let Some(arr) = data.get("templates").and_then(|v| v.as_array()) else { return };
+        for t in arr {
+            let Some(kind) = t.get("kind").and_then(|v| v.as_str()) else { continue };
+            let label = t.get("label").and_then(|v| v.as_str()).unwrap_or(kind).to_string();
+            let cost = t.get("cost").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let footprint = t.get("footprint").and_then(|v| v.as_f64()).unwrap_or(40.0) as f32;
+            let range = t.get("range").and_then(|v| v.as_f64()).unwrap_or(300.0) as f32;
+            let splash = t.get("splash_radius").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let hit_radius = t.get("hit_radius").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let slow_factor = t.get("slow_factor").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let slow_duration = t.get("slow_duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            self.td_templates.insert(kind.to_string(), TdTemplate {
+                label,
+                cost,
+                footprint_backend: footprint,
+                range_backend: range,
+                splash_radius_backend: splash,
+                hit_radius_backend: hit_radius,
+                slow_factor,
+                slow_duration,
+            });
+        }
+        log::info!("🏗 TD tower_templates received: {} kinds", self.td_templates.len());
     }
 
     /// 接收 Bomb 塔爆炸事件（`game/explosion`），加入待渲染列表。
