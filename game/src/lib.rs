@@ -250,6 +250,8 @@ struct ClientProjectile {
     /// 方向性子彈（Tack 放射針）：無 target_id，走直線到 `end_pos`
     directional: bool,
     end_pos: Vector2<f32>,
+    /// 命中半徑視覺化圓環（跟著子彈走）；hit_radius > 0 且 directional 時建立
+    hit_ring: Vec<(Handle<Node>, Vector2<f32>)>,
 }
 
 /// Heartbeat info (for UI display)
@@ -629,6 +631,12 @@ pub struct Game {
     /// 進行中的爆炸特效（Bomb 塔命中時 spawn）
     #[visit(skip)] #[reflect(hidden)]
     active_explosions: Vec<ActiveExplosion>,
+    /// TD 路徑 check_points（render 座標）— 供 placement 預覽計算是否壓到路
+    #[visit(skip)] #[reflect(hidden)]
+    td_paths_render: Vec<Vec<Vector2<f32>>>,
+    /// TD 禁止通行多邊形（render 座標）— 供 placement 預覽計算是否壓到 region
+    #[visit(skip)] #[reflect(hidden)]
+    td_regions_render: Vec<Vec<Vector2<f32>>>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -1284,36 +1292,87 @@ impl Plugin for Game {
                 scene.graph.remove_node(h);
             }
             if let Some(kind) = self.selected_tower_kind {
-                // (footprint_backend, range_backend) — 與 tower_template.rs 的模板同步
-                let (footprint_backend, range_backend): (f32, f32) = match kind {
-                    "dart" => (40.0, 350.0),
-                    "bomb" => (50.0, 400.0),
-                    "tack" => (40.0, 380.0),
-                    "ice"  => (40.0, 180.0),
-                    _      => (40.0, 300.0),
+                // (footprint_backend, range_backend, cost) — 與 tower_template.rs 的模板同步
+                let (footprint_backend, range_backend, cost): (f32, f32, i32) = match kind {
+                    "dart" => (40.0, 350.0, 200),
+                    "bomb" => (50.0, 400.0, 650),
+                    "tack" => (40.0, 380.0, 400),
+                    "ice"  => (40.0, 180.0, 400),
+                    _      => (40.0, 300.0, 0),
                 };
                 let mwp = self.mouse_world_pos;
-                // 內圈：footprint（綠色、表示塔佔位）
+                // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
+                const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
+                let footprint_render = footprint_backend * WORLD_SCALE;
+                let clear_render = (footprint_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
+                let clear_sq = clear_render * clear_render;
+                let mut can_place = self.hero_state.gold >= cost;
+                if can_place {
+                    // 壓到 path？
+                    'outer: for path in &self.td_paths_render {
+                        for i in 0..path.len().saturating_sub(1) {
+                            if point_segment_dist_sq(mwp, path[i], path[i+1]) < clear_sq {
+                                can_place = false;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if can_place {
+                    // 壓到 region？
+                    for poly in &self.td_regions_render {
+                        if circle_hits_polygon(mwp, footprint_render, poly) {
+                            can_place = false;
+                            break;
+                        }
+                    }
+                }
+                if can_place {
+                    // 與其他塔重疊？（只看 TD 塔）
+                    for ent in self.network_entities.values() {
+                        if ent.entity_type != "tower" { continue }
+                        if ent.tower_kind.is_none() { continue }
+                        let min_d = ent.collision_radius_render + footprint_render;
+                        if (ent.position - mwp).norm_squared() < min_d * min_d {
+                            can_place = false;
+                            break;
+                        }
+                    }
+                }
+
+                // 可蓋 → 綠；不可蓋 → 紅
+                let (foot_color, range_color) = if can_place {
+                    (
+                        Color::from_rgba(80, 220, 120, 220),
+                        Color::from_rgba(255, 255, 255, 160),
+                    )
+                } else {
+                    (
+                        Color::from_rgba(230, 50, 50, 240),
+                        Color::from_rgba(230, 80, 80, 160),
+                    )
+                };
+                // 內圈：footprint
                 let segs = build_circle_outline(
                     scene,
                     mwp,
-                    footprint_backend * WORLD_SCALE,
+                    footprint_render,
                     24,
                     0.04,
-                    Color::from_rgba(80, 220, 120, 220),
+                    foot_color,
                     Z_REGION + 0.0002,
                 );
                 for (h, _) in segs {
                     self.td_preview_nodes.push(h);
                 }
-                // 外圈：攻擊範圍（半透明白色、表示射程）
+                // 外圈：攻擊範圍
                 let segs = build_circle_outline(
                     scene,
                     mwp,
                     range_backend * WORLD_SCALE,
                     48,
                     0.03,
-                    Color::from_rgba(255, 255, 255, 160),
+                    range_color,
                     Z_REGION + 0.0001,
                 );
                 for (h, _) in segs {
@@ -1415,6 +1474,12 @@ impl Plugin for Game {
             scene.graph[proj.node]
                 .local_transform_mut()
                 .set_position(Vector3::new(-pos.x, pos.y, Z_BULLET));
+            // Tack 命中圈跟隨子彈
+            for (h, offset) in &proj.hit_ring {
+                scene.graph[*h]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_BULLET - 0.0001));
+            }
             if t >= 1.0 {
                 // 方向性子彈的 damage 由後端 H 事件授權，不做 optimistic 扣血
                 if !proj.directional && !proj.applied && proj.damage > 0.0 {
@@ -1436,6 +1501,9 @@ impl Plugin for Game {
         for id in finished {
             if let Some(proj) = self.client_projectiles.remove(&id) {
                 scene.graph.remove_node(proj.node);
+                for (h, _) in proj.hit_ring {
+                    scene.graph.remove_node(h);
+                }
             }
         }
 
@@ -2191,12 +2259,38 @@ impl Game {
             ("game", "explosion") => self.td_explosion_spawn(&evt.data),
             (_, "stall") => self.entity_stall(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
+            (_, "S" | "speed") => self.entity_speed_update(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
             (_, "M" | "move") => self.entity_move(&evt.data, scene),
             (_, "H" | "hp") => self.entity_hp_update(&evt.data, scene),
             (_, "D" | "delete") => self.entity_delete(&evt.data, scene),
             _ => {} // "R", "tick" etc. — ignore
         }
+    }
+
+    /// 後端 Ice 塔命中 / slow 結束時發 `creep/S` 事件更新移動速度。
+    /// Payload: `{ id, move_speed }`（backend 單位/秒）
+    /// 收到後重算 `lerp_duration`（剩餘距離 / 新 move_speed），並把 prev_position
+    /// 鎖到目前插值位置避免瞬移，這樣 slow 在視覺上立即生效。
+    fn entity_speed_update(&mut self, data: &serde_json::Value) {
+        let Some(id) = data.get("id").and_then(|v| v.as_u64()).map(|v| v as u32) else { return };
+        let Some(ms) = data.get("move_speed").and_then(|v| v.as_f64()) else { return };
+        let ms = ms as f32;
+        let Some(entity) = self.network_entities.get_mut(&id) else { return };
+        entity.move_speed = ms;
+        // 鎖在當前插值位置 → 從這裡重新算 lerp_duration 到 target
+        let cur = entity.position;
+        entity.prev_position = cur;
+        let dx = entity.target_position.x - cur.x;
+        let dy = entity.target_position.y - cur.y;
+        let dist_render = (dx * dx + dy * dy).sqrt();
+        let dist_backend = dist_render / WORLD_SCALE;
+        entity.lerp_elapsed = 0.0;
+        entity.lerp_duration = if ms > 1.0 && dist_backend > f32::EPSILON {
+            (dist_backend / ms).clamp(0.01, 3600.0)
+        } else {
+            0.01
+        };
     }
 
     fn entity_facing_update(&mut self, data: &serde_json::Value) {
@@ -2280,9 +2374,13 @@ impl Game {
         for handle in self.td_path_nodes.drain(..) {
             scene.graph.remove_node(handle);
         }
+        self.td_paths_render.clear();
         let Some(paths) = data.get("paths").and_then(|v| v.as_array()) else { return };
-        let color = Color::from_rgba(160, 120, 60, 255);
-        let thickness = 0.35_f32;
+        let color = Color::from_rgba(170, 140, 90, 255);
+        // 厚度 = 2 × PATH_HALF_WIDTH × WORLD_SCALE（與後端/前端蓋塔驗證同寬）
+        // 路寬縮 20%（80 → 64 backend）讓視覺更清爽，禁蓋緩衝同步縮短
+        let half_width = 64.0 * WORLD_SCALE; // render 單位
+        let thickness = 2.0 * half_width;
         let mut count = 0usize;
         for p in paths {
             let Some(arr) = p.get("points").and_then(|v| v.as_array()) else { continue };
@@ -2297,6 +2395,24 @@ impl Game {
                     self.td_path_nodes.push(h);
                 }
             }
+            // 在每個 check_point 位置畫一個填滿的圓盤，把相鄰線段的邊角縫隙覆蓋掉
+            // 用 build_circle_outline 以 radius=half_width/2、thickness=half_width 的設定，
+            // 各段 wedge 從中心覆蓋到 half_width，形成視覺上的實心圓
+            for cp in pts.iter() {
+                let segs = build_circle_outline(
+                    scene,
+                    *cp,
+                    half_width * 0.5,
+                    24,
+                    half_width,
+                    color,
+                    Z_PATH - 0.00005, // 跟線段一起渲染、略往下一點避免 z-fighting
+                );
+                for (h, _) in segs {
+                    self.td_path_nodes.push(h);
+                }
+            }
+            self.td_paths_render.push(pts);
             count += 1;
         }
         log::info!("🛣️ TD paths updated: {} paths drawn", count);
@@ -2309,6 +2425,7 @@ impl Game {
         for handle in self.region_line_nodes.drain(..) {
             scene.graph.remove_node(handle);
         }
+        self.td_regions_render.clear();
         let Some(regions) = data.get("regions").and_then(|v| v.as_array()) else { return };
         let color = Color::from_rgba(255, 60, 60, 255);
         let mut total_points = 0usize;
@@ -2323,6 +2440,7 @@ impl Game {
             total_points += pts.len();
             let handles = build_polygon_outline(scene, &pts, REGION_LINE_THICKNESS, color, Z_REGION);
             self.region_line_nodes.extend(handles);
+            self.td_regions_render.push(pts);
         }
         log::info!("📍 BlockedRegions updated: {} regions, {} points", regions.len(), total_points);
     }
@@ -2528,6 +2646,26 @@ impl Game {
             }
         };
 
+        // Tack 放射針：依後端 hit_radius 畫一個半透明深灰色圓圈跟著子彈跑，
+        // 讓玩家看得見命中範圍
+        let hit_ring: Vec<(Handle<Node>, Vector2<f32>)> = {
+            let hit_radius_backend = data.get("hit_radius")
+                .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            if directional && hit_radius_backend > 0.0 {
+                build_circle_outline(
+                    scene,
+                    start_pos,
+                    hit_radius_backend * WORLD_SCALE,
+                    20,
+                    0.03,
+                    Color::from_rgba(50, 50, 50, 160),
+                    Z_BULLET - 0.0001,
+                )
+            } else {
+                Vec::new()
+            }
+        };
+
         self.client_projectiles.insert(id, ClientProjectile {
             node,
             target_id,
@@ -2537,6 +2675,7 @@ impl Game {
             flight_time,
             directional,
             end_pos,
+            hit_ring,
             damage,
             applied: false,
         });
@@ -2553,6 +2692,9 @@ impl Game {
         };
         if let Some(proj) = self.client_projectiles.remove(&id) {
             scene.graph.remove_node(proj.node);
+            for (h, _) in proj.hit_ring {
+                scene.graph.remove_node(h);
+            }
         }
     }
 
@@ -3250,4 +3392,47 @@ fn screen_to_world_approx(
     // 螢幕 +Y（向下）→ 世界 -Y
     let wy = -(screen_y / window_h - 0.5) * world_height;
     Vector2::new(wx, wy)
+}
+
+/// Ray-casting 點在多邊形內判定（凹/凸皆可）。與 omb/src/util/geometry.rs 同演算法。
+fn point_in_polygon(p: Vector2<f32>, poly: &[Vector2<f32>]) -> bool {
+    if poly.len() < 3 { return false; }
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = poly[i];
+        let pj = poly[j];
+        let cond = (pi.y > p.y) != (pj.y > p.y)
+            && p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y + f32::EPSILON) + pi.x;
+        if cond { inside = !inside; }
+        j = i;
+    }
+    inside
+}
+
+/// 點到線段 (a-b) 的最短距離平方。
+fn point_segment_dist_sq(p: Vector2<f32>, a: Vector2<f32>, b: Vector2<f32>) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    let len_sq = ab.x * ab.x + ab.y * ab.y;
+    if len_sq < 1e-8 { return ap.norm_squared(); }
+    let t = (ap.x * ab.x + ap.y * ab.y) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let proj = a + ab * t;
+    (p - proj).norm_squared()
+}
+
+/// 圓 vs 多邊形：圓心在內 → true；或任一邊距圓心 < r → true。
+fn circle_hits_polygon(center: Vector2<f32>, r: f32, poly: &[Vector2<f32>]) -> bool {
+    if poly.len() < 3 { return false; }
+    if point_in_polygon(center, poly) { return true; }
+    let r2 = r * r;
+    let n = poly.len();
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        if point_segment_dist_sq(center, a, b) < r2 { return true; }
+    }
+    false
 }
