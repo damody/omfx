@@ -252,6 +252,8 @@ struct ClientProjectile {
     end_pos: Vector2<f32>,
     /// 命中半徑視覺化圓環（跟著子彈走）；hit_radius > 0 且 directional 時建立
     hit_ring: Vec<(Handle<Node>, Vector2<f32>)>,
+    /// Bomb 塔專用：命中後自 spawn 爆炸特效；render 單位
+    splash_radius_render: f32,
 }
 
 /// Heartbeat info (for UI display)
@@ -1486,6 +1488,22 @@ impl Plugin for Game {
                     predicted_damage.push((proj.target_id, proj.damage));
                     proj.applied = true;
                 }
+                // Bomb 塔：命中時在「子彈當前視覺位置」自 spawn 爆炸特效。
+                // 子彈視覺 = 追蹤 target 的實時位置，所以爆炸中心永遠落在氣球身上，
+                // 不會因為 1-tick 誤差停在舊位置。
+                if proj.splash_radius_render > 0.02 && !proj.applied {
+                    // `applied` 同時當作「已觸發爆炸」的旗標
+                }
+                if proj.splash_radius_render > 0.02 {
+                    // 當前子彈位置作為爆炸圓心
+                    self.active_explosions.push(ActiveExplosion {
+                        pos,
+                        max_radius: proj.splash_radius_render,
+                        duration: 0.35,
+                        elapsed: 0.0,
+                        nodes: Vec::new(),
+                    });
+                }
                 finished.push(*id);
             }
         }
@@ -2666,6 +2684,10 @@ impl Game {
             }
         };
 
+        let splash_radius_backend = data.get("splash_radius")
+            .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let splash_radius_render = splash_radius_backend * WORLD_SCALE;
+
         self.client_projectiles.insert(id, ClientProjectile {
             node,
             target_id,
@@ -2676,6 +2698,7 @@ impl Game {
             directional,
             end_pos,
             hit_ring,
+            splash_radius_render,
             damage,
             applied: false,
         });
