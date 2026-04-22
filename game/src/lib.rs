@@ -1280,8 +1280,42 @@ impl Plugin for Game {
             }
         }
 
-        // 4c. Camera follow hero
-        if let Some(hero_id) = self.hero_state.entity_id {
+        // 4c. Camera follow hero（MOBA 模式）或 固定俯視（TD 模式）
+        //     TD 模式下：相機固定在地圖中心、拉遠到能看完整條路線。
+        if self.is_td_mode {
+            if !self.td_camera_configured {
+                // 一次性：放大視角、鎖定在原點
+                if let Some(cam) = scene.graph[self.camera]
+                    .cast_mut::<fyrox::scene::camera::Camera>()
+                {
+                    cam.set_projection(Projection::Orthographic(OrthographicProjection {
+                        z_near: -0.1,
+                        z_far: 16.0,
+                        vertical_size: 14.0, // 28 render 高 = 2800 backend，可裝下 ±1200 Y
+                    }));
+                }
+                let z = scene.graph[self.camera].local_transform().position().z;
+                scene.graph[self.camera]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(0.0, 0.0, z));
+                self.camera_world_pos = Vector2::new(0.0, 0.0);
+                self.td_camera_configured = true;
+                log::info!("🎥 TD 相機已鎖定：center=(0,0), vertical_size=14");
+
+                // 一次性送 viewport 給後端（涵蓋整張地圖）
+                if let Some(ref network) = self.network {
+                    let aspect = self.window_size.x / self.window_size.y.max(1.0);
+                    let half_height = 14.0 / WORLD_SCALE;
+                    let half_width = 14.0 * aspect / WORLD_SCALE;
+                    let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
+                        cx: 0.0,
+                        cy: 0.0,
+                        hw: half_width,
+                        hh: half_height,
+                    });
+                }
+            }
+        } else if let Some(hero_id) = self.hero_state.entity_id {
             if let Some(hero_ent) = self.network_entities.get(&hero_id) {
                 let pos = hero_ent.position;
                 let z = scene.graph[self.camera].local_transform().position().z;
@@ -1640,12 +1674,14 @@ impl Plugin for Game {
                 event: WindowEvent::CursorMoved { position, .. },
                 ..
             } => {
+                // camera vertical_size * 2：MOBA=20，TD=28（對應 vertical_size=14）
+                let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
                 let local = screen_to_world_approx(
                     position.x as f32,
                     position.y as f32,
                     self.window_size.x,
                     self.window_size.y,
-                    20.0, // matches camera vertical_size * 2
+                    world_height,
                 );
                 // 加上 camera 位移，得到絕對 render-world 座標
                 self.mouse_world_pos = local + self.camera_world_pos;
