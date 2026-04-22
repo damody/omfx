@@ -593,15 +593,15 @@ pub struct Game {
     /// TD 模式氣球路線的 scene node（每條 path 一組線段）。
     #[visit(skip)] #[reflect(hidden)]
     td_path_nodes: Vec<Handle<Node>>,
-    /// TD 模式右側 4 塔按鈕的 UI Text node。
+    /// TD 模式右側塔按鈕的 UI Text node（動態 Vec：N 個塔來自 td_template_order 長度）
     #[visit(skip)] #[reflect(hidden)]
-    ui_td_tower_buttons: [Handle<Text>; 4],
-    /// 4 塔按鈕的 hit-test rects（x, y, w, h）—— 每 frame 依 window_size 更新。
+    ui_td_tower_buttons: Vec<Handle<Text>>,
+    /// 塔按鈕的 hit-test rects（x, y, w, h）—— 每 frame 依 window_size 更新
     #[visit(skip)] #[reflect(hidden)]
-    td_tower_button_rects: [(f32, f32, f32, f32); 4],
-    /// 目前玩家選中的塔類型 ("dart"/"bomb"/"tack"/"ice")；None 表示未選。
+    td_tower_button_rects: Vec<(f32, f32, f32, f32)>,
+    /// 目前玩家選中的塔 unit_id（例如 "tower_dart"）；None 表示未選
     #[visit(skip)] #[reflect(hidden)]
-    selected_tower_kind: Option<&'static str>,
+    selected_tower_kind: Option<String>,
     /// 滑鼠位置的塔預覽圓圈 scene node（選中塔時跟著滑鼠走）。
     #[visit(skip)] #[reflect(hidden)]
     td_preview_nodes: Vec<Handle<Node>>,
@@ -652,9 +652,12 @@ pub struct Game {
     /// TD 禁止通行多邊形（render 座標）— 供 placement 預覽計算是否壓到 region
     #[visit(skip)] #[reflect(hidden)]
     td_regions_render: Vec<Vec<Vector2<f32>>>,
-    /// 後端送來的 TD 塔 template 快取（kind → TdTemplate）
+    /// 後端送來的 TD 塔 template 快取（unit_id → TdTemplate）
     #[visit(skip)] #[reflect(hidden)]
     td_templates: HashMap<String, TdTemplate>,
+    /// Template 的顯示順序（= DLL `units()` 註冊順序），供按鈕排版用
+    #[visit(skip)] #[reflect(hidden)]
+    td_template_order: Vec<String>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -1088,23 +1091,10 @@ impl Plugin for Game {
             self.start_round_button_rect = (-9999.0, -9999.0, 240.0, 48.0);
         }
 
-        // TD 模式右側 4 塔按鈕（text-only，每 frame 依 window_size 置右）
-        // 初始空文字；update() 從 td_templates 快取填 label+cost
-        {
-            for i in 0..4 {
-                let text = TextBuilder::new(
-                    WidgetBuilder::new()
-                        .with_desired_position(Vector2::new(-9999.0, -9999.0))
-                        .with_width(240.0)
-                        .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
-                )
-                .with_text(String::new())
-                .with_font_size(18.0.into())
-                .build(&mut ui.build_ctx());
-                self.ui_td_tower_buttons[i] = text;
-                self.td_tower_button_rects[i] = (-9999.0, -9999.0, 240.0, 40.0);
-            }
-        }
+        // TD 模式右側塔按鈕（text-only，動態 Vec）
+        // 收到 game/tower_templates 事件後才建；此時空 Vec
+        self.ui_td_tower_buttons = Vec::new();
+        self.td_tower_button_rects = Vec::new();
 
         // 商店面板（初始空字串；按 B 切換顯示內容）
         self.ui_shop_text = TextBuilder::new(
@@ -1304,8 +1294,8 @@ impl Plugin for Game {
             for h in self.td_preview_nodes.drain(..) {
                 scene.graph.remove_node(h);
             }
-            if let Some(kind) = self.selected_tower_kind {
-              if let Some(tpl) = self.td_templates.get(kind).cloned() {
+            if let Some(kind) = self.selected_tower_kind.clone() {
+              if let Some(tpl) = self.td_templates.get(&kind).cloned() {
                 let footprint_backend = tpl.footprint_backend;
                 let range_backend = tpl.range_backend;
                 let cost = tpl.cost;
@@ -1721,9 +1711,8 @@ impl Plugin for Game {
                 }
             }
 
-            // ===== TD 模式右側 4 塔按鈕（每 frame 依 window_size 置右） =====
-            // 按鈕 label 從後端 tower_templates 讀（單一事實來源）；templates 還沒到
-            // 就顯示 kind 大寫字串當佔位
+            // ===== TD 模式右側塔按鈕（動態：數量 = td_template_order.len()） =====
+            // 數量與順序由後端 tower_templates 事件決定（DLL units() 註冊順序）
             {
                 let btn_w = 240.0f32;
                 let btn_h = 36.0f32;
@@ -1731,24 +1720,45 @@ impl Plugin for Game {
                 let right_margin = 20.0f32;
                 let x = self.window_size.x - btn_w - right_margin;
                 let base_y = 80.0f32;
-                let selected = self.selected_tower_kind;
-                let kinds = ["dart", "bomb", "tack", "ice"];
-                for i in 0..4 {
+
+                let n = self.td_template_order.len();
+                // 不夠就補 TextBuilder
+                while self.ui_td_tower_buttons.len() < n {
+                    let h = TextBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                            .with_width(btn_w)
+                            .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                    )
+                    .with_text(String::new())
+                    .with_font_size(18.0.into())
+                    .build(&mut ui.build_ctx());
+                    self.ui_td_tower_buttons.push(h);
+                    self.td_tower_button_rects.push((-9999.0, -9999.0, btn_w, btn_h));
+                }
+                // 多了就藏起來（不 remove；避免頻繁 create/destroy）
+                for i in n..self.ui_td_tower_buttons.len() {
+                    ui.send(self.ui_td_tower_buttons[i],
+                        WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
+                    self.td_tower_button_rects[i] = (-9999.0, -9999.0, 0.0, 0.0);
+                }
+
+                let selected = self.selected_tower_kind.as_deref();
+                for i in 0..n {
                     let y = base_y + (i as f32) * btn_spacing;
                     self.td_tower_button_rects[i] = (x, y, btn_w, btn_h);
-                    if self.ui_td_tower_buttons[i] != Handle::<Text>::NONE {
-                        ui.send(
-                            self.ui_td_tower_buttons[i],
-                            WidgetMessage::DesiredPosition(Vector2::new(x, y)),
-                        );
-                        let prefix = if selected == Some(kinds[i]) { "▶ " } else { "  " };
-                        let label_cost = match self.td_templates.get(kinds[i]) {
-                            Some(tpl) => format!("{}  ${}", tpl.label, tpl.cost),
-                            None      => format!("({})", kinds[i]),
-                        };
-                        let text = format!("{}[{}] {}", prefix, i + 1, label_cost);
-                        ui.send(self.ui_td_tower_buttons[i], TextMessage::Text(text));
-                    }
+                    let uid = &self.td_template_order[i];
+                    ui.send(
+                        self.ui_td_tower_buttons[i],
+                        WidgetMessage::DesiredPosition(Vector2::new(x, y)),
+                    );
+                    let prefix = if selected == Some(uid.as_str()) { "▶ " } else { "  " };
+                    let label_cost = match self.td_templates.get(uid) {
+                        Some(tpl) => format!("{}  ${}", tpl.label, tpl.cost),
+                        None      => uid.clone(),
+                    };
+                    let text = format!("{}[{}] {}", prefix, i + 1, label_cost);
+                    ui.send(self.ui_td_tower_buttons[i], TextMessage::Text(text));
                 }
             }
 
@@ -1759,8 +1769,9 @@ impl Plugin for Game {
                 let btn_h = 42.0f32;
                 let right_margin = 20.0f32;
                 let x = self.window_size.x - panel_w - right_margin;
-                // 定位在 4 塔按鈕下方再留一個 gap（base_y + 4*44 + gap = 80 + 176 + 20）
-                let y_name = 80.0f32 + 4.0 * 44.0 + 20.0;
+                // 定位在 N 塔按鈕下方再留一個 gap（N 動態 = td_template_order.len()）
+                let n_btn = self.td_template_order.len().max(1) as f32;
+                let y_name = 80.0f32 + n_btn * 44.0 + 20.0;
                 let y_btn = y_name + name_h + 4.0;
 
                 // Sell 面板從 td_templates 快取讀 label + cost（單一事實來源）
@@ -2013,19 +2024,24 @@ impl Plugin for Game {
 
                 // 2. 4 塔按鈕
                 if !hit_ui {
+                    // 依動態 template_order 對應按鈕
+                    let mut hit_idx: Option<usize> = None;
                     for (i, rect) in self.td_tower_button_rects.iter().enumerate() {
                         let (bx, by, bw, bh) = *rect;
+                        if i >= self.td_template_order.len() { break }
                         if screen.x >= bx && screen.x <= bx + bw
                             && screen.y >= by && screen.y <= by + bh
                         {
-                            let kinds = ["dart", "bomb", "tack", "ice"];
-                            self.selected_tower_kind = Some(kinds[i]);
-                            // 選新塔時取消已選中的既有塔
-                            self.selected_tower_entity = None;
-                            log::info!("選中塔: {}", kinds[i]);
-                            hit_ui = true;
+                            hit_idx = Some(i);
                             break;
                         }
+                    }
+                    if let Some(i) = hit_idx {
+                        let uid = self.td_template_order[i].clone();
+                        self.selected_tower_kind = Some(uid.clone());
+                        self.selected_tower_entity = None;
+                        log::info!("選中塔: {}", uid);
+                        hit_ui = true;
                     }
                 }
 
@@ -2049,11 +2065,11 @@ impl Plugin for Game {
 
                 // 4. 放置塔（如在選塔模式）。放完後若沒按 Ctrl 則自動取消
                 if !hit_ui {
-                    if let Some(kind) = self.selected_tower_kind {
+                    if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
                         if let Some(ref network) = self.network {
                             let _ = network.cmd_tx.send(NetCommand::PlaceTower {
-                                kind: kind.to_string(),
+                                kind,
                                 x: world_pos.x / WORLD_SCALE,
                                 y: world_pos.y / WORLD_SCALE,
                             });
@@ -2190,20 +2206,28 @@ impl Plugin for Game {
                     KeyCode::KeyB => {
                         self.shop_visible = !self.shop_visible;
                     }
-                    // TD 模式：1/2/3/4 鍵盤快捷選塔；Escape 取消選取
+                    // TD 模式：1-9 鍵盤快捷選塔（依 td_template_order 順序）；Escape 取消選取
                     KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4
+                    | KeyCode::Digit5 | KeyCode::Digit6 | KeyCode::Digit7 | KeyCode::Digit8
+                    | KeyCode::Digit9
                         if !self.shop_visible =>
                     {
-                        let kinds = ["dart", "bomb", "tack", "ice"];
                         let idx = match key {
                             KeyCode::Digit1 => 0,
                             KeyCode::Digit2 => 1,
                             KeyCode::Digit3 => 2,
                             KeyCode::Digit4 => 3,
+                            KeyCode::Digit5 => 4,
+                            KeyCode::Digit6 => 5,
+                            KeyCode::Digit7 => 6,
+                            KeyCode::Digit8 => 7,
+                            KeyCode::Digit9 => 8,
                             _ => unreachable!(),
                         };
-                        self.selected_tower_kind = Some(kinds[idx]);
-                        log::info!("快捷選中塔: {}", kinds[idx]);
+                        if let Some(uid) = self.td_template_order.get(idx).cloned() {
+                            self.selected_tower_kind = Some(uid.clone());
+                            log::info!("快捷選中塔: {}", uid);
+                        }
                     }
                     KeyCode::Escape => {
                         if self.selected_tower_kind.is_some() {
@@ -2358,6 +2382,7 @@ impl Game {
     /// 前端用這份快取：placement 預覽、4 塔按鈕、sell 退款、範圍圈都從這讀。
     fn td_tower_templates_update(&mut self, data: &serde_json::Value) {
         self.td_templates.clear();
+        self.td_template_order.clear();
         let Some(arr) = data.get("templates").and_then(|v| v.as_array()) else { return };
         for t in arr {
             let Some(kind) = t.get("kind").and_then(|v| v.as_str()) else { continue };
@@ -2379,6 +2404,7 @@ impl Game {
                 slow_factor,
                 slow_duration,
             });
+            self.td_template_order.push(kind.to_string());
         }
         log::info!("🏗 TD tower_templates received: {} kinds", self.td_templates.len());
     }
