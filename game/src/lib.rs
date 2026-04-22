@@ -217,6 +217,17 @@ struct NetworkEntity {
 /// Seconds that a newly-spawned creep's debug path stays visible.
 const PATH_VISIBLE_SECS: f32 = 5.0;
 
+/// Bomb 爆炸紅圈特效：由 0 半徑膨脹到 `max_radius`，`duration` 秒後消失。
+/// 每 frame 在 update() 重建線段節點以表現成長動畫。
+#[derive(Debug)]
+struct ActiveExplosion {
+    pos: Vector2<f32>, // render 座標
+    max_radius: f32,   // render 單位
+    duration: f32,
+    elapsed: f32,
+    nodes: Vec<Handle<Node>>,
+}
+
 /// Client-side projectile simulation.
 ///
 /// Backend only sends a single C event with `target_id` + `flight_time_ms`;
@@ -236,6 +247,9 @@ struct ClientProjectile {
     // heartbeat HP snapshot reconciles drift every 2s.
     damage: f32,
     applied: bool,
+    /// 方向性子彈（Tack 放射針）：無 target_id，走直線到 `end_pos`
+    directional: bool,
+    end_pos: Vector2<f32>,
 }
 
 /// Heartbeat info (for UI display)
@@ -612,6 +626,9 @@ pub struct Game {
     /// 選中塔的攻擊範圍圓圈 scene nodes（跟著 entity 跑）
     #[visit(skip)] #[reflect(hidden)]
     td_selected_range_nodes: Vec<Handle<Node>>,
+    /// 進行中的爆炸特效（Bomb 塔命中時 spawn）
+    #[visit(skip)] #[reflect(hidden)]
+    active_explosions: Vec<ActiveExplosion>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -1267,11 +1284,11 @@ impl Plugin for Game {
                 scene.graph.remove_node(h);
             }
             if let Some(kind) = self.selected_tower_kind {
-                // (footprint_backend, range_backend)
+                // (footprint_backend, range_backend) — 與 tower_template.rs 的模板同步
                 let (footprint_backend, range_backend): (f32, f32) = match kind {
                     "dart" => (40.0, 350.0),
                     "bomb" => (50.0, 400.0),
-                    "tack" => (40.0, 220.0),
+                    "tack" => (40.0, 380.0),
                     "ice"  => (40.0, 180.0),
                     _      => (40.0, 300.0),
                 };
@@ -1302,6 +1319,46 @@ impl Plugin for Game {
                 for (h, _) in segs {
                     self.td_preview_nodes.push(h);
                 }
+            }
+        }
+
+        // Bomb 爆炸特效：每 frame 依 elapsed 比例重建紅圈（由小到大），結束時移除
+        {
+            let dt_f = context.dt;
+            let mut finished_idx: Vec<usize> = Vec::new();
+            for (i, ex) in self.active_explosions.iter_mut().enumerate() {
+                ex.elapsed += dt_f;
+                // 先清掉上一 frame 的線段
+                for h in ex.nodes.drain(..) {
+                    scene.graph.remove_node(h);
+                }
+                if ex.elapsed >= ex.duration {
+                    finished_idx.push(i);
+                    continue;
+                }
+                let t = (ex.elapsed / ex.duration).clamp(0.0, 1.0);
+                let cur_r = ex.max_radius * t;
+                // alpha 隨時間衰減（起始不透明 → 結束透明）
+                let alpha = (255.0 * (1.0 - t)) as u8;
+                let color = Color::from_rgba(230, 70, 40, alpha.max(40));
+                if cur_r > 0.02 {
+                    let segs = build_circle_outline(
+                        scene,
+                        ex.pos,
+                        cur_r,
+                        32,
+                        0.06,
+                        color,
+                        Z_REGION + 0.0004,
+                    );
+                    for (h, _) in segs {
+                        ex.nodes.push(h);
+                    }
+                }
+            }
+            // 反向刪除以保持 index 有效
+            for i in finished_idx.into_iter().rev() {
+                self.active_explosions.remove(i);
             }
         }
 
@@ -1344,18 +1401,23 @@ impl Plugin for Game {
         for (id, proj) in self.client_projectiles.iter_mut() {
             proj.elapsed += dt;
             let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
-            let target_pos = self
-                .network_entities
-                .get(&proj.target_id)
-                .map(|e| e.position)
-                .unwrap_or(proj.last_target_pos);
+            // 方向性子彈走固定直線；追蹤子彈鎖 target 現位
+            let target_pos = if proj.directional {
+                proj.end_pos
+            } else {
+                self.network_entities
+                    .get(&proj.target_id)
+                    .map(|e| e.position)
+                    .unwrap_or(proj.last_target_pos)
+            };
             proj.last_target_pos = target_pos;
             let pos = proj.start_pos + (target_pos - proj.start_pos) * t;
             scene.graph[proj.node]
                 .local_transform_mut()
                 .set_position(Vector3::new(-pos.x, pos.y, Z_BULLET));
             if t >= 1.0 {
-                if !proj.applied && proj.damage > 0.0 {
+                // 方向性子彈的 damage 由後端 H 事件授權，不做 optimistic 扣血
+                if !proj.directional && !proj.applied && proj.damage > 0.0 {
                     predicted_damage.push((proj.target_id, proj.damage));
                     proj.applied = true;
                 }
@@ -2126,6 +2188,7 @@ impl Game {
             ("map", "paths") => self.map_paths_update(&evt.data, scene),
             ("game", "round") => self.td_round_update(&evt.data),
             ("game", "lives") => self.td_lives_update(&evt.data),
+            ("game", "explosion") => self.td_explosion_spawn(&evt.data),
             (_, "stall") => self.entity_stall(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
@@ -2174,6 +2237,23 @@ impl Game {
         if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) {
             self.hero_state.lives = v as i32;
         }
+    }
+
+    /// 接收 Bomb 塔爆炸事件（`game/explosion`），加入待渲染列表。
+    /// Payload: `{ "x": f32, "y": f32, "radius": backend_units, "duration": seconds }`
+    /// 線段在 update() 依 elapsed 比例動態重建，由小圈膨脹到 max_radius。
+    fn td_explosion_spawn(&mut self, data: &serde_json::Value) {
+        let x = data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+        let y = data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+        let r = data.get("radius").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32 * WORLD_SCALE;
+        let dur = data.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.35) as f32;
+        self.active_explosions.push(ActiveExplosion {
+            pos: Vector2::new(x, y),
+            max_radius: r,
+            duration: dur,
+            elapsed: 0.0,
+            nodes: Vec::new(),
+        });
     }
 
     /// 接收後端 TD 回合狀態（`game/round` 事件）：更新當前波數、總波數、運行狀態。
@@ -2385,13 +2465,15 @@ impl Game {
         if self.client_projectiles.contains_key(&id) {
             return;
         }
+        let directional = data.get("directional").and_then(|v| v.as_bool()).unwrap_or(false);
         let target_id = data.get("target_id")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let target_id = match target_id {
-            Some(t) => t,
-            None => return, // can't pursue without a target
-        };
+            .map(|v| v as u32)
+            .unwrap_or(0);
+        // 非 directional 但沒有 target → 無法追蹤，跳過
+        if !directional && target_id == 0 {
+            return;
+        }
 
         let start = data.get("start_pos")
             .or_else(|| data.get("position"));
@@ -2414,17 +2496,37 @@ impl Game {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
 
+        // 依塔種決定子彈顏色與尺寸：Tack 是黑色細針，Bomb 黑色稍大，其他維持預設黃色方塊
+        let kind_str = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let (bullet_color, bullet_scale): (Color, f32) = match kind_str {
+            "tack" => (Color::from_rgba(20, 20, 20, 255), 0.08),
+            "bomb" => (Color::from_rgba(40, 40, 40, 255), 0.14),
+            "ice"  => (Color::from_rgba(120, 200, 255, 255), 0.1),
+            _      => (Color::from_rgba(255, 230, 50, 255), 0.1),
+        };
         let node: Handle<Node> = RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
                     .with_local_position(Vector3::new(-sx, sy, Z_BULLET))
-                    .with_local_scale(Vector3::new(0.1, 0.1, f32::EPSILON))
+                    .with_local_scale(Vector3::new(bullet_scale, bullet_scale, f32::EPSILON))
                     .build(),
             ),
         )
-        .with_color(Color::from_rgba(255, 230, 50, 255))
+        .with_color(bullet_color)
         .build(&mut scene.graph)
         .transmute();
+
+        let end_pos = {
+            let ep = data.get("end_pos");
+            if let Some(ep) = ep {
+                Vector2::new(
+                    ep.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
+                    ep.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE,
+                )
+            } else {
+                start_pos
+            }
+        };
 
         self.client_projectiles.insert(id, ClientProjectile {
             node,
@@ -2433,6 +2535,8 @@ impl Game {
             last_target_pos: start_pos,
             elapsed: 0.0,
             flight_time,
+            directional,
+            end_pos,
             damage,
             applied: false,
         });
