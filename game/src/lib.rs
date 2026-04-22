@@ -79,6 +79,7 @@ const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 /// Frontend → Backend command
 enum NetCommand {
     PlaceTower { kind: String, x: f32, y: f32 },
+    SellTower { tower_id: u32 },
     HeroMove { x: f32, y: f32 },
     ViewportUpdate { cx: f32, cy: f32, hw: f32, hh: f32 },
     CastAbility { slot: String, x: f32, y: f32 },
@@ -207,6 +208,10 @@ struct NetworkEntity {
     collision_radius_render: f32,
     // 碰撞半徑視覺化圓環段：Handle + ring-local 偏移（相對 entity 中心）
     collision_ring: Vec<(Handle<Node>, Vector2<f32>)>,
+    // TD 塔類型（"dart"/"bomb"/"tack"/"ice"）；非 TD 塔為 None
+    tower_kind: Option<String>,
+    // TD 塔攻擊射程（backend 單位）；0 表示不是有射程的單位
+    attack_range_backend: f32,
 }
 
 /// Seconds that a newly-spawned creep's debug path stays visible.
@@ -473,6 +478,10 @@ impl NetworkBridge {
                                     let _ = client.send_command("tower", "create",
                                         serde_json::json!({"kind": kind, "x": x, "y": y})).await;
                                 }
+                                NetCommand::SellTower { tower_id } => {
+                                    let _ = client.send_command("tower", "sell",
+                                        serde_json::json!({"tower_id": tower_id})).await;
+                                }
                                 NetCommand::HeroMove { x, y } => {
                                     let _ = client.send_command("player", "move",
                                         serde_json::json!({"x": x, "y": y})).await;
@@ -588,6 +597,21 @@ pub struct Game {
     /// 是否已經針對 TD 模式調整過相機 ortho（避免每 tick 重設）。
     #[visit(skip)] #[reflect(hidden)]
     td_camera_configured: bool,
+    /// 玩家點選中的已蓋塔 entity id（右側顯示 sell 面板、地圖上畫射程圈）；None = 未選取
+    #[visit(skip)] #[reflect(hidden)]
+    selected_tower_entity: Option<u32>,
+    /// 選中塔右側面板：塔名+等級 文字
+    #[visit(skip)] #[reflect(hidden)]
+    ui_td_sell_name_text: Handle<Text>,
+    /// 選中塔右側面板：Sell 按鈕文字
+    #[visit(skip)] #[reflect(hidden)]
+    ui_td_sell_button_text: Handle<Text>,
+    /// Sell 按鈕 hit-test rect（每 frame 依 window_size 更新；塔未選時放螢幕外）
+    #[visit(skip)] #[reflect(hidden)]
+    td_sell_button_rect: (f32, f32, f32, f32),
+    /// 選中塔的攻擊範圍圓圈 scene nodes（跟著 entity 跑）
+    #[visit(skip)] #[reflect(hidden)]
+    td_selected_range_nodes: Vec<Handle<Node>>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -651,6 +675,9 @@ pub struct Game {
     shop_visible: bool,
     #[visit(skip)] #[reflect(hidden)]
     shift_held: bool,
+    /// Ctrl 按住：蓋塔後不自動取消選塔模式（方便一次連蓋多個）
+    #[visit(skip)] #[reflect(hidden)]
+    ctrl_held: bool,
     #[visit(skip)] #[reflect(hidden)]
     game_ended: bool,
     #[visit(skip)] #[reflect(hidden)]
@@ -980,6 +1007,30 @@ impl Plugin for Game {
         .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
 
+        // 選中塔 Sell 面板（右側，塔被選取時才定位到可見位置）
+        {
+            self.ui_td_sell_name_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                    .with_width(240.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(18.0.into())
+            .build(&mut ui.build_ctx());
+
+            self.ui_td_sell_button_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                    .with_width(240.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(120, 20, 20, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(20.0.into())
+            .build(&mut ui.build_ctx());
+            self.td_sell_button_rect = (-9999.0, -9999.0, 240.0, 42.0);
+        }
+
         // Start Round 按鈕（右下角）
         {
             self.ui_start_round_button = TextBuilder::new(
@@ -1210,22 +1261,26 @@ impl Plugin for Game {
             }
         }
 
-        // TD 塔預覽圓圈：若選中某塔，每 frame 在滑鼠位置重畫圓圈（綠色）；未選則清除。
+        // TD 塔預覽圓圈：選中塔時每 frame 在滑鼠位置重畫 footprint + 攻擊範圍兩圈。
         {
             for h in self.td_preview_nodes.drain(..) {
                 scene.graph.remove_node(h);
             }
             if let Some(kind) = self.selected_tower_kind {
-                let footprint_backend: f32 = match kind {
-                    "bomb" => 50.0,
-                    _ => 40.0,
+                // (footprint_backend, range_backend)
+                let (footprint_backend, range_backend): (f32, f32) = match kind {
+                    "dart" => (40.0, 350.0),
+                    "bomb" => (50.0, 400.0),
+                    "tack" => (40.0, 220.0),
+                    "ice"  => (40.0, 180.0),
+                    _      => (40.0, 300.0),
                 };
-                let footprint_render = footprint_backend * WORLD_SCALE;
                 let mwp = self.mouse_world_pos;
+                // 內圈：footprint（綠色、表示塔佔位）
                 let segs = build_circle_outline(
                     scene,
                     mwp,
-                    footprint_render,
+                    footprint_backend * WORLD_SCALE,
                     24,
                     0.04,
                     Color::from_rgba(80, 220, 120, 220),
@@ -1233,6 +1288,48 @@ impl Plugin for Game {
                 );
                 for (h, _) in segs {
                     self.td_preview_nodes.push(h);
+                }
+                // 外圈：攻擊範圍（半透明白色、表示射程）
+                let segs = build_circle_outline(
+                    scene,
+                    mwp,
+                    range_backend * WORLD_SCALE,
+                    48,
+                    0.03,
+                    Color::from_rgba(255, 255, 255, 160),
+                    Z_REGION + 0.0001,
+                );
+                for (h, _) in segs {
+                    self.td_preview_nodes.push(h);
+                }
+            }
+        }
+
+        // TD 已選中塔的射程圈：每 frame 以塔位置為中心重畫；若塔已消失則自動清選
+        {
+            for h in self.td_selected_range_nodes.drain(..) {
+                scene.graph.remove_node(h);
+            }
+            if let Some(tid) = self.selected_tower_entity {
+                match self.network_entities.get(&tid) {
+                    Some(ent) if ent.entity_type == "tower" && ent.attack_range_backend > 0.0 => {
+                        let segs = build_circle_outline(
+                            scene,
+                            ent.position,
+                            ent.attack_range_backend * WORLD_SCALE,
+                            48,
+                            0.035,
+                            Color::from_rgba(255, 220, 40, 220),
+                            Z_REGION + 0.0003,
+                        );
+                        for (h, _) in segs {
+                            self.td_selected_range_nodes.push(h);
+                        }
+                    }
+                    _ => {
+                        // entity 消失（被賣或打掉）→ 清選
+                        self.selected_tower_entity = None;
+                    }
                 }
             }
         }
@@ -1377,10 +1474,11 @@ impl Plugin for Game {
             // Update label screen position (above HP bar) + 文字含 HP 數字
             if let Some(label) = entity.name_label {
                 let name_world_y = entity.position.y + 0.5;
+                let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
                 let screen_pos = world_to_screen_approx(
                     entity.position.x - self.camera_world_pos.x,
                     name_world_y - self.camera_world_pos.y,
-                    win.x, win.y,
+                    win.x, win.y, world_height,
                 );
                 let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
                 ui.send(label, WidgetMessage::DesiredPosition(pos));
@@ -1496,6 +1594,53 @@ impl Plugin for Game {
                         let text = format!("{}{}", prefix, labels[i]);
                         ui.send(self.ui_td_tower_buttons[i], TextMessage::Text(text));
                     }
+                }
+            }
+
+            // ===== TD 模式：選中塔 Sell 面板（右側，4 塔按鈕下方） =====
+            {
+                let panel_w = 240.0f32;
+                let name_h = 28.0f32;
+                let btn_h = 42.0f32;
+                let right_margin = 20.0f32;
+                let x = self.window_size.x - panel_w - right_margin;
+                // 定位在 4 塔按鈕下方再留一個 gap（base_y + 4*44 + gap = 80 + 176 + 20）
+                let y_name = 80.0f32 + 4.0 * 44.0 + 20.0;
+                let y_btn = y_name + name_h + 4.0;
+
+                let info: Option<(String, i32)> = self.selected_tower_entity.and_then(|tid| {
+                    self.network_entities.get(&tid).and_then(|ent| {
+                        let kind_key = ent.tower_kind.as_deref()?;
+                        let (label, cost) = match kind_key {
+                            "dart" => ("Dart Monkey", 200),
+                            "bomb" => ("Bomb Shooter", 650),
+                            "tack" => ("Tack Shooter", 400),
+                            "ice"  => ("Ice Monkey", 400),
+                            _      => (kind_key, 0),
+                        };
+                        let refund = (cost as f32 * 0.85) as i32;
+                        Some((label.to_string(), refund))
+                    })
+                });
+
+                if let Some((label, refund)) = info {
+                    ui.send(self.ui_td_sell_name_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(x, y_name)));
+                    ui.send(self.ui_td_sell_name_text,
+                        TextMessage::Text(format!("▸ {}", label)));
+
+                    ui.send(self.ui_td_sell_button_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(x, y_btn)));
+                    ui.send(self.ui_td_sell_button_text,
+                        TextMessage::Text(format!("[SELL] ${}", refund)));
+                    self.td_sell_button_rect = (x, y_btn, panel_w, btn_h);
+                } else {
+                    // 未選塔：藏在螢幕外
+                    ui.send(self.ui_td_sell_name_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
+                    ui.send(self.ui_td_sell_button_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
+                    self.td_sell_button_rect = (-9999.0, -9999.0, 0.0, 0.0);
                 }
             }
 
@@ -1697,7 +1842,7 @@ impl Plugin for Game {
                     },
                 ..
             } => {
-                // TD 模式左鍵：依序檢查 Start Round 按鈕 → 4 塔按鈕 → 放置塔
+                // TD 模式左鍵：依序 Start Round → 4 塔按鈕 → Sell 按鈕 → 放置塔 → 點選已蓋塔
                 let screen = self.mouse_screen_pos;
                 let mut hit_ui = false;
 
@@ -1726,6 +1871,8 @@ impl Plugin for Game {
                         {
                             let kinds = ["dart", "bomb", "tack", "ice"];
                             self.selected_tower_kind = Some(kinds[i]);
+                            // 選新塔時取消已選中的既有塔
+                            self.selected_tower_entity = None;
                             log::info!("選中塔: {}", kinds[i]);
                             hit_ui = true;
                             break;
@@ -1733,7 +1880,25 @@ impl Plugin for Game {
                     }
                 }
 
-                // 3. 放置塔（如已選）
+                // 3. Sell 按鈕（只有有已選中塔時生效）
+                if !hit_ui && self.selected_tower_entity.is_some() {
+                    let (bx, by, bw, bh) = self.td_sell_button_rect;
+                    if screen.x >= bx && screen.x <= bx + bw
+                        && screen.y >= by && screen.y <= by + bh
+                    {
+                        if let Some(tid) = self.selected_tower_entity {
+                            if let Some(ref network) = self.network {
+                                let _ = network.cmd_tx.send(NetCommand::SellTower { tower_id: tid });
+                            }
+                            log::info!("📣 送出 Sell Tower id={}", tid);
+                            // 本地先樂觀清空，後端確認 delete 事件後 UI 自然關閉
+                            self.selected_tower_entity = None;
+                        }
+                        hit_ui = true;
+                    }
+                }
+
+                // 4. 放置塔（如在選塔模式）。放完後若沒按 Ctrl 則自動取消
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind {
                         let world_pos = self.mouse_world_pos;
@@ -1744,10 +1909,40 @@ impl Plugin for Game {
                                 y: world_pos.y / WORLD_SCALE,
                             });
                         }
+                        if !self.ctrl_held {
+                            self.selected_tower_kind = None;
+                        }
+                        hit_ui = true;
+                    }
+                }
+
+                // 5. 點選已蓋塔（只有非選塔模式時生效）
+                if !hit_ui && self.selected_tower_kind.is_none() {
+                    let mwp = self.mouse_world_pos;
+                    let mut best: Option<(u32, f32)> = None;
+                    for (id, ent) in self.network_entities.iter() {
+                        if ent.entity_type != "tower" { continue }
+                        if ent.tower_kind.is_none() { continue } // 只選 TD 塔（非 MOBA lane/base）
+                        let d = (ent.position - mwp).norm();
+                        let pick_radius = (ent.collision_radius_render * 1.6).max(0.6);
+                        if d <= pick_radius {
+                            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                                best = Some((*id, d));
+                            }
+                        }
+                    }
+                    if let Some((id, _)) = best {
+                        self.selected_tower_entity = Some(id);
+                        log::info!("點選中塔 id={}", id);
+                    } else {
+                        // 點空地 → 清掉選取
+                        if self.selected_tower_entity.is_some() {
+                            self.selected_tower_entity = None;
+                        }
                     }
                 }
             }
-            // Right click → hero move (world coordinates, no grid snap)
+            // Right click：TD 模式優先用來取消選塔；若無任何選取才送 HeroMove
             Event::WindowEvent {
                 event:
                     WindowEvent::MouseInput {
@@ -1757,10 +1952,20 @@ impl Plugin for Game {
                     },
                 ..
             } => {
-                let world_pos = self.mouse_world_pos;
-                if let Some(ref network) = self.network {
-                    // Convert render coords back to backend coords
-                    let _ = network.cmd_tx.send(NetCommand::HeroMove { x: world_pos.x / WORLD_SCALE, y: world_pos.y / WORLD_SCALE });
+                if self.selected_tower_kind.is_some() {
+                    self.selected_tower_kind = None;
+                    log::info!("RMB 取消放塔預覽");
+                } else if self.selected_tower_entity.is_some() {
+                    self.selected_tower_entity = None;
+                    log::info!("RMB 取消選中塔");
+                } else {
+                    let world_pos = self.mouse_world_pos;
+                    if let Some(ref network) = self.network {
+                        let _ = network.cmd_tx.send(NetCommand::HeroMove {
+                            x: world_pos.x / WORLD_SCALE,
+                            y: world_pos.y / WORLD_SCALE,
+                        });
+                    }
                 }
             }
             // LoL MVP 鍵盤輸入
@@ -1776,10 +1981,14 @@ impl Plugin for Game {
                     _ => return Ok(()),
                 };
 
-                // Shift 狀態追蹤
+                // Shift / Ctrl 狀態追蹤
                 match key {
                     KeyCode::ShiftLeft | KeyCode::ShiftRight => {
                         self.shift_held = pressed;
+                        return Ok(());
+                    }
+                    KeyCode::ControlLeft | KeyCode::ControlRight => {
+                        self.ctrl_held = pressed;
                         return Ok(());
                     }
                     _ => {}
@@ -2423,6 +2632,10 @@ impl Game {
             Vec::new()
         };
 
+        // TD 塔額外欄位：kind + range（從後端 tower.create payload）
+        let tower_kind = data.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let attack_range_backend = data.get("range").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
             node,
@@ -2443,6 +2656,8 @@ impl Game {
             facing_arrow,
             collision_radius_render,
             collision_ring,
+            tower_kind,
+            attack_range_backend,
         });
     }
 
@@ -2907,8 +3122,7 @@ fn world_to_grid(wx: f32, wy: f32) -> Option<(usize, usize)> {
     }
 }
 
-fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32) -> Vector2<f32> {
-    let world_height = 20.0;
+fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32, world_height: f32) -> Vector2<f32> {
     let aspect = window_w / window_h;
     let world_width = world_height * aspect;
     // +X world → +X screen（camera 的 -1 X scale 已把原本的翻轉抵消）
