@@ -78,7 +78,7 @@ const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 
 /// Frontend → Backend command
 enum NetCommand {
-    PlaceTower { x: f32, y: f32 },
+    PlaceTower { kind: String, x: f32, y: f32 },
     HeroMove { x: f32, y: f32 },
     ViewportUpdate { cx: f32, cy: f32, hw: f32, hh: f32 },
     CastAbility { slot: String, x: f32, y: f32 },
@@ -86,6 +86,7 @@ enum NetCommand {
     BuyItem { item_id: String },
     SellItem { slot: usize },
     UseItem { slot: usize },
+    StartRound,
 }
 
 /// Timestamped backend event (for sorted buffering)
@@ -468,9 +469,9 @@ impl NetworkBridge {
                     loop {
                         match cmd_rx.try_recv() {
                             Ok(cmd) => match cmd {
-                                NetCommand::PlaceTower { x, y } => {
+                                NetCommand::PlaceTower { kind, x, y } => {
                                     let _ = client.send_command("tower", "create",
-                                        serde_json::json!({"x": x, "y": y})).await;
+                                        serde_json::json!({"kind": kind, "x": x, "y": y})).await;
                                 }
                                 NetCommand::HeroMove { x, y } => {
                                     let _ = client.send_command("player", "move",
@@ -498,6 +499,10 @@ impl NetworkBridge {
                                 NetCommand::UseItem { slot } => {
                                     let _ = client.send_command("player", "use_item",
                                         serde_json::json!({"slot": slot})).await;
+                                }
+                                NetCommand::StartRound => {
+                                    let _ = client.send_command("player", "start_round",
+                                        serde_json::json!({})).await;
                                 }
                             },
                             Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -545,6 +550,37 @@ pub struct Game {
     /// Region blocker 近似圓 scene node（debug 視覺化；與 region 線框一起在 init 時畫）。
     #[visit(skip)] #[reflect(hidden)]
     region_blocker_nodes: Vec<Handle<Node>>,
+    /// TD 模式氣球路線的 scene node（每條 path 一組線段）。
+    #[visit(skip)] #[reflect(hidden)]
+    td_path_nodes: Vec<Handle<Node>>,
+    /// TD 模式右側 4 塔按鈕的 UI Text node。
+    #[visit(skip)] #[reflect(hidden)]
+    ui_td_tower_buttons: [Handle<Text>; 4],
+    /// 4 塔按鈕的 hit-test rects（x, y, w, h）—— 每 frame 依 window_size 更新。
+    #[visit(skip)] #[reflect(hidden)]
+    td_tower_button_rects: [(f32, f32, f32, f32); 4],
+    /// 目前玩家選中的塔類型 ("dart"/"bomb"/"tack"/"ice")；None 表示未選。
+    #[visit(skip)] #[reflect(hidden)]
+    selected_tower_kind: Option<&'static str>,
+    /// 滑鼠位置的塔預覽圓圈 scene node（選中塔時跟著滑鼠走）。
+    #[visit(skip)] #[reflect(hidden)]
+    td_preview_nodes: Vec<Handle<Node>>,
+    /// Start Round 按鈕 UI Text node。
+    #[visit(skip)] #[reflect(hidden)]
+    ui_start_round_button: Handle<Text>,
+    /// Start Round 按鈕 hit-test rect（每 frame 依 window_size 更新）。
+    #[visit(skip)] #[reflect(hidden)]
+    start_round_button_rect: (f32, f32, f32, f32),
+    /// TD 當前已完成的波數（1-based 概念；後端推送 `game/round` 時更新）。
+    /// 0 表示還沒開始第一波。
+    #[visit(skip)] #[reflect(hidden)]
+    current_round: u32,
+    /// TD 總波數（後端推送 `game/round` 時更新）。
+    #[visit(skip)] #[reflect(hidden)]
+    total_rounds: u32,
+    /// TD 本波是否正在跑（true = 按鈕變灰；false = 按鈕可按）。
+    #[visit(skip)] #[reflect(hidden)]
+    round_is_running: bool,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     #[visit(skip)] #[reflect(hidden)]
@@ -650,6 +686,8 @@ struct LocalHeroState {
     xp_next: i32,
     skill_points: i32,
     gold: i32,
+    /// TD 模式的玩家生命；非 TD 模式後端不推送此值，保持初值 0
+    lives: i32,
     hp: f32,
     max_hp: f32,
     abilities: Vec<String>,          // ability ids, index 0=Q, 1=W, 2=E, 3=R
@@ -924,16 +962,53 @@ impl Plugin for Game {
         .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
 
-        // LoL MVP HUD 文字（底部一行）
+        // HUD 文字（左上角，緊貼 status bar 下方）
         self.ui_hud_text = TextBuilder::new(
             WidgetBuilder::new()
-                .with_desired_position(Vector2::new(10.0, 540.0))
+                .with_desired_position(Vector2::new(10.0, 34.0))
                 .with_width(1900.0)
                 .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("".to_string())
         .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
+
+        // Start Round 按鈕（右下角）
+        {
+            self.ui_start_round_button = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                    .with_width(240.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(0, 80, 0, 255)).into()),
+            )
+            .with_text("▶ Start Round 1".to_string())
+            .with_font_size(22.0.into())
+            .build(&mut ui.build_ctx());
+            self.start_round_button_rect = (-9999.0, -9999.0, 240.0, 48.0);
+        }
+
+        // TD 模式右側 4 塔按鈕（text-only，每 frame 依 window_size 置右）
+        {
+            let labels = [
+                "[1] Dart Monkey  $200",
+                "[2] Bomb Shooter $650",
+                "[3] Tack Shooter $400",
+                "[4] Ice Monkey   $400",
+            ];
+            for i in 0..4 {
+                let text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                        .with_width(240.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                )
+                .with_text(labels[i].to_string())
+                .with_font_size(18.0.into())
+                .build(&mut ui.build_ctx());
+                self.ui_td_tower_buttons[i] = text;
+                self.td_tower_button_rects[i] = (-9999.0, -9999.0, 240.0, 40.0);
+            }
+        }
 
         // 商店面板（初始空字串；按 B 切換顯示內容）
         self.ui_shop_text = TextBuilder::new(
@@ -1125,6 +1200,33 @@ impl Plugin for Game {
                 scene.graph[*handle]
                     .local_transform_mut()
                     .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_RING));
+            }
+        }
+
+        // TD 塔預覽圓圈：若選中某塔，每 frame 在滑鼠位置重畫圓圈（綠色）；未選則清除。
+        {
+            for h in self.td_preview_nodes.drain(..) {
+                scene.graph.remove_node(h);
+            }
+            if let Some(kind) = self.selected_tower_kind {
+                let footprint_backend: f32 = match kind {
+                    "bomb" => 50.0,
+                    _ => 40.0,
+                };
+                let footprint_render = footprint_backend * WORLD_SCALE;
+                let mwp = self.mouse_world_pos;
+                let segs = build_circle_outline(
+                    scene,
+                    mwp,
+                    footprint_render,
+                    24,
+                    0.04,
+                    Color::from_rgba(80, 220, 120, 220),
+                    Z_REGION + 0.0002,
+                );
+                for (h, _) in segs {
+                    self.td_preview_nodes.push(h);
+                }
             }
         }
 
@@ -1324,6 +1426,65 @@ impl Plugin for Game {
                 }
             }
 
+            // ===== TD 模式右側 4 塔按鈕（每 frame 依 window_size 置右） =====
+            {
+                let btn_w = 240.0f32;
+                let btn_h = 36.0f32;
+                let btn_spacing = 44.0f32;
+                let right_margin = 20.0f32;
+                let x = self.window_size.x - btn_w - right_margin;
+                let base_y = 80.0f32;
+                let labels = [
+                    "[1] Dart Monkey  $200",
+                    "[2] Bomb Shooter $650",
+                    "[3] Tack Shooter $400",
+                    "[4] Ice Monkey   $400",
+                ];
+                let selected = self.selected_tower_kind;
+                let kinds = ["dart", "bomb", "tack", "ice"];
+                for i in 0..4 {
+                    let y = base_y + (i as f32) * btn_spacing;
+                    self.td_tower_button_rects[i] = (x, y, btn_w, btn_h);
+                    if self.ui_td_tower_buttons[i] != Handle::<Text>::NONE {
+                        ui.send(
+                            self.ui_td_tower_buttons[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(x, y)),
+                        );
+                        // 選中的按鈕前面加 ▶ 提示
+                        let prefix = if selected == Some(kinds[i]) { "▶ " } else { "  " };
+                        let text = format!("{}{}", prefix, labels[i]);
+                        ui.send(self.ui_td_tower_buttons[i], TextMessage::Text(text));
+                    }
+                }
+            }
+
+            // ===== TD 模式 Start Round 按鈕（右下角） =====
+            {
+                let btn_w = 260.0f32;
+                let btn_h = 48.0f32;
+                let right_margin = 20.0f32;
+                let bottom_margin = 140.0f32; // 避開技能列
+                let x = self.window_size.x - btn_w - right_margin;
+                let y = self.window_size.y - btn_h - bottom_margin;
+                self.start_round_button_rect = (x, y, btn_w, btn_h);
+                if self.ui_start_round_button != Handle::<Text>::NONE {
+                    ui.send(
+                        self.ui_start_round_button,
+                        WidgetMessage::DesiredPosition(Vector2::new(x, y)),
+                    );
+                    let text = if self.total_rounds > 0 && self.current_round >= self.total_rounds && !self.round_is_running {
+                        "✓ ALL ROUNDS CLEAR".to_string()
+                    } else if self.round_is_running {
+                        format!("⏸ Round {} Running...", self.current_round.max(1))
+                    } else {
+                        let next = self.current_round + 1;
+                        let total = self.total_rounds.max(1);
+                        format!("▶ START ROUND {} / {}", next, total)
+                    };
+                    ui.send(self.ui_start_round_button, TextMessage::Text(text));
+                }
+            }
+
             // 技能冷卻每 frame 遞減
             for cd in self.hero_state.ability_cd.values_mut() {
                 if *cd > 0.0 { *cd = (*cd - dt).max(0.0); }
@@ -1367,10 +1528,17 @@ impl Plugin for Game {
                     None => inv.push_str(&format!("[{}]- ", i + 1)),
                 }
             }
-            let hud = format!(
-                "HP {:.0}/{:.0}  LV {}  XP {}/{}  GOLD {}  SP {}  |  {}",
-                hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.gold, hs.skill_points, inv,
-            );
+            let hud = if hs.lives > 0 {
+                format!(
+                    "LIVES {}   GOLD {}   |   HP {:.0}/{:.0}  LV {}  XP {}/{}  SP {}",
+                    hs.lives, hs.gold, hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.skill_points,
+                )
+            } else {
+                format!(
+                    "HP {:.0}/{:.0}  LV {}  XP {}/{}  GOLD {}  SP {}  |  {}",
+                    hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.gold, hs.skill_points, inv,
+                )
+            };
             ui.send(self.ui_hud_text, TextMessage::Text(hud));
 
             // 商店顯示 / 隱藏
@@ -1486,11 +1654,53 @@ impl Plugin for Game {
                     },
                 ..
             } => {
-                let world_pos = self.mouse_world_pos;
-                if let Some((col, row)) = world_to_grid(world_pos.x, world_pos.y) {
-                    let (cx, cy) = grid_to_world(col, row);
-                    if let Some(ref network) = self.network {
-                        let _ = network.cmd_tx.send(NetCommand::PlaceTower { x: cx / WORLD_SCALE, y: cy / WORLD_SCALE });
+                // TD 模式左鍵：依序檢查 Start Round 按鈕 → 4 塔按鈕 → 放置塔
+                let screen = self.mouse_screen_pos;
+                let mut hit_ui = false;
+
+                // 1. Start Round 按鈕
+                {
+                    let (bx, by, bw, bh) = self.start_round_button_rect;
+                    if screen.x >= bx && screen.x <= bx + bw
+                        && screen.y >= by && screen.y <= by + bh
+                        && !self.round_is_running
+                        && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
+                    {
+                        if let Some(ref network) = self.network {
+                            let _ = network.cmd_tx.send(NetCommand::StartRound);
+                        }
+                        log::info!("📣 送出 Start Round 指令");
+                        hit_ui = true;
+                    }
+                }
+
+                // 2. 4 塔按鈕
+                if !hit_ui {
+                    for (i, rect) in self.td_tower_button_rects.iter().enumerate() {
+                        let (bx, by, bw, bh) = *rect;
+                        if screen.x >= bx && screen.x <= bx + bw
+                            && screen.y >= by && screen.y <= by + bh
+                        {
+                            let kinds = ["dart", "bomb", "tack", "ice"];
+                            self.selected_tower_kind = Some(kinds[i]);
+                            log::info!("選中塔: {}", kinds[i]);
+                            hit_ui = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 3. 放置塔（如已選）
+                if !hit_ui {
+                    if let Some(kind) = self.selected_tower_kind {
+                        let world_pos = self.mouse_world_pos;
+                        if let Some(ref network) = self.network {
+                            let _ = network.cmd_tx.send(NetCommand::PlaceTower {
+                                kind: kind.to_string(),
+                                x: world_pos.x / WORLD_SCALE,
+                                y: world_pos.y / WORLD_SCALE,
+                            });
+                        }
                     }
                 }
             }
@@ -1579,6 +1789,27 @@ impl Plugin for Game {
                     KeyCode::KeyB => {
                         self.shop_visible = !self.shop_visible;
                     }
+                    // TD 模式：1/2/3/4 鍵盤快捷選塔；Escape 取消選取
+                    KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4
+                        if !self.shop_visible =>
+                    {
+                        let kinds = ["dart", "bomb", "tack", "ice"];
+                        let idx = match key {
+                            KeyCode::Digit1 => 0,
+                            KeyCode::Digit2 => 1,
+                            KeyCode::Digit3 => 2,
+                            KeyCode::Digit4 => 3,
+                            _ => unreachable!(),
+                        };
+                        self.selected_tower_kind = Some(kinds[idx]);
+                        log::info!("快捷選中塔: {}", kinds[idx]);
+                    }
+                    KeyCode::Escape => {
+                        if self.selected_tower_kind.is_some() {
+                            self.selected_tower_kind = None;
+                            log::info!("取消選塔");
+                        }
+                    }
                     // 數字鍵: shop 開啟時購買對應 index 裝備；否則使用對應背包 slot
                     KeyCode::Digit0 | KeyCode::Digit1 | KeyCode::Digit2
                     | KeyCode::Digit3 | KeyCode::Digit4 | KeyCode::Digit5
@@ -1640,6 +1871,9 @@ impl Game {
             ("game", "end") => self.game_end(&evt.data),
             ("map", "regions") => self.map_regions_update(&evt.data, scene),
             ("map", "region_blockers") => self.map_region_blockers_update(&evt.data, scene),
+            ("map", "paths") => self.map_paths_update(&evt.data, scene),
+            ("game", "round") => self.td_round_update(&evt.data),
+            ("game", "lives") => self.td_lives_update(&evt.data),
             (_, "stall") => self.entity_stall(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
             (ty, "C" | "create") => self.entity_create(ty, &evt.data, scene),
@@ -1680,6 +1914,60 @@ impl Game {
         if let Some(f) = data.get("facing").and_then(|v| v.as_f64()) {
             entity.facing = f as f32;
         }
+    }
+
+    /// 接收後端 TD 玩家生命（`game/lives` 事件）：小兵漏怪時即時更新 HUD。
+    /// Payload: `{ "lives": i32 }`
+    fn td_lives_update(&mut self, data: &serde_json::Value) {
+        if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) {
+            self.hero_state.lives = v as i32;
+        }
+    }
+
+    /// 接收後端 TD 回合狀態（`game/round` 事件）：更新當前波數、總波數、運行狀態。
+    /// Payload: `{ "round": u32, "total": u32, "is_running": bool }`
+    fn td_round_update(&mut self, data: &serde_json::Value) {
+        if let Some(v) = data.get("round").and_then(|v| v.as_u64()) {
+            self.current_round = v as u32;
+        }
+        if let Some(v) = data.get("total").and_then(|v| v.as_u64()) {
+            self.total_rounds = v as u32;
+        }
+        if let Some(v) = data.get("is_running").and_then(|v| v.as_bool()) {
+            self.round_is_running = v;
+        }
+        log::info!(
+            "📣 TD round {}/{} running={}",
+            self.current_round, self.total_rounds, self.round_is_running
+        );
+    }
+
+    /// 接收後端 TD 路徑（`map/paths` 事件），把每條 path 的 check_points 連成粗線。
+    /// Payload: `{ "paths": [{"name": "...", "points": [{"x":..., "y":...}, ...]}, ...] }`。
+    fn map_paths_update(&mut self, data: &serde_json::Value, scene: &mut Scene) {
+        for handle in self.td_path_nodes.drain(..) {
+            scene.graph.remove_node(handle);
+        }
+        let Some(paths) = data.get("paths").and_then(|v| v.as_array()) else { return };
+        let color = Color::from_rgba(160, 120, 60, 255);
+        let thickness = 0.35_f32;
+        let mut count = 0usize;
+        for p in paths {
+            let Some(arr) = p.get("points").and_then(|v| v.as_array()) else { continue };
+            if arr.len() < 2 { continue; }
+            let pts: Vec<Vector2<f32>> = arr.iter().map(|pt| {
+                let x = pt.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+                let y = pt.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * WORLD_SCALE;
+                Vector2::new(x, y)
+            }).collect();
+            for i in 0..pts.len() - 1 {
+                if let Some(h) = build_line_segment(scene, pts[i], pts[i + 1], thickness, color, Z_PATH) {
+                    self.td_path_nodes.push(h);
+                }
+            }
+            count += 1;
+        }
+        log::info!("🛣️ TD paths updated: {} paths drawn", count);
     }
 
     /// 接收後端送來的 BlockedRegion 列表（`map/regions` 事件），繪製為紅色線框多邊形。
@@ -1746,6 +2034,7 @@ impl Game {
         if let Some(v) = data.get("xp_next").and_then(|v| v.as_i64()) { hs.xp_next = v as i32; }
         if let Some(v) = data.get("skill_points").and_then(|v| v.as_i64()) { hs.skill_points = v as i32; }
         if let Some(v) = data.get("gold").and_then(|v| v.as_i64()) { hs.gold = v as i32; }
+        if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) { hs.lives = v as i32; }
         if let Some(v) = data.get("hp").and_then(|v| v.as_f64()) { hs.hp = v as f32; }
         if let Some(v) = data.get("max_hp").and_then(|v| v.as_f64()) { hs.max_hp = v as f32; }
         if let Some(arr) = data.get("abilities").and_then(|v| v.as_array()) {
