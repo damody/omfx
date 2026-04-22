@@ -1089,13 +1089,8 @@ impl Plugin for Game {
         }
 
         // TD 模式右側 4 塔按鈕（text-only，每 frame 依 window_size 置右）
+        // 初始空文字；update() 從 td_templates 快取填 label+cost
         {
-            let labels = [
-                "[1] Dart Monkey  $200",
-                "[2] Bomb Shooter $650",
-                "[3] Tack Shooter $400",
-                "[4] Ice Monkey   $400",
-            ];
             for i in 0..4 {
                 let text = TextBuilder::new(
                     WidgetBuilder::new()
@@ -1103,7 +1098,7 @@ impl Plugin for Game {
                         .with_width(240.0)
                         .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
                 )
-                .with_text(labels[i].to_string())
+                .with_text(String::new())
                 .with_font_size(18.0.into())
                 .build(&mut ui.build_ctx());
                 self.ui_td_tower_buttons[i] = text;
@@ -1768,19 +1763,13 @@ impl Plugin for Game {
                 let y_name = 80.0f32 + 4.0 * 44.0 + 20.0;
                 let y_btn = y_name + name_h + 4.0;
 
+                // Sell 面板從 td_templates 快取讀 label + cost（單一事實來源）
                 let info: Option<(String, i32)> = self.selected_tower_entity.and_then(|tid| {
-                    self.network_entities.get(&tid).and_then(|ent| {
-                        let kind_key = ent.tower_kind.as_deref()?;
-                        let (label, cost) = match kind_key {
-                            "dart" => ("Dart Monkey", 200),
-                            "bomb" => ("Bomb Shooter", 650),
-                            "tack" => ("Tack Shooter", 400),
-                            "ice"  => ("Ice Monkey", 400),
-                            _      => (kind_key, 0),
-                        };
-                        let refund = (cost as f32 * 0.85) as i32;
-                        Some((label.to_string(), refund))
-                    })
+                    let kind_key = self.network_entities.get(&tid)
+                        .and_then(|ent| ent.tower_kind.as_deref())?;
+                    let tpl = self.td_templates.get(kind_key)?;
+                    let refund = (tpl.cost as f32 * 0.85) as i32;
+                    Some((tpl.label.clone(), refund))
                 });
 
                 if let Some((label, refund)) = info {
