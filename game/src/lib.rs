@@ -83,6 +83,7 @@ const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 enum NetCommand {
     PlaceTower { kind: String, x: f32, y: f32 },
     SellTower { tower_id: u32 },
+    UpgradeTower { tower_id: u32, path: u8 },
     HeroMove { x: f32, y: f32 },
     ViewportUpdate { cx: f32, cy: f32, hw: f32, hh: f32 },
     CastAbility { slot: String, x: f32, y: f32 },
@@ -218,6 +219,8 @@ struct NetworkEntity {
     tower_kind: Option<String>,
     // TD 塔攻擊射程（backend 單位）；0 表示不是有射程的單位
     attack_range_backend: f32,
+    // TD tower upgrade state（3 條路線各自的 level），預設 [0,0,0]
+    upgrade_levels: [u8; 3],
     // Name label 快取：stress 場景下 1000 entity × 每幀 format!() + 兩個
     // UI message 會吃光 frame。只在字串/位置變動超過門檻時才送。
     last_label_text: String,
@@ -524,6 +527,10 @@ impl NetworkBridge {
                                     let _ = client.send_command("tower", "sell",
                                         serde_json::json!({"tower_id": tower_id})).await;
                                 }
+                                NetCommand::UpgradeTower { tower_id, path } => {
+                                    let _ = client.send_command("tower", "upgrade",
+                                        serde_json::json!({"tower_id": tower_id, "path": path})).await;
+                                }
                                 NetCommand::HeroMove { x, y } => {
                                     let _ = client.send_command("player", "move",
                                         serde_json::json!({"x": x, "y": y})).await;
@@ -651,6 +658,12 @@ pub struct Game {
     /// Sell 按鈕 hit-test rect（每 frame 依 window_size 更新；塔未選時放螢幕外）
     #[visit(skip)] #[reflect(hidden)]
     td_sell_button_rect: (f32, f32, f32, f32),
+    /// 選中塔右側面板：3 條路線升級按鈕文字
+    #[visit(skip)] #[reflect(hidden)]
+    ui_td_upgrade_buttons: [Handle<Text>; 3],
+    /// 3 條路線升級按鈕 hit-test rect；塔未選時放螢幕外
+    #[visit(skip)] #[reflect(hidden)]
+    td_upgrade_button_rects: [(f32, f32, f32, f32); 3],
     /// 選中塔的攻擊範圍圓圈 scene nodes（跟著 entity 跑）
     #[visit(skip)] #[reflect(hidden)]
     td_selected_range_nodes: Vec<Handle<Node>>,
@@ -1086,6 +1099,20 @@ impl Plugin for Game {
             .with_font_size(20.0.into())
             .build(&mut ui.build_ctx());
             self.td_sell_button_rect = (-9999.0, -9999.0, 240.0, 42.0);
+
+            // 3 條路線升級按鈕（塔被選取時才定位到可見位置）
+            for i in 0..3 {
+                self.ui_td_upgrade_buttons[i] = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                        .with_width(240.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(20, 60, 120, 255)).into()),
+                )
+                .with_text(String::new())
+                .with_font_size(18.0.into())
+                .build(&mut ui.build_ctx());
+                self.td_upgrade_button_rects[i] = (-9999.0, -9999.0, 240.0, 38.0);
+            }
         }
 
         // Start Round 按鈕（右下角）
@@ -1797,15 +1824,16 @@ impl Plugin for Game {
                 let y_btn = y_name + name_h + 4.0;
 
                 // Sell 面板從 td_templates 快取讀 label + cost（單一事實來源）
-                let info: Option<(String, i32)> = self.selected_tower_entity.and_then(|tid| {
-                    let kind_key = self.network_entities.get(&tid)
-                        .and_then(|ent| ent.tower_kind.as_deref())?;
+                // 同時讀 base_cost + upgrade_levels 供升級按鈕顯示
+                let info: Option<(String, i32, i32, [u8; 3])> = self.selected_tower_entity.and_then(|tid| {
+                    let ent = self.network_entities.get(&tid)?;
+                    let kind_key = ent.tower_kind.as_deref()?;
                     let tpl = self.td_templates.get(kind_key)?;
                     let refund = (tpl.cost as f32 * 0.85) as i32;
-                    Some((tpl.label.clone(), refund))
+                    Some((tpl.label.clone(), refund, tpl.cost, ent.upgrade_levels))
                 });
 
-                if let Some((label, refund)) = info {
+                if let Some((label, refund, base_cost, levels)) = info {
                     ui.send(self.ui_td_sell_name_text,
                         WidgetMessage::DesiredPosition(Vector2::new(x, y_name)));
                     ui.send(self.ui_td_sell_name_text,
@@ -1816,6 +1844,28 @@ impl Plugin for Game {
                     ui.send(self.ui_td_sell_button_text,
                         TextMessage::Text(format!("[SELL] ${}", refund)));
                     self.td_sell_button_rect = (x, y_btn, panel_w, btn_h);
+
+                    // 3 條升級按鈕，往下排（每行 btn_h + 4）
+                    let up_btn_h = 38.0f32;
+                    for path in 0u8..3 {
+                        let level = levels[path as usize];
+                        let y_up = y_btn + btn_h + 6.0 + (path as f32) * (up_btn_h + 4.0);
+                        let filled = level.min(4) as usize;
+                        let empty = 4 - filled;
+                        let dots: String = "■".repeat(filled) + &"□".repeat(empty);
+                        let text = if level >= 4 {
+                            format!("{}  [P{}] MAX", dots, path + 1)
+                        } else {
+                            let next_cost = omoba_core::tower_meta::upgrade_cost(base_cost, level + 1);
+                            format!("{}  [P{}] L{}->L{} ${}",
+                                dots, path + 1, level, level + 1, next_cost)
+                        };
+                        ui.send(self.ui_td_upgrade_buttons[path as usize],
+                            WidgetMessage::DesiredPosition(Vector2::new(x, y_up)));
+                        ui.send(self.ui_td_upgrade_buttons[path as usize],
+                            TextMessage::Text(text));
+                        self.td_upgrade_button_rects[path as usize] = (x, y_up, panel_w, up_btn_h);
+                    }
                 } else {
                     // 未選塔：藏在螢幕外
                     ui.send(self.ui_td_sell_name_text,
@@ -1823,6 +1873,11 @@ impl Plugin for Game {
                     ui.send(self.ui_td_sell_button_text,
                         WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
                     self.td_sell_button_rect = (-9999.0, -9999.0, 0.0, 0.0);
+                    for path in 0..3 {
+                        ui.send(self.ui_td_upgrade_buttons[path],
+                            WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
+                        self.td_upgrade_button_rects[path] = (-9999.0, -9999.0, 0.0, 0.0);
+                    }
                 }
             }
 
@@ -2085,6 +2140,27 @@ impl Plugin for Game {
                     }
                 }
 
+                // 3b. 3 條升級按鈕（必須在 tower-deselect 邏輯之前跑）
+                if !hit_ui && self.selected_tower_entity.is_some() {
+                    for path in 0u8..3 {
+                        let (bx, by, bw, bh) = self.td_upgrade_button_rects[path as usize];
+                        if bx > -9000.0
+                            && screen.x >= bx && screen.x < bx + bw
+                            && screen.y >= by && screen.y < by + bh
+                        {
+                            if let Some(tid) = self.selected_tower_entity {
+                                if let Some(ref network) = self.network {
+                                    let _ = network.cmd_tx.send(
+                                        NetCommand::UpgradeTower { tower_id: tid, path });
+                                }
+                                log::info!("📣 送出 Upgrade Tower id={} path={}", tid, path);
+                            }
+                            hit_ui = true;
+                            break;
+                        }
+                    }
+                }
+
                 // 4. 放置塔（如在選塔模式）。放完後若沒按 Ctrl 則自動取消
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
@@ -2323,6 +2399,11 @@ impl Game {
             ("game", "lives") => self.td_lives_update(&evt.data),
             ("game", "tower_templates") => self.td_tower_templates_update(&evt.data),
             ("game", "explosion") => self.td_explosion_spawn(&evt.data),
+            ("tower", "upgrade") => self.tower_upgrade_apply(&evt.data),
+            ("tower", "upgrade_reject") => {
+                log::warn!("tower upgrade rejected: {}",
+                    evt.data.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown"));
+            }
             (_, "stall") => self.entity_stall(&evt.data),
             (_, "F" | "facing") => self.entity_facing_update(&evt.data),
             (_, "S" | "speed") => self.entity_speed_update(&evt.data),
@@ -2397,6 +2478,26 @@ impl Game {
         if let Some(v) = data.get("lives").and_then(|v| v.as_i64()) {
             self.hero_state.lives = v as i32;
         }
+    }
+
+    /// 接收後端 `tower/upgrade` 廣播：更新 NetworkEntity.upgrade_levels。
+    /// Payload: `{ tower_id, path, level, name, levels: [l0, l1, l2] }`
+    fn tower_upgrade_apply(&mut self, data: &serde_json::Value) {
+        let Some(tid) = data.get("tower_id").and_then(|v| v.as_u64()) else { return };
+        let tid = tid as u32;
+        if let Some(ent) = self.network_entities.get_mut(&tid) {
+            if let Some(levels) = data.get("levels").and_then(|v| v.as_array()) {
+                if levels.len() == 3 {
+                    for i in 0..3 {
+                        ent.upgrade_levels[i] = levels[i].as_u64().unwrap_or(0) as u8;
+                    }
+                }
+            }
+        }
+        log::info!("tower {} upgraded to path {} level {}",
+            tid,
+            data.get("path").and_then(|v| v.as_u64()).unwrap_or(0),
+            data.get("level").and_then(|v| v.as_u64()).unwrap_or(0));
     }
 
     /// 接收後端 TD 塔 templates（`game/tower_templates` 事件）。
@@ -3009,6 +3110,7 @@ impl Game {
             collision_ring,
             tower_kind,
             attack_range_backend,
+            upgrade_levels: [0; 3],
             last_label_text: String::new(),
             last_label_pos: Vector2::new(f32::MIN, f32::MIN),
         });
