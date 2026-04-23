@@ -26,3 +26,8 @@ inherits = "release"
 # compile your game in debug mode, which is much faster (at least x3), than release.
 [profile.dev.package."*"]
 opt-level = 3
+
+# game code 本身也要帶點優化，否則 stress 場景下 lerp / UI 迴圈拖慢幀率。
+# opt-level = 1 讓 hot loop 快 2-3 倍，debug info 仍保留。
+[profile.dev]
+opt-level = 1

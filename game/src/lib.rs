@@ -68,6 +68,9 @@ const Z_BACKGROUND: f32 = 0.005;
 
 const COLLISION_RING_SEGMENTS: usize = 24;
 const COLLISION_RING_THICKNESS: f32 = 0.025;
+/// 預設關閉：1000 entity 各 24 段 = 24 K scene node，每幀 transform update
+/// 是 stress 場景下最大 CPU 成本之一。改 true 可恢復 debug 可視化。
+const COLLISION_RING_ENABLED: bool = false;
 const REGION_LINE_THICKNESS: f32 = 0.04;
 const REGION_BLOCKER_SEGMENTS: usize = 12;
 const REGION_BLOCKER_THICKNESS: f32 = 0.015;
@@ -97,6 +100,9 @@ struct TimestampedEvent {
     msg_type: String,
     action: String,
     data: serde_json::Value,
+    /// 從 GameEventData 轉傳；update loop 用來算網路吞吐量，
+    /// 避免每幀 serde_json::to_string 重做 serialize。
+    payload_bytes: usize,
 }
 
 impl PartialEq for TimestampedEvent {
@@ -212,6 +218,10 @@ struct NetworkEntity {
     tower_kind: Option<String>,
     // TD 塔攻擊射程（backend 單位）；0 表示不是有射程的單位
     attack_range_backend: f32,
+    // Name label 快取：stress 場景下 1000 entity × 每幀 format!() + 兩個
+    // UI message 會吃光 frame。只在字串/位置變動超過門檻時才送。
+    last_label_text: String,
+    last_label_pos: Vector2<f32>,
 }
 
 /// Seconds that a newly-spawned creep's debug path stays visible.
@@ -494,6 +504,7 @@ impl NetworkBridge {
                             msg_type: evt.msg_type,
                             action: evt.action,
                             data: evt.data,
+                            payload_bytes: evt.payload_bytes,
                         }).is_err() {
                             break;
                         }
@@ -1182,9 +1193,9 @@ impl Plugin for Game {
         if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
             let mut pending_hp_sync: Option<serde_json::Value> = None;
             for evt in network.event_rx.try_iter() {
-                // 估算 event 位元數：msg_type + action + JSON payload + 固定 overhead (~16 for timestamp)
-                let payload_bytes = serde_json::to_string(&evt.data).map(|s| s.len()).unwrap_or(0);
-                self.net_bytes_current += (evt.msg_type.len() + evt.action.len() + payload_bytes + 16) as u64;
+                // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
+                // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
+                self.net_bytes_current += (evt.msg_type.len() + evt.action.len() + evt.payload_bytes + 16) as u64;
                 // Heartbeat: calibrate clock immediately, don't buffer
                 if evt.msg_type == "heartbeat" && evt.action == "tick" {
                     buffer.sync_clock(evt.timestamp_ms);
@@ -1618,6 +1629,8 @@ impl Plugin for Game {
             }
 
             // Update label screen position (above HP bar) + 文字含 HP 數字
+            // Stress 場景節流：位置差距 < 1 px、文字未變時，整個 entity 跳過
+            // 兩條 UI 訊息，避免 1000 entity × 每幀 send 把 Fyrox UI queue 灌爆。
             if let Some(label) = entity.name_label {
                 let name_world_y = entity.position.y + 0.5;
                 let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
@@ -1627,14 +1640,23 @@ impl Plugin for Game {
                     win.x, win.y, world_height,
                 );
                 let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
-                ui.send(label, WidgetMessage::DesiredPosition(pos));
+                let pos_changed = (pos.x - entity.last_label_pos.x).abs() >= 1.0
+                    || (pos.y - entity.last_label_pos.y).abs() >= 1.0;
+                if pos_changed {
+                    ui.send(label, WidgetMessage::DesiredPosition(pos));
+                    entity.last_label_pos = pos;
+                }
 
                 // 顯示「名字 HP/MaxHP」讓 HP bouncing 肉眼可見
+                // 用 round() 比對避免 0.1 HP 級小波動灌訊息
                 let text = match entity.health {
-                    Some((h, m)) => format!("{} {:.0}/{:.0}", entity.name, h, m),
+                    Some((h, m)) => format!("{} {:.0}/{:.0}", entity.name, h.round(), m.round()),
                     None => entity.name.clone(),
                 };
-                ui.send(label, TextMessage::Text(text));
+                if text != entity.last_label_text {
+                    ui.send(label, TextMessage::Text(text.clone()));
+                    entity.last_label_text = text;
+                }
             }
         }
 
@@ -2944,7 +2966,9 @@ impl Game {
         };
 
         // 建立碰撞半徑紅色圓環（跳過 projectile/未知類型）
-        let collision_ring = if matches!(entity_type, "hero" | "creep" | "unit" | "tower")
+        // 預設關閉；見 COLLISION_RING_ENABLED 旁註解。
+        let collision_ring = if COLLISION_RING_ENABLED
+            && matches!(entity_type, "hero" | "creep" | "unit" | "tower")
             && collision_radius_render > 0.0 {
             build_circle_outline(
                 scene,
@@ -2985,6 +3009,8 @@ impl Game {
             collision_ring,
             tower_kind,
             attack_range_backend,
+            last_label_text: String::new(),
+            last_label_pos: Vector2::new(f32::MIN, f32::MIN),
         });
     }
 
