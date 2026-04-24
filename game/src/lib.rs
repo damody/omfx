@@ -1289,15 +1289,21 @@ impl Plugin for Game {
             // Heartbeat HP reconciliation: overwrite client-predicted HP with the
             // authoritative backend snapshot (corrects drift accumulated from
             // optimistic damage prediction + missed/overshot hits).
+            //
+            // Task 1.5 (2026-04-24): server switched to compact keys `{"i": id, "h": hp}`
+            // and dropped max_hp. We keep whatever max_hp the entity already had (from
+            // creep.create / hero_stats / prior snapshot). Entities we've never seen a
+            // max_hp for are rare (spawned before client connected) — use hp as a
+            // temporary upper bound so the bar still renders sanely.
             if let Some(snap) = pending_hp_sync {
                 if let Some(arr) = snap.as_array() {
                     for item in arr {
-                        let id = item.get("id").and_then(|v| v.as_u64()).map(|v| v as u32);
-                        let hp = item.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
-                        let max_hp = item.get("max_hp").and_then(|v| v.as_f64()).map(|v| v as f32);
-                        if let (Some(id), Some(h), Some(m)) = (id, hp, max_hp) {
+                        let id = item.get("i").and_then(|v| v.as_u64()).map(|v| v as u32);
+                        let hp = item.get("h").and_then(|v| v.as_f64()).map(|v| v as f32);
+                        if let (Some(id), Some(h)) = (id, hp) {
                             if let Some(entity) = self.network_entities.get_mut(&id) {
-                                entity.health = Some((h, m));
+                                let max_hp = entity.health.map(|(_, m)| m).unwrap_or(h.max(1.0));
+                                entity.health = Some((h, max_hp));
                             }
                         }
                     }
