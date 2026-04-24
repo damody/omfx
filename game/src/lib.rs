@@ -225,6 +225,23 @@ struct NetworkEntity {
     // UI message 會吃光 frame。只在字串/位置變動超過門檻時才送。
     last_label_text: String,
     last_label_pos: Vector2<f32>,
+    // ------- P4: velocity-based extrapolation (creep-only) -------
+    // When `extrap_velocity > 0.0` the entity uses velocity extrapolation
+    // instead of lerp. Server emits creep.M only on waypoint/speed change,
+    // so between events the client advances `position` on its own using:
+    //     current = extrap_start_pos + velocity * dir * elapsed
+    // `extrap_direction` is cached from (target - start_pos).normalize() at
+    // event apply time so the per-frame render path is branchless.
+    // `extrap_elapsed` is seconds since the event arrived (wall-clock, dt-
+    // integrated in update()); matches backend tick_dt closely enough for
+    // seconds-scale segments, with heartbeat drift snap correcting error.
+    extrap_velocity: f32,
+    extrap_start_pos: Vector2<f32>,
+    extrap_direction: Vector2<f32>,
+    extrap_elapsed: f32,
+    /// Total travel time for the segment (distance / velocity). After this
+    /// the entity locks at target until a new creep.M arrives.
+    extrap_duration: f32,
 }
 
 /// Seconds that a newly-spawned creep's debug path stays visible.
@@ -1262,6 +1279,8 @@ impl Plugin for Game {
         // 2. Receive events from NetworkBridge, push into EventBuffer
         if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
             let mut pending_hp_sync: Option<serde_json::Value> = None;
+            // P4: buffer heartbeat pos_snapshot for post-lerp drift correction.
+            let mut pending_pos_sync: Option<serde_json::Value> = None;
             for evt in network.event_rx.try_iter() {
                 // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
                 // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
@@ -1275,6 +1294,9 @@ impl Plugin for Game {
                     self.heartbeat = parse_heartbeat(&evt.data);
                     if let Some(snap) = evt.data.get("hp_snapshot").cloned() {
                         pending_hp_sync = Some(snap);
+                    }
+                    if let Some(snap) = evt.data.get("pos_snapshot").cloned() {
+                        pending_pos_sync = Some(snap);
                     }
                 } else {
                     buffer.push(evt);
@@ -1309,6 +1331,56 @@ impl Plugin for Game {
                     }
                 }
             }
+
+            // P4: position drift correction from heartbeat pos_snapshot (10% sample
+            // of viewport-visible creeps). For each entry compare client's
+            // extrapolated pos to server's authoritative pos; if drift exceeds
+            // DRIFT_SNAP_THRESHOLD world units, snap to server pos and reset the
+            // extrapolation anchor so subsequent extrapolation re-accumulates error
+            // from zero.
+            if let Some(pos_snap) = pending_pos_sync {
+                const DRIFT_SNAP_THRESHOLD: f32 = 4.0; // world units
+                let threshold_render = DRIFT_SNAP_THRESHOLD * WORLD_SCALE;
+                let threshold_render_sq = threshold_render * threshold_render;
+                if let Some(arr) = pos_snap.as_array() {
+                    for item in arr {
+                        let id = item.get("i").and_then(|v| v.as_u64()).map(|v| v as u32);
+                        let sx = item.get("x").and_then(|v| v.as_f64()).map(|v| v as f32 * WORLD_SCALE);
+                        let sy = item.get("y").and_then(|v| v.as_f64()).map(|v| v as f32 * WORLD_SCALE);
+                        if let (Some(id), Some(sx), Some(sy)) = (id, sx, sy) {
+                            let server_pos = Vector2::new(sx, sy);
+                            if let Some(entity) = self.network_entities.get_mut(&id) {
+                                let dx = entity.position.x - server_pos.x;
+                                let dy = entity.position.y - server_pos.y;
+                                if dx * dx + dy * dy > threshold_render_sq {
+                                    // Snap + re-anchor. Keep direction + velocity so
+                                    // the creep continues toward its known target from
+                                    // the corrected anchor without a "hard reset" feel.
+                                    entity.position = server_pos;
+                                    entity.prev_position = server_pos;
+                                    entity.extrap_start_pos = server_pos;
+                                    entity.extrap_elapsed = 0.0;
+                                    // Recompute duration from the snapped start to the
+                                    // known target using current velocity so we don't
+                                    // over/under-shoot after the snap.
+                                    let tdx = entity.target_position.x - server_pos.x;
+                                    let tdy = entity.target_position.y - server_pos.y;
+                                    let dist_render = (tdx * tdx + tdy * tdy).sqrt();
+                                    if dist_render > f32::EPSILON {
+                                        entity.extrap_direction = Vector2::new(tdx / dist_render, tdy / dist_render);
+                                        let dist_backend = dist_render / WORLD_SCALE;
+                                        if entity.extrap_velocity > 1.0 {
+                                            entity.extrap_duration = (dist_backend / entity.extrap_velocity).clamp(0.01, 3600.0);
+                                        }
+                                    }
+                                    entity.lerp_elapsed = 0.0;
+                                    entity.lerp_duration = entity.extrap_duration.max(0.01);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 4. Interpolate entity positions (client-side lerp)
@@ -1325,8 +1397,28 @@ impl Plugin for Game {
             }
 
             entity.lerp_elapsed += dt;
-            let t = (entity.lerp_elapsed / entity.lerp_duration).clamp(0.0, 1.0);
-            let pos = entity.prev_position.lerp(&entity.target_position, t);
+            // P4: velocity extrapolation takes priority over lerp for creeps
+            // with an active segment. After `extrap_duration` elapses we lock
+            // at `target_position` until the next creep.M arrives; that's how
+            // we render idle at a waypoint when the server hasn't decided on
+            // the next one yet (e.g. TD path end, blocked by collision).
+            let pos = if entity.extrap_velocity > 1.0 && entity.extrap_duration > 0.0 {
+                entity.extrap_elapsed += dt;
+                if entity.extrap_elapsed >= entity.extrap_duration {
+                    entity.target_position
+                } else {
+                    let travel_backend = entity.extrap_velocity * entity.extrap_elapsed;
+                    let travel_render = travel_backend * WORLD_SCALE;
+                    entity.extrap_start_pos
+                        + Vector2::new(
+                            entity.extrap_direction.x * travel_render,
+                            entity.extrap_direction.y * travel_render,
+                        )
+                }
+            } else {
+                let t = (entity.lerp_elapsed / entity.lerp_duration).clamp(0.0, 1.0);
+                entity.prev_position.lerp(&entity.target_position, t)
+            };
             entity.position = pos;
 
             // Update node position (keep same Z) — X 取負讓 +X world 投到螢幕右
@@ -2568,6 +2660,20 @@ impl Game {
         } else {
             0.01
         };
+        // P4: if this entity is running on velocity extrapolation (creep with a
+        // server-supplied start_pos/velocity), re-anchor at current position so
+        // the new speed takes effect on the remaining segment. Leaves
+        // extrap_direction alone since the target didn't change.
+        if entity.extrap_velocity > 0.0 {
+            entity.extrap_start_pos = cur;
+            entity.extrap_velocity = ms;
+            entity.extrap_elapsed = 0.0;
+            entity.extrap_duration = if ms > 1.0 && dist_backend > f32::EPSILON {
+                (dist_backend / ms).clamp(0.01, 3600.0)
+            } else {
+                0.0
+            };
+        }
     }
 
     fn entity_facing_update(&mut self, data: &serde_json::Value) {
@@ -2597,6 +2703,11 @@ impl Game {
         entity.position = stall_pos;
         entity.target_position = stall_pos;
         entity.lerp_elapsed = entity.lerp_duration;
+        // P4: cancel extrapolation so render doesn't override the freeze.
+        entity.extrap_velocity = 0.0;
+        entity.extrap_duration = 0.0;
+        entity.extrap_start_pos = stall_pos;
+        entity.extrap_elapsed = 0.0;
         if let Some(f) = data.get("facing").and_then(|v| v.as_f64()) {
             entity.facing = f as f32;
         }
@@ -3264,6 +3375,12 @@ impl Game {
             upgrade_levels: [0; 3],
             last_label_text: String::new(),
             last_label_pos: Vector2::new(f32::MIN, f32::MIN),
+            // P4 extrapolation fields — disabled until first creep.M with velocity.
+            extrap_velocity: 0.0,
+            extrap_start_pos: pos,
+            extrap_direction: Vector2::new(0.0, 0.0),
+            extrap_elapsed: 0.0,
+            extrap_duration: 0.0,
         });
     }
 
@@ -3321,6 +3438,56 @@ impl Game {
                 0.1
             }
         };
+
+        // P4: if the server payload carries `velocity` + `start_pos` (new since
+        // server gates emit on waypoint change), use velocity extrapolation
+        // anchored at the server-authoritative start position. This matches
+        // what the server will simulate until the next M arrives, so drift is
+        // proportional only to clock skew + packet latency, not accumulated lerp
+        // error. When fields are absent or zero (legacy freeze/stop path), we
+        // fall through to the existing lerp above.
+        let velocity_backend = data.get("velocity").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let start_pos = data.get("start_pos").and_then(|sp| {
+            let sx = sp.get("x").and_then(|v| v.as_f64())? as f32 * WORLD_SCALE;
+            let sy = sp.get("y").and_then(|v| v.as_f64())? as f32 * WORLD_SCALE;
+            Some(Vector2::new(sx, sy))
+        });
+        if is_creep && velocity_backend > 1.0 {
+            if let Some(sp) = start_pos {
+                // Re-anchor the interpolation path at the server-provided start_pos
+                // so the client traverses the exact same segment the server says
+                // it's on. The visible jump if the client had drifted is absorbed
+                // inside one frame — acceptable because drift is < a few units
+                // between heartbeats.
+                entity.extrap_start_pos = sp;
+                entity.prev_position = sp;
+                entity.position = sp;
+                entity.extrap_velocity = velocity_backend;
+                let dx = entity.target_position.x - sp.x;
+                let dy = entity.target_position.y - sp.y;
+                let dist_render = (dx * dx + dy * dy).sqrt();
+                entity.extrap_direction = if dist_render > f32::EPSILON {
+                    Vector2::new(dx / dist_render, dy / dist_render)
+                } else {
+                    Vector2::new(0.0, 0.0)
+                };
+                let dist_backend = dist_render / WORLD_SCALE;
+                entity.extrap_duration = if velocity_backend > 1.0 && dist_backend > f32::EPSILON {
+                    (dist_backend / velocity_backend).clamp(0.01, 3600.0)
+                } else {
+                    0.0
+                };
+                entity.extrap_elapsed = 0.0;
+                // Sync lerp_* so non-extrap code paths (HP bar, facing arrow) still work
+                // off the same anchor; the update() loop picks the extrap branch.
+                entity.lerp_duration = entity.extrap_duration.max(0.01);
+                entity.lerp_elapsed = 0.0;
+            }
+        } else if is_creep {
+            // Legacy / freeze path (velocity=0): disable extrapolation so we stay on lerp.
+            entity.extrap_velocity = 0.0;
+            entity.extrap_duration = 0.0;
+        }
 
         // Update HP if provided
         let hp = data.get("hp").and_then(|v| v.as_f64()).map(|v| v as f32);
