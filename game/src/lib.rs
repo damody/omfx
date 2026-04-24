@@ -702,6 +702,9 @@ pub struct Game {
     ui_status_text: Handle<Text>,
     #[visit(skip)] #[reflect(hidden)]
     ui_hud_text: Handle<Text>,
+    /// 左下角英雄屬性面板（多行：name/title/Lv/XP/SP/三圍/HP/Gold + 4 技能等級）
+    #[visit(skip)] #[reflect(hidden)]
+    ui_hero_stats_panel: Handle<Text>,
     #[visit(skip)] #[reflect(hidden)]
     ui_ability_icons: [Handle<UiNode>; 4],
     #[visit(skip)] #[reflect(hidden)]
@@ -780,11 +783,23 @@ struct AbilityInfo {
     effects: HashMap<String, serde_json::Value>,
 }
 
+/// 前端緩存的單一 buff（由 hero.stats 的 "buffs" 陣列驅動）
+#[derive(Default, Debug, Clone)]
+struct LocalBuff {
+    id: String,
+    /// 剩餘秒數；-1.0 代表無限期（toggle）
+    remaining: f32,
+    /// 原始 payload（例 sniper_mode = {range_bonus:100, damage_bonus:0.15, ...}）
+    payload: serde_json::Value,
+}
+
 /// 前端緩存的 hero 狀態（由 hero.stats / hero.inventory 事件驅動）
 #[derive(Default, Debug, Clone)]
 struct LocalHeroState {
     /// 英雄在後端的 entity id，camera 跟隨用
     entity_id: Option<u32>,
+    name: String,
+    title: String,
     level: i32,
     xp: i32,
     xp_next: i32,
@@ -794,6 +809,23 @@ struct LocalHeroState {
     lives: i32,
     hp: f32,
     max_hp: f32,
+    strength: i32,
+    agility: i32,
+    intelligence: i32,
+    /// "strength" / "agility" / "intelligence"；決定左下角面板 primary * 標記位置
+    primary_attribute: String,
+    armor: f32,
+    magic_resist: f32,
+    move_speed: f32,
+    attack_damage: f32,
+    /// 秒/攻（asd）；0 代表不攻擊
+    attack_interval: f32,
+    attack_range: f32,
+    bullet_speed: f32,
+    /// 當前在 BuffStore 裡的 buff 快照（由後端 `hero.stats` 每 0.3 秒 push 一次）。
+    /// remaining < 0 代表無限期（例：toggle 型 sniper_mode）。前端每 tick 本地
+    /// 遞減 remaining，讓倒數看起來連續；下次 push 會重設成權威值。
+    buffs: Vec<LocalBuff>,
     abilities: Vec<String>,          // ability ids, index 0=Q, 1=W, 2=E, 3=R
     ability_levels: HashMap<String, i32>,
     /// 技能剩餘冷卻秒數（key = ability id），本地遞減
@@ -1071,6 +1103,17 @@ impl Plugin for Game {
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(10.0, 34.0))
                 .with_width(1900.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+        )
+        .with_text("".to_string())
+        .with_font_size(18.0.into())
+        .build(&mut ui.build_ctx());
+
+        // 左下角英雄屬性面板（多行）；實際位置由 update() 依 window_size 重定位
+        self.ui_hero_stats_panel = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(10.0, 400.0))
+                .with_width(480.0)
                 .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("".to_string())
@@ -1913,6 +1956,14 @@ impl Plugin for Game {
                 if *cd > 0.0 { *cd = (*cd - dt).max(0.0); }
             }
 
+            // Buff 倒數：本地每 frame 遞減，讓面板顯示連續變化；
+            // 下次 backend push 的 snapshot 會重設成權威值，避免漂移。
+            for b in self.hero_state.buffs.iter_mut() {
+                if b.remaining > 0.0 { b.remaining = (b.remaining - dt).max(0.0); }
+            }
+            // remaining = 0 的有限期 buff 從本地清掉（權威值會在下次 push 糾正）
+            self.hero_state.buffs.retain(|b| b.remaining != 0.0);
+
             let hs = &self.hero_state;
             // 更新技能 icon 下方的等級點 + 中央 CD 數字
             for i in 0..4 {
@@ -1963,6 +2014,79 @@ impl Plugin for Game {
                 )
             };
             ui.send(self.ui_hud_text, TextMessage::Text(hud));
+
+            // 左下角英雄屬性面板：每 tick 重組文字並依 window_size 重定位
+            {
+                let hs = &self.hero_state;
+                let header = if hs.name.is_empty() {
+                    "(尚未載入英雄)".to_string()
+                } else if hs.title.is_empty() {
+                    hs.name.clone()
+                } else {
+                    format!("{} · {}", hs.name, hs.title)
+                };
+                // 主屬性標記：與主屬性相同的三圍後面加 ★
+                let tag = |attr: &str| if hs.primary_attribute == attr { "★" } else { " " };
+                let mut ability_lines = String::new();
+                for (i, id) in hs.abilities.iter().enumerate().take(4) {
+                    let lvl = hs.ability_levels.get(id).copied().unwrap_or(0);
+                    let key = ["Q", "W", "E", "R"].get(i).copied().unwrap_or("?");
+                    ability_lines.push_str(&format!("\n[{}] {:<22} 等級 {}/4", key, id, lvl));
+                }
+                let aps = if hs.attack_interval > 0.0 { 1.0 / hs.attack_interval } else { 0.0 };
+                // 組 buff 區塊：每行 "[id] 剩餘 X.Xs" 或 "[id] 持續 ∞"
+                let mut buff_lines = String::new();
+                if hs.buffs.is_empty() {
+                    buff_lines.push_str("\n  （無）");
+                } else {
+                    for b in &hs.buffs {
+                        let dur = if b.remaining < 0.0 {
+                            "∞".to_string()
+                        } else {
+                            format!("{:.1}秒", b.remaining)
+                        };
+                        buff_lines.push_str(&format!("\n  {:<20} 剩餘 {}", b.id, dur));
+                        // 列 payload 的數值欄位（range_bonus/damage_bonus/...）
+                        if let Some(obj) = b.payload.as_object() {
+                            for (k, v) in obj {
+                                if let Some(f) = v.as_f64() {
+                                    buff_lines.push_str(&format!("\n    {:<22} {:>+6.2}", k, f));
+                                }
+                            }
+                        }
+                    }
+                }
+                // 所有欄位採用 2 字中文標籤 + 右對齊數值，保持垂直對齊
+                let panel_text = format!(
+                    "{}\n\
+                     等級 {:>3}     經驗 {:>4}/{:<4}   技點 {}\n\
+                     力量 {:>3}{}   敏捷 {:>3}{}   智力 {:>3}{}\n\
+                     血量 {:>4}/{:<4}   金錢 {}\n\
+                     護甲 {:>4.1}   魔抗 {:>4.1}   移速 {:>4.0}\n\
+                     攻擊 {:>4.0}   攻速 {:>4.2}秒   射程 {:>4.0}\n\
+                     彈速 {:>4.0}   每秒 {:>4.2}\n\
+                     ── 技能 ──{}\n\
+                     ── 效果 ──{}",
+                    header,
+                    hs.level, hs.xp, hs.xp_next, hs.skill_points,
+                    hs.strength, tag("strength"),
+                    hs.agility, tag("agility"),
+                    hs.intelligence, tag("intelligence"),
+                    hs.hp as i32, hs.max_hp as i32, hs.gold,
+                    hs.armor, hs.magic_resist, hs.move_speed,
+                    hs.attack_damage, hs.attack_interval, hs.attack_range,
+                    hs.bullet_speed, aps,
+                    ability_lines,
+                    buff_lines,
+                );
+                let panel_h = 360.0;
+                let panel_y = (self.window_size.y - panel_h - 10.0).max(0.0);
+                ui.send(
+                    self.ui_hero_stats_panel,
+                    WidgetMessage::DesiredPosition(Vector2::new(10.0, panel_y)),
+                );
+                ui.send(self.ui_hero_stats_panel, TextMessage::Text(panel_text));
+            }
 
             // 商店顯示 / 隱藏
             let shop = if self.shop_visible {
@@ -2680,6 +2804,27 @@ impl Game {
         {
             let hs = &mut self.hero_state;
             if let Some(v) = data.get("id").and_then(|v| v.as_u64()) { hs.entity_id = Some(v as u32); }
+            if let Some(v) = data.get("name").and_then(|v| v.as_str()) { hs.name = v.to_string(); }
+            if let Some(v) = data.get("title").and_then(|v| v.as_str()) { hs.title = v.to_string(); }
+            if let Some(v) = data.get("strength").and_then(|v| v.as_i64()) { hs.strength = v as i32; }
+            if let Some(v) = data.get("agility").and_then(|v| v.as_i64()) { hs.agility = v as i32; }
+            if let Some(v) = data.get("intelligence").and_then(|v| v.as_i64()) { hs.intelligence = v as i32; }
+            if let Some(v) = data.get("primary_attribute").and_then(|v| v.as_str()) { hs.primary_attribute = v.to_string(); }
+            if let Some(v) = data.get("armor").and_then(|v| v.as_f64()) { hs.armor = v as f32; }
+            if let Some(v) = data.get("magic_resist").and_then(|v| v.as_f64()) { hs.magic_resist = v as f32; }
+            if let Some(v) = data.get("move_speed").and_then(|v| v.as_f64()) { hs.move_speed = v as f32; }
+            if let Some(v) = data.get("attack_damage").and_then(|v| v.as_f64()) { hs.attack_damage = v as f32; }
+            if let Some(v) = data.get("attack_interval").and_then(|v| v.as_f64()) { hs.attack_interval = v as f32; }
+            if let Some(v) = data.get("attack_range").and_then(|v| v.as_f64()) { hs.attack_range = v as f32; }
+            if let Some(v) = data.get("bullet_speed").and_then(|v| v.as_f64()) { hs.bullet_speed = v as f32; }
+            if let Some(arr) = data.get("buffs").and_then(|v| v.as_array()) {
+                hs.buffs = arr.iter().filter_map(|b| {
+                    let id = b.get("id")?.as_str()?.to_string();
+                    let remaining = b.get("remaining")?.as_f64()? as f32;
+                    let payload = b.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+                    Some(LocalBuff { id, remaining, payload })
+                }).collect();
+            }
             if let Some(v) = data.get("level").and_then(|v| v.as_i64()) { hs.level = v as i32; }
             if let Some(v) = data.get("xp").and_then(|v| v.as_i64()) { hs.xp = v as i32; }
             if let Some(v) = data.get("xp_next").and_then(|v| v.as_i64()) { hs.xp_next = v as i32; }
