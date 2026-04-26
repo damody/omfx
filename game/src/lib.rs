@@ -101,9 +101,10 @@ struct TimestampedEvent {
     msg_type: String,
     action: String,
     data: serde_json::Value,
-    /// 從 GameEventData 轉傳；update loop 用來算網路吞吐量，
-    /// 避免每幀 serde_json::to_string 重做 serialize。
+    /// 解壓後 prost payload 長度。HUD 顯示「應用層」logical bytes。
     payload_bytes: usize,
+    /// 真實 KCP/UDP wire bytes (LZ4 壓縮後 + framing)。HUD 顯示真實 bandwidth。
+    wire_bytes: usize,
 }
 
 impl PartialEq for TimestampedEvent {
@@ -525,6 +526,7 @@ impl NetworkBridge {
                             action: evt.action,
                             data: evt.data,
                             payload_bytes: evt.payload_bytes,
+                            wire_bytes: evt.wire_bytes,
                         }).is_err() {
                             break;
                         }
@@ -775,12 +777,18 @@ pub struct Game {
     /// Camera 目前所在 render-world 座標（用於滑鼠座標換算與 label 螢幕換算）
     #[visit(skip)] #[reflect(hidden)]
     camera_world_pos: Vector2<f32>,
-    /// 本秒累計的網路事件 payload bytes
+    /// 本秒累計的網路事件 logical (decompressed) payload bytes — UI 看「應用層」量
     #[visit(skip)] #[reflect(hidden)]
     net_bytes_current: u64,
-    /// 上一秒的總 bytes，供顯示用
+    /// 上一秒的總 logical bytes，供顯示用
     #[visit(skip)] #[reflect(hidden)]
     net_bytes_last_sec: u64,
+    /// 本秒累計的真實 wire bytes (壓縮後 + framing) — UI 看真實 bandwidth
+    #[visit(skip)] #[reflect(hidden)]
+    net_wire_bytes_current: u64,
+    /// 上一秒的真實 wire bytes
+    #[visit(skip)] #[reflect(hidden)]
+    net_wire_bytes_last_sec: u64,
     /// 計時：每滿 1 秒 roll over
     #[visit(skip)] #[reflect(hidden)]
     net_stats_elapsed: f32,
@@ -1273,6 +1281,8 @@ impl Plugin for Game {
         if self.net_stats_elapsed >= 1.0 {
             self.net_bytes_last_sec = self.net_bytes_current;
             self.net_bytes_current = 0;
+            self.net_wire_bytes_last_sec = self.net_wire_bytes_current;
+            self.net_wire_bytes_current = 0;
             self.net_stats_elapsed -= 1.0;
         }
 
@@ -1284,7 +1294,10 @@ impl Plugin for Game {
             for evt in network.event_rx.try_iter() {
                 // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
                 // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
+                // logical: 解壓後的 prost payload + shim 重建的字串開銷（HUD 看「應用層」量）
                 self.net_bytes_current += (evt.msg_type.len() + evt.action.len() + evt.payload_bytes + 16) as u64;
+                // wire: KCP/UDP 上的真實 bytes (LZ4 壓縮後 + 1+4 byte framing)
+                self.net_wire_bytes_current += evt.wire_bytes as u64;
                 // Heartbeat: calibrate clock immediately, don't buffer
                 if evt.msg_type == "heartbeat" && evt.action == "tick" {
                     buffer.sync_clock(evt.timestamp_ms);
@@ -1737,31 +1750,27 @@ impl Plugin for Game {
                     });
                 }
             }
-        } else if let Some(hero_id) = self.hero_state.entity_id {
-            if let Some(hero_ent) = self.network_entities.get(&hero_id) {
-                let pos = hero_ent.position;
-                let z = scene.graph[self.camera].local_transform().position().z;
-                // 渲染時 X 負號：Fyrox 預設 +X 到螢幕左，我們希望 +X 到右，所以 entity/camera X 都反向
-                scene.graph[self.camera]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x, pos.y, z));
-                self.camera_world_pos = pos;
+        } else {
+            // MOBA 模式：相機不再跟隨英雄移動。保留 camera 在 scene.rgs 載入時的初始位置，
+            // camera_world_pos 從 camera 當前 transform 反推（X 渲染負號 → world.x = -cam.x），
+            // 確保 name label 螢幕投影 (L~1806) 與 mouse_world_pos (L~2291) 仍正確。
+            // viewport 週期性同步到後端用 camera 實際位置（之後若加滑鼠拖曳鏡頭仍能正確同步）。
+            let cam_pos = scene.graph[self.camera].local_transform().position();
+            self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
 
-                // 週期性同步 viewport 給後端（~2 Hz）
-                self.viewport_sync_elapsed += dt;
-                if self.viewport_sync_elapsed >= 0.5 {
-                    self.viewport_sync_elapsed = 0.0;
-                    if let Some(ref network) = self.network {
-                        let aspect = self.window_size.x / self.window_size.y.max(1.0);
-                        let half_height = 10.0 / WORLD_SCALE;
-                        let half_width = 10.0 * aspect / WORLD_SCALE;
-                        let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
-                            cx: pos.x / WORLD_SCALE,
-                            cy: pos.y / WORLD_SCALE,
-                            hw: half_width,
-                            hh: half_height,
-                        });
-                    }
+            self.viewport_sync_elapsed += dt;
+            if self.viewport_sync_elapsed >= 0.5 {
+                self.viewport_sync_elapsed = 0.0;
+                if let Some(ref network) = self.network {
+                    let aspect = self.window_size.x / self.window_size.y.max(1.0);
+                    let half_height = 10.0 / WORLD_SCALE;
+                    let half_width = 10.0 * aspect / WORLD_SCALE;
+                    let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
+                        cx: self.camera_world_pos.x / WORLD_SCALE,
+                        cy: self.camera_world_pos.y / WORLD_SCALE,
+                        hw: half_width,
+                        hh: half_height,
+                    });
                 }
             }
         }
@@ -1833,22 +1842,26 @@ impl Plugin for Game {
             ConnectionStatus::Disconnected => "Disconnected".to_string(),
             ConnectionStatus::Connecting => "Connecting...".to_string(),
             ConnectionStatus::Connected => {
-                let bps = self.net_bytes_last_sec;
-                let net_str = if bps >= 1_000_000 {
-                    format!("{:.2} MB/s", bps as f64 / 1_000_000.0)
-                } else if bps >= 1_000 {
-                    format!("{:.1} KB/s", bps as f64 / 1_000.0)
-                } else {
-                    format!("{} B/s", bps)
+                let fmt_bps = |bps: u64| -> String {
+                    if bps >= 1_000_000 {
+                        format!("{:.2} MB/s", bps as f64 / 1_000_000.0)
+                    } else if bps >= 1_000 {
+                        format!("{:.1} KB/s", bps as f64 / 1_000.0)
+                    } else {
+                        format!("{} B/s", bps)
+                    }
                 };
+                let wire_str = fmt_bps(self.net_wire_bytes_last_sec);   // 真實 UDP wire (壓縮後)
+                let logical_str = fmt_bps(self.net_bytes_last_sec);      // 解壓後 logical
                 format!(
-                    "Connected | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {}",
+                    "Connected | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
                     self.heartbeat.tick,
                     self.heartbeat.game_time,
                     self.heartbeat.entity_count,
                     self.heartbeat.hero_count,
                     self.heartbeat.creep_count,
-                    net_str,
+                    wire_str,
+                    logical_str,
                 )
             }
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
