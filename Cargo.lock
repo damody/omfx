@@ -3468,6 +3468,7 @@ dependencies = [
  "anyhow",
  "log",
  "lz4_flex",
+ "omoba-template-ids",
  "prost",
  "prost-build",
  "rand 0.9.4",
@@ -3477,6 +3478,14 @@ dependencies = [
  "tokio_kcp",
  "toml 0.9.12+spec-1.1.0",
  "vek",
+]
+
+[[package]]
+name = "omoba-template-ids"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
