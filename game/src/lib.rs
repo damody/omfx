@@ -1114,9 +1114,11 @@ impl Plugin for Game {
             .build(&mut ui.build_ctx());
         }
 
+        // status bar 緊貼螢幕頂端，留更多 UI 空間給下方資訊
         self.ui_status_text = TextBuilder::new(
             WidgetBuilder::new()
-                .with_desired_position(Vector2::new(10.0, 10.0))
+                .with_desired_position(Vector2::new(10.0, 2.0))
+                .with_width(1900.0)
                 .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
         .with_text("Connecting...".to_string())
@@ -1126,7 +1128,7 @@ impl Plugin for Game {
         // HUD 文字（左上角，緊貼 status bar 下方）
         self.ui_hud_text = TextBuilder::new(
             WidgetBuilder::new()
-                .with_desired_position(Vector2::new(10.0, 34.0))
+                .with_desired_position(Vector2::new(10.0, 24.0))
                 .with_width(1900.0)
                 .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
         )
