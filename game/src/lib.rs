@@ -2192,8 +2192,8 @@ impl Plugin for Game {
                     ability_lines,
                     buff_lines,
                 );
-                let panel_h = 360.0;
-                let panel_y = (self.window_size.y - panel_h - 10.0).max(0.0);
+                // 英雄屬性面板移到左上（status bar y=2 + HUD y=24 之下，y=50 起）
+                let panel_y = 50.0;
                 ui.send(
                     self.ui_hero_stats_panel,
                     WidgetMessage::DesiredPosition(Vector2::new(10.0, panel_y)),
