@@ -277,6 +277,25 @@ struct ActiveExplosion {
 /// Backend only sends a single C event with `target_id` + `flight_time_ms`;
 /// the bullet's position is computed locally each frame as a pursuit lerp
 /// from `start_pos` toward the target entity's CURRENT client-side position.
+/// P7 layered prediction entry (per projectile id). Tracks「server 已經宣告
+/// 但 server 還沒送 hp_snapshot 反映」這段視窗內，client 想本地視覺上扣多少血。
+///
+/// Lifecycle:
+///   PC arrives        → insert (applied=false)
+///   visual t≥1.0 hit  → applied=true（命中時刻才從 display HP 扣下去）
+///   D event           → remove（projectile 死了：可能命中、可能 timeout/取消）
+///   heartbeat retain  → 不在 server 的 in_flight_projectiles 集合 → remove
+///
+/// HP bar render 時：display_hp = authoritative_hp(server 權威值) - Σ(applied dmg)。
+/// 跟 heartbeat hp_snapshot 不雙重計算因為 server 用 in_flight 顯式告訴 client
+/// 哪幾發還沒結算（沒在裡面的就是已經反映在 hp_snapshot 上、應該移除）。
+#[derive(Debug)]
+struct PendingPredDmg {
+    target_id: u32,
+    dmg: f32,
+    applied: bool,
+}
+
 /// This eliminates the per-tick network round-trip lag that made bullets
 /// visually trail the creep.
 #[derive(Debug)]
@@ -703,6 +722,12 @@ pub struct Game {
     td_template_order: Vec<String>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
+    /// P7 layered prediction：key = projectile id（server `e.id()`）。
+    /// 跟 client_projectiles 同 id；前者是視覺軌跡，這個是傷害預測 ledger。
+    /// 視覺命中後 ClientProjectile 移除但 PendingPredDmg 留著，等 heartbeat
+    /// 的 in_flight_projectiles 或 D event 真結算才移除。
+    #[visit(skip)] #[reflect(hidden)]
+    pending_pred_dmg: HashMap<u32, PendingPredDmg>,
     #[visit(skip)] #[reflect(hidden)]
     heartbeat: HeartbeatInfo,
 
@@ -1247,6 +1272,7 @@ impl Plugin for Game {
         self.event_buffer = Some(EventBuffer::new());
         self.network_entities = HashMap::new();
         self.client_projectiles = HashMap::new();
+        self.pending_pred_dmg = HashMap::new();
 
         Ok(())
     }
@@ -1318,6 +1344,17 @@ impl Plugin for Game {
                     }
                     if let Some(snap) = evt.data.get("pos_snapshot").cloned() {
                         pending_pos_sync = Some(snap);
+                    }
+                    // P7 layered: server 告訴我們哪幾個 predeclared projectile 還在飛。
+                    // 不在這集合內的 pending entry 表示 server 那邊已結算（命中
+                    // 的話 hp_snapshot 帶來新 hp、cancel 的話 D event 也會到），
+                    // 我們要把它們從 ledger 移除避免之後拿來扣 display HP。
+                    if let Some(arr) = evt.data.get("in_flight_projectiles").and_then(|v| v.as_array()) {
+                        let in_flight_set: std::collections::HashSet<u32> = arr
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u32))
+                            .collect();
+                        self.pending_pred_dmg.retain(|proj_id, _| in_flight_set.contains(proj_id));
                     }
                 } else {
                     buffer.push(evt);
@@ -1406,7 +1443,18 @@ impl Plugin for Game {
 
         // 4. Interpolate entity positions (client-side lerp)
         let dt = context.dt;
-        for entity in self.network_entities.values_mut() {
+        // P7 layered: 預先 sum 每個 target 的 applied 預測扣血，HP bar 渲染時減去。
+        // O(P) where P = pending count，通常 < 50。
+        let pending_dmg_by_target: HashMap<u32, f32> = {
+            let mut m: HashMap<u32, f32> = HashMap::new();
+            for p in self.pending_pred_dmg.values() {
+                if p.applied {
+                    *m.entry(p.target_id).or_insert(0.0) += p.dmg;
+                }
+            }
+            m
+        };
+        for (&entity_id, entity) in self.network_entities.iter_mut() {
             // Expire creep debug path after PATH_VISIBLE_SECS
             if !entity.path_nodes.is_empty() {
                 entity.path_age += dt;
@@ -1451,7 +1499,12 @@ impl Plugin for Game {
             // Update HP bar positions
             if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
                 let bar_y = pos.y + 0.3;
-                let hp_ratio = (h / m).clamp(0.0, 1.0);
+                // P7 layered display HP：authoritative h 減去已 applied 但 server 還沒
+                // 反映的預測扣血，讓 visual 在子彈視覺命中當下就掉血、heartbeat reconcile
+                // 後 pending 從 retain 被移除、h 也對應降下，畫面值不會跳。
+                let pending_dmg = pending_dmg_by_target.get(&entity_id).copied().unwrap_or(0.0);
+                let display_h = (h - pending_dmg).max(0.0);
+                let hp_ratio = (display_h / m).clamp(0.0, 1.0);
                 let bar_width = 0.8;
 
                 scene.graph[bg]
@@ -1656,7 +1709,10 @@ impl Plugin for Game {
         //     (game_processor.rs 裡用 initial_dist / bullet_speed 設 safety_time_left 的 1/3)，
         //     所以彈落時 optimistic 扣血與 100ms 內到達的 backend "H" 事件幾乎 sync，不會 bouncing。
         let mut finished: Vec<u32> = Vec::new();
-        let mut predicted_damage: Vec<(u32, f32)> = Vec::new();
+        // P7 layered：t≥1.0 視覺命中時要 mark 對應 pending_pred_dmg 為 applied=true。
+        // 收 id 後在 loop 結束後一起做（避免 self.client_projectiles 與 self.pending_pred_dmg
+        // 同時 mut borrow 的 split-borrow 麻煩）。
+        let mut predicted_apply_ids: Vec<u32> = Vec::new();
         for (id, proj) in self.client_projectiles.iter_mut() {
             proj.elapsed += dt;
             let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
@@ -1683,7 +1739,7 @@ impl Plugin for Game {
             if t >= 1.0 {
                 // 方向性子彈的 damage 由後端 H 事件授權，不做 optimistic 扣血
                 if !proj.directional && !proj.applied && proj.damage > 0.0 {
-                    predicted_damage.push((proj.target_id, proj.damage));
+                    predicted_apply_ids.push(*id);
                     proj.applied = true;
                 }
                 // Bomb 塔：命中時在「子彈當前視覺位置」自 spawn 爆炸特效。
@@ -1705,13 +1761,12 @@ impl Plugin for Game {
                 finished.push(*id);
             }
         }
-        // Optimistic 扣血：等後續 backend "H" 事件（約 0~100ms 內）reconcile
-        for (target_id, dmg) in predicted_damage {
-            if let Some(entity) = self.network_entities.get_mut(&target_id) {
-                if let Some((h, m)) = entity.health {
-                    let new_h = (h - dmg).max(0.0);
-                    entity.health = Some((new_h, m));
-                }
+        // P7 layered：mark applied，display HP 渲染時才減（在下方 entity update loop
+        // 計 pending_dmg_by_target）。不再直接寫 entity.health（authoritative 由 server H
+        // / heartbeat hp_snapshot 獨佔）。
+        for proj_id in predicted_apply_ids {
+            if let Some(p) = self.pending_pred_dmg.get_mut(&proj_id) {
+                p.applied = true;
             }
         }
         for id in finished {
@@ -1806,7 +1861,7 @@ impl Plugin for Game {
         }
 
         // Create missing labels & update positions
-        for entity in self.network_entities.values_mut() {
+        for (&entity_id, entity) in self.network_entities.iter_mut() {
             if entity.health.is_none() {
                 continue; // only show names for entities with HP bars
             }
@@ -1847,8 +1902,13 @@ impl Plugin for Game {
 
                 // 顯示「名字 HP/MaxHP」讓 HP bouncing 肉眼可見
                 // 用 round() 比對避免 0.1 HP 級小波動灌訊息
+                // P7 layered：跟 HP bar 一致，扣掉 applied 但 server 還沒反映的預測扣血
                 let text = match entity.health {
-                    Some((h, m)) => format!("{} {:.0}/{:.0}", entity.name, h.round(), m.round()),
+                    Some((h, m)) => {
+                        let pending_dmg = pending_dmg_by_target.get(&entity_id).copied().unwrap_or(0.0);
+                        let display_h = (h - pending_dmg).max(0.0);
+                        format!("{} {:.0}/{:.0}", entity.name, display_h.round(), m.round())
+                    }
                     None => entity.name.clone(),
                 };
                 if text != entity.last_label_text {
@@ -3179,6 +3239,15 @@ impl Game {
             damage,
             applied: false,
         });
+        // P7 layered: 只記 single-target with damage 才需要預測（directional / target=0 的彈
+        // server 端 predeclared_dmg=0 不會走這條，但 damage 欄位可能還是有，多一層保險）。
+        if !directional && target_id != 0 && damage > 0.0 {
+            self.pending_pred_dmg.insert(id, PendingPredDmg {
+                target_id,
+                dmg: damage,
+                applied: false,
+            });
+        }
     }
 
     fn projectile_delete(&mut self, data: &serde_json::Value, scene: &mut Scene) {
@@ -3196,6 +3265,10 @@ impl Game {
                 scene.graph.remove_node(h);
             }
         }
+        // P7 layered: D event 表示 server 端 projectile 死了 — 命中已結算（hp 會在
+        // 下次 hp_snapshot 帶來新值）或被取消（hp 沒變但 pending 也該清掉）。
+        // 兩種情況都從 ledger 拿掉避免後續錯誤扣血。
+        self.pending_pred_dmg.remove(&id);
     }
 
     fn entity_create(&mut self, entity_type: &str, data: &serde_json::Value, scene: &mut Scene) {
