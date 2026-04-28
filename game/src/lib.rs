@@ -1325,6 +1325,11 @@ impl Plugin for Game {
             let mut pending_hp_sync: Option<serde_json::Value> = None;
             // P4: buffer heartbeat pos_snapshot for post-lerp drift correction.
             let mut pending_pos_sync: Option<serde_json::Value> = None;
+            // P7 layered: defer pending retain to AFTER hp_sync so authoritative
+            // is updated before we drop applied entries — otherwise display
+            // briefly = old_auth-0 = old_auth (UP) before hp_sync brings it
+            // down again (the「減少→增加→減少」flicker).
+            let mut pending_in_flight_set: Option<std::collections::HashSet<u32>> = None;
             for evt in network.event_rx.try_iter() {
                 // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
                 // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
@@ -1347,14 +1352,15 @@ impl Plugin for Game {
                     }
                     // P7 layered: server 告訴我們哪幾個 predeclared projectile 還在飛。
                     // 不在這集合內的 pending entry 表示 server 那邊已結算（命中
-                    // 的話 hp_snapshot 帶來新 hp、cancel 的話 D event 也會到），
-                    // 我們要把它們從 ledger 移除避免之後拿來扣 display HP。
+                    // 的話 hp_snapshot 帶來新 hp、cancel 的話沒效應），retain 操作
+                    // 必須延到 hp_sync 之後，避免 display 在 auth 還沒更新時瞬間
+                    // 失去 applied 預測扣血造成往上跳的 flicker。
                     if let Some(arr) = evt.data.get("in_flight_projectiles").and_then(|v| v.as_array()) {
-                        let in_flight_set: std::collections::HashSet<u32> = arr
+                        let set: std::collections::HashSet<u32> = arr
                             .iter()
                             .filter_map(|v| v.as_u64().map(|n| n as u32))
                             .collect();
-                        self.pending_pred_dmg.retain(|proj_id, _| in_flight_set.contains(proj_id));
+                        pending_in_flight_set = Some(set);
                     }
                 } else {
                     buffer.push(evt);
@@ -1388,6 +1394,14 @@ impl Plugin for Game {
                         }
                     }
                 }
+            }
+
+            // P7 layered: now that authoritative hp is updated, drop pending
+            // entries the server says have settled. Doing this AFTER hp_sync
+            // means display = new_auth - 0 = new_auth (smooth) instead of
+            // old_auth - 0 = old_auth (flicker UP).
+            if let Some(in_flight_set) = pending_in_flight_set {
+                self.pending_pred_dmg.retain(|proj_id, _| in_flight_set.contains(proj_id));
             }
 
             // P4: position drift correction from heartbeat pos_snapshot (10% sample
@@ -3265,10 +3279,11 @@ impl Game {
                 scene.graph.remove_node(h);
             }
         }
-        // P7 layered: D event 表示 server 端 projectile 死了 — 命中已結算（hp 會在
-        // 下次 hp_snapshot 帶來新值）或被取消（hp 沒變但 pending 也該清掉）。
-        // 兩種情況都從 ledger 拿掉避免後續錯誤扣血。
-        self.pending_pred_dmg.remove(&id);
+        // P7 layered: D event 故意 NOT remove pending_pred_dmg。
+        // 原因：D 因 EventBuffer render_delay_ms 比 heartbeat 早抵達，若這裡先 remove，
+        // display = auth - 0 = old_auth（跳上去），等 heartbeat hp_sync 才把 auth 蓋成
+        // 新值（再跳下來），視覺上會看到「減少→增加→減少」flicker。
+        // 改由 heartbeat 的 in_flight_projectiles retain 統一管理 pending 生命週期。
     }
 
     fn entity_create(&mut self, entity_type: &str, data: &serde_json::Value, scene: &mut Scene) {
