@@ -774,6 +774,10 @@ pub struct Game {
     game_ended: bool,
     #[visit(skip)] #[reflect(hidden)]
     viewport_sync_elapsed: f32,
+    /// 上一次實際送出的 viewport (cx, cy, hw, hh)；值不變就跳過送出避免 omb log 洗版與
+    /// 無謂的 KCP decode + mutex/channel work。reconnect 時 reset 為 None 以強制重送。
+    #[visit(skip)] #[reflect(hidden)]
+    last_sent_viewport: Option<(f32, f32, f32, f32)>,
     /// Camera 目前所在 render-world 座標（用於滑鼠座標換算與 label 螢幕換算）
     #[visit(skip)] #[reflect(hidden)]
     camera_world_pos: Vector2<f32>,
@@ -1266,13 +1270,15 @@ impl Plugin for Game {
         if let Some(ref network) = self.network {
             while let Ok(status) = network.status_rx.try_recv() {
                 if status == ConnectionStatus::Connected && self.connection_status != ConnectionStatus::Connected {
-                    // Send initial viewport on first connect
+                    // Send initial viewport on first connect (or reconnect — omb session is fresh,
+                    // must seed it before any visibility diff can run).
                     let aspect = self.window_size.x / self.window_size.y;
                     let half_height = 10.0 / WORLD_SCALE; // vertical_size in game coords
                     let half_width = 10.0 * aspect / WORLD_SCALE;
                     let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
                         cx: 0.0, cy: 0.0, hw: half_width, hh: half_height,
                     });
+                    self.last_sent_viewport = Some((0.0, 0.0, half_width, half_height));
                 }
                 self.connection_status = status;
             }
@@ -1767,12 +1773,25 @@ impl Plugin for Game {
                     let aspect = self.window_size.x / self.window_size.y.max(1.0);
                     let half_height = 10.0 / WORLD_SCALE;
                     let half_width = 10.0 * aspect / WORLD_SCALE;
-                    let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
-                        cx: self.camera_world_pos.x / WORLD_SCALE,
-                        cy: self.camera_world_pos.y / WORLD_SCALE,
-                        hw: half_width,
-                        hh: half_height,
-                    });
+                    let cx = self.camera_world_pos.x / WORLD_SCALE;
+                    let cy = self.camera_world_pos.y / WORLD_SCALE;
+                    let next = (cx, cy, half_width, half_height);
+                    let changed = match self.last_sent_viewport {
+                        None => true,
+                        Some(prev) => {
+                            const EPS: f32 = 1e-3;
+                            (prev.0 - next.0).abs() > EPS
+                                || (prev.1 - next.1).abs() > EPS
+                                || (prev.2 - next.2).abs() > EPS
+                                || (prev.3 - next.3).abs() > EPS
+                        }
+                    };
+                    if changed {
+                        let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
+                            cx, cy, hw: half_width, hh: half_height,
+                        });
+                        self.last_sent_viewport = Some(next);
+                    }
                 }
             }
         }
