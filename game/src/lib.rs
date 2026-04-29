@@ -621,6 +621,69 @@ impl NetworkBridge {
 // Game Plugin
 // ---------------------------------------------------------------------------
 
+// ---------- Frame profile (omfx 端 per-frame timing 拆解，類比 omb 的 tick_profile) ----------
+
+#[derive(Default, Debug)]
+struct FrameProfile {
+    frame_count: u64,
+    events_ns: u128,
+    interp_ns: u128,
+    visual_ns: u128,
+    proj_ns: u128,
+    cam_ns: u128,
+    ui_ns: u128,
+    total_ns: u128,
+    events_drained: u64,
+    creeps_seen: u64,
+    projectiles_seen: u64,
+}
+
+impl FrameProfile {
+    const WINDOW: u64 = 60;
+
+    fn finish_frame(&mut self) {
+        self.frame_count += 1;
+        if self.frame_count % Self::WINDOW == 0 {
+            self.emit_log();
+            self.reset_window();
+        }
+    }
+
+    fn emit_log(&self) {
+        let w = Self::WINDOW as f64;
+        let total_ms = self.total_ns as f64 / w / 1_000_000.0;
+        let max_fps = if total_ms > 0.0 { (1000.0 / total_ms) as u32 } else { 0 };
+        log::info!(
+            "omfx_frame window={} avg(ms) events={:.2} interp={:.2} visual={:.2} proj={:.2} cam={:.2} ui={:.2} total={:.2} (max_fps={}, events_per_frame={:.0}, creeps={:.0}, projectiles={:.0})",
+            Self::WINDOW,
+            self.events_ns as f64 / w / 1_000_000.0,
+            self.interp_ns as f64 / w / 1_000_000.0,
+            self.visual_ns as f64 / w / 1_000_000.0,
+            self.proj_ns as f64 / w / 1_000_000.0,
+            self.cam_ns as f64 / w / 1_000_000.0,
+            self.ui_ns as f64 / w / 1_000_000.0,
+            total_ms,
+            max_fps,
+            self.events_drained as f64 / w,
+            self.creeps_seen as f64 / w,
+            self.projectiles_seen as f64 / w,
+        );
+    }
+
+    fn reset_window(&mut self) {
+        self.events_ns = 0;
+        self.interp_ns = 0;
+        self.visual_ns = 0;
+        self.proj_ns = 0;
+        self.cam_ns = 0;
+        self.ui_ns = 0;
+        self.total_ns = 0;
+        self.events_drained = 0;
+        self.creeps_seen = 0;
+        self.projectiles_seen = 0;
+    }
+}
+
 #[derive(Default, Visit, Reflect, Debug)]
 #[reflect(non_cloneable)]
 pub struct Game {
@@ -730,6 +793,10 @@ pub struct Game {
     pending_pred_dmg: HashMap<u32, PendingPredDmg>,
     #[visit(skip)] #[reflect(hidden)]
     heartbeat: HeartbeatInfo,
+
+    /// Per-frame profile（每 60 frame 輸出一行 omfx_frame_profile log）。
+    #[visit(skip)] #[reflect(hidden)]
+    frame_profile: FrameProfile,
 
     // --- Backend Process ---
     /// Drops → kills backend. Held for the whole Game lifetime so that any exit
@@ -1291,6 +1358,7 @@ impl Plugin for Game {
 
     fn update(&mut self, context: &mut PluginContext) -> GameResult {
         let scene = &mut context.scenes[self.scene];
+        let frame_t0 = std::time::Instant::now();
 
         // 1. Check connection status
         if let Some(ref network) = self.network {
@@ -1321,6 +1389,8 @@ impl Plugin for Game {
         }
 
         // 2. Receive events from NetworkBridge, push into EventBuffer
+        let t_events = std::time::Instant::now();
+        let mut events_drained_local: u64 = 0;
         if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
             let mut pending_hp_sync: Option<serde_json::Value> = None;
             // P4: buffer heartbeat pos_snapshot for post-lerp drift correction.
@@ -1331,6 +1401,7 @@ impl Plugin for Game {
             // down again (the「減少→增加→減少」flicker).
             let mut pending_in_flight_set: Option<std::collections::HashSet<u32>> = None;
             for evt in network.event_rx.try_iter() {
+                events_drained_local += 1;
                 // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
                 // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
                 // logical: 解壓後的 prost payload + shim 重建的字串開銷（HUD 看「應用層」量）
@@ -1369,6 +1440,7 @@ impl Plugin for Game {
 
             // 3. Drain ready events from buffer and render
             for evt in buffer.drain_ready() {
+                events_drained_local += 1;
                 self.apply_event(evt, scene);
             }
 
@@ -1455,7 +1527,10 @@ impl Plugin for Game {
             }
         }
 
+        let events_ns = t_events.elapsed().as_nanos();
+
         // 4. Interpolate entity positions (client-side lerp)
+        let t_interp = std::time::Instant::now();
         let dt = context.dt;
         // P7 layered: 預先 sum 每個 target 的 applied 預測扣血，HP bar 渲染時減去。
         // O(P) where P = pending count，通常 < 50。
@@ -1570,7 +1645,10 @@ impl Plugin for Game {
             }
         }
 
+        let interp_ns = t_interp.elapsed().as_nanos();
+
         // TD 塔預覽圓圈：選中塔時每 frame 在滑鼠位置重畫 footprint + 攻擊範圍兩圈。
+        let t_visual = std::time::Instant::now();
         {
             for h in self.td_preview_nodes.drain(..) {
                 scene.graph.remove_node(h);
@@ -1731,11 +1809,14 @@ impl Plugin for Game {
             }
         }
 
+        let visual_ns = t_visual.elapsed().as_nanos();
+
         // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
         //     current interpolated position; t forced to 1 at flight_time).
         //     後端改為 100ms batch 發送，client flight_time 與 backend projectile time 已對齊
         //     (game_processor.rs 裡用 initial_dist / bullet_speed 設 safety_time_left 的 1/3)，
         //     所以彈落時 optimistic 扣血與 100ms 內到達的 backend "H" 事件幾乎 sync，不會 bouncing。
+        let t_proj = std::time::Instant::now();
         let mut finished: Vec<u32> = Vec::new();
         // P7 layered：t≥1.0 視覺命中時要 mark 對應 pending_pred_dmg 為 applied=true。
         // 收 id 後在 loop 結束後一起做（避免 self.client_projectiles 與 self.pending_pred_dmg
@@ -1806,8 +1887,11 @@ impl Plugin for Game {
             }
         }
 
+        let proj_ns = t_proj.elapsed().as_nanos();
+
         // 4c. Camera follow hero（MOBA 模式）或 固定俯視（TD 模式）
         //     TD 模式下：相機固定在地圖中心、拉遠到能看完整條路線。
+        let t_cam = std::time::Instant::now();
         if self.is_td_mode {
             if !self.td_camera_configured {
                 // 一次性：放大視角、鎖定在原點
@@ -1879,7 +1963,10 @@ impl Plugin for Game {
             }
         }
 
+        let cam_ns = t_cam.elapsed().as_nanos();
+
         // 5. Update name labels (UI layer)
+        let t_ui = std::time::Instant::now();
         let ui = context.user_interfaces.first_mut();
         let win = self.window_size;
 
@@ -2384,6 +2471,20 @@ impl Plugin for Game {
                 );
             }
         }
+        let ui_ns = t_ui.elapsed().as_nanos();
+
+        let total_ns = frame_t0.elapsed().as_nanos();
+        self.frame_profile.events_ns += events_ns;
+        self.frame_profile.interp_ns += interp_ns;
+        self.frame_profile.visual_ns += visual_ns;
+        self.frame_profile.proj_ns += proj_ns;
+        self.frame_profile.cam_ns += cam_ns;
+        self.frame_profile.ui_ns += ui_ns;
+        self.frame_profile.total_ns += total_ns;
+        self.frame_profile.events_drained += events_drained_local;
+        self.frame_profile.creeps_seen += self.network_entities.len() as u64;
+        self.frame_profile.projectiles_seen += self.client_projectiles.len() as u64;
+        self.frame_profile.finish_frame();
 
         Ok(())
     }
