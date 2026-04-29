@@ -1401,7 +1401,6 @@ impl Plugin for Game {
             // down again (the「減少→增加→減少」flicker).
             let mut pending_in_flight_set: Option<std::collections::HashSet<u32>> = None;
             for evt in network.event_rx.try_iter() {
-                events_drained_local += 1;
                 // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
                 // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
                 // logical: 解壓後的 prost payload + shim 重建的字串開銷（HUD 看「應用層」量）
