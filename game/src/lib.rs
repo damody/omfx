@@ -262,14 +262,13 @@ struct TdTemplate {
 }
 
 /// Bomb 爆炸紅圈特效：由 0 半徑膨脹到 `max_radius`，`duration` 秒後消失。
-/// 每 frame 在 update() 重建線段節點以表現成長動畫。
+/// 每 frame 透過 `scene.drawing_context.add_line(...)` 提交 32 段圓環，整批 single draw call。
 #[derive(Debug)]
 struct ActiveExplosion {
     pos: Vector2<f32>, // render 座標
     max_radius: f32,   // render 單位
     duration: f32,
     elapsed: f32,
-    nodes: Vec<Handle<Node>>,
 }
 
 /// Client-side projectile simulation.
@@ -1358,6 +1357,9 @@ impl Plugin for Game {
 
     fn update(&mut self, context: &mut PluginContext) -> GameResult {
         let scene = &mut context.scenes[self.scene];
+        // 每 frame 清掉 drawing_context 的 line buffer，避免累積到無限大導致 FPS 為 0。
+        // 後續 phase（爆炸 / 路徑 debug 等）會 push 新的 line 進來。
+        scene.drawing_context.clear_lines();
         let frame_t0 = std::time::Instant::now();
 
         // 1. Check connection status
@@ -1739,16 +1741,16 @@ impl Plugin for Game {
             }
         }
 
-        // Bomb 爆炸特效：每 frame 依 elapsed 比例重建紅圈（由小到大），結束時移除
+        // Bomb 爆炸特效：用 Fyrox SceneDrawingContext 提交 32 線段，整批 single draw call。
+        // 不再 per-frame remove+create scene graph node（原作法在 1000-tower stress 約 4.6ms / frame）。
+        // 座標慣例與 build_line_segment 一致：x 取負（見該函式 center 計算 `-(from.x + to.x) * 0.5`）。
         {
+            use fyrox::scene::debug::Line;
             let dt_f = context.dt;
+            const SEGS: usize = 32;
             let mut finished_idx: Vec<usize> = Vec::new();
             for (i, ex) in self.active_explosions.iter_mut().enumerate() {
                 ex.elapsed += dt_f;
-                // 先清掉上一 frame 的線段
-                for h in ex.nodes.drain(..) {
-                    scene.graph.remove_node(h);
-                }
                 if ex.elapsed >= ex.duration {
                     finished_idx.push(i);
                     continue;
@@ -1759,17 +1761,19 @@ impl Plugin for Game {
                 let alpha = (255.0 * (1.0 - t)) as u8;
                 let color = Color::from_rgba(230, 70, 40, alpha.max(40));
                 if cur_r > 0.02 {
-                    let segs = build_circle_outline(
-                        scene,
-                        ex.pos,
-                        cur_r,
-                        32,
-                        0.06,
-                        color,
-                        Z_REGION + 0.0004,
-                    );
-                    for (h, _) in segs {
-                        ex.nodes.push(h);
+                    let z = Z_REGION + 0.0004;
+                    // 起點：θ=0 → (cx + r, cy)；x 翻負與 build_line_segment 對齊
+                    let mut prev = Vector3::new(-(ex.pos.x + cur_r), ex.pos.y, z);
+                    for k in 1..=SEGS {
+                        let theta = (k as f32) * std::f32::consts::TAU / (SEGS as f32);
+                        let (s, c) = theta.sin_cos();
+                        let next = Vector3::new(
+                            -(ex.pos.x + cur_r * c),
+                            ex.pos.y + cur_r * s,
+                            z,
+                        );
+                        scene.drawing_context.add_line(Line { begin: prev, end: next, color });
+                        prev = next;
                     }
                 }
             }
@@ -1863,7 +1867,6 @@ impl Plugin for Game {
                         max_radius: proj.splash_radius_render,
                         duration: 0.35,
                         elapsed: 0.0,
-                        nodes: Vec::new(),
                     });
                 }
                 finished.push(*id);
@@ -3013,7 +3016,6 @@ impl Game {
             max_radius: r,
             duration: dur,
             elapsed: 0.0,
-            nodes: Vec::new(),
         });
     }
 
@@ -3414,11 +3416,6 @@ impl Game {
             Some(id) => id,
             None => return,
         };
-        // [DEBUG-STRESS] 只 log creep 來追蹤 spawn 對 disappearance 比例
-        if entity_type == "creep" {
-            log::info!("✨ entity_create id={} type='{}' visible_count={}",
-                id, entity_type, self.network_entities.len());
-        }
 
         // Idempotent: skip if already exists
         if self.network_entities.contains_key(&id) {
