@@ -1504,6 +1504,20 @@ impl Plugin for Game {
             };
             entity.position = pos;
 
+            // [DEBUG-STRESS] 抓 NaN / Inf / 怪座標：creep 不該飛出 ±5000 範圍
+            if entity.entity_type == "creep" {
+                if !pos.x.is_finite() || !pos.y.is_finite() || pos.x.abs() > 5000.0 || pos.y.abs() > 5000.0 {
+                    log::warn!(
+                        "🤡 weird creep pos id={} pos=({},{}) prev=({},{}) target=({},{}) lerp_t_dur={}/{} extrap_v={} extrap_dur={}",
+                        entity_id, pos.x, pos.y,
+                        entity.prev_position.x, entity.prev_position.y,
+                        entity.target_position.x, entity.target_position.y,
+                        entity.lerp_elapsed, entity.lerp_duration,
+                        entity.extrap_velocity, entity.extrap_duration,
+                    );
+                }
+            }
+
             // Update node position (keep same Z) — X 取負讓 +X world 投到螢幕右
             let z = scene.graph[entity.node].local_transform().position().z;
             scene.graph[entity.node]
@@ -2763,10 +2777,13 @@ impl Game {
         let dist_render = (dx * dx + dy * dy).sqrt();
         let dist_backend = dist_render / WORLD_SCALE;
         entity.lerp_elapsed = 0.0;
+        // BUG fix: ms ≤ 1（多重 ice 減速疊加）原本 fallback 0.01s，下一 frame
+        // dt 就 > duration，t clamp 到 1 → position 直接跳到 target_position（下個 waypoint）
+        // = 「creep 被打就瞬移」現象。ms 太慢 = 基本不動，用 3600 讓 lerp 永遠停在 prev_position。
         entity.lerp_duration = if ms > 1.0 && dist_backend > f32::EPSILON {
             (dist_backend / ms).clamp(0.01, 3600.0)
         } else {
-            0.01
+            3600.0
         };
         // P4: if this entity is running on velocity extrapolation (creep with a
         // server-supplied start_pos/velocity), re-anchor at current position so
@@ -2776,10 +2793,12 @@ impl Game {
             entity.extrap_start_pos = cur;
             entity.extrap_velocity = ms;
             entity.extrap_elapsed = 0.0;
+            // 同上修正：ms ≤ 1 原本給 0.0 → render 會掉回 lerp（也是壞掉的 0.01）
+            // → 仍然瞬移。給 3600 讓 extrap 路徑保持但 travel 速度極小（≈ 不動）。
             entity.extrap_duration = if ms > 1.0 && dist_backend > f32::EPSILON {
                 (dist_backend / ms).clamp(0.01, 3600.0)
             } else {
-                0.0
+                3600.0
             };
         }
     }
@@ -3295,6 +3314,11 @@ impl Game {
             Some(id) => id,
             None => return,
         };
+        // [DEBUG-STRESS] 只 log creep 來追蹤 spawn 對 disappearance 比例
+        if entity_type == "creep" {
+            log::info!("✨ entity_create id={} type='{}' visible_count={}",
+                id, entity_type, self.network_entities.len());
+        }
 
         // Idempotent: skip if already exists
         if self.network_entities.contains_key(&id) {
@@ -3540,10 +3564,20 @@ impl Game {
         // Otherwise, if the client lerp is still traversing A→B when the server emits
         // M(→C), we'd lerp from "somewhere on A→B" straight to C — cutting the corner
         // and making the creep appear to skip the B vertex.
+        //
+        // BUG fix: backend (creep_tick.rs) 也會在 velocity 改變（ice 減速）時發送 creep.M
+        // 但 target 不變。這時候若 snap 到 OLD target_position = 下個 waypoint，creep
+        // 會直接瞬移到 B。改成「target 真的改變才 snap，否則 anchor 在當前位置」。
         let new_target = Vector2::new(x, y);
         let is_creep = entity.entity_type == "creep";
-        entity.prev_position = if is_creep { entity.target_position } else { entity.position };
-        entity.position = entity.prev_position;
+        let target_changed = (new_target - entity.target_position).magnitude_squared() > 0.001;
+        if is_creep && !target_changed {
+            // Velocity-only update — keep current rendered position, don't snap.
+            entity.prev_position = entity.position;
+        } else {
+            entity.prev_position = if is_creep { entity.target_position } else { entity.position };
+            entity.position = entity.prev_position;
+        }
         entity.target_position = new_target;
         entity.lerp_elapsed = 0.0;
         entity.lerp_duration = {
@@ -3557,7 +3591,10 @@ impl Game {
                 // and forced to idle at waypoints waiting for the next M event.
                 (dist_backend / entity.move_speed).clamp(0.01, 3600.0)
             } else {
-                0.1
+                // BUG fix: 原本 0.1s — ice 多重疊加把 move_speed 壓到 ≤ 1 時 fallback
+                // 觸發，0.1s 等於 6 frames 直接 lerp 到 target = 瞬移到下個 waypoint。
+                // 改 3600 讓 lerp 永遠走不完，position 留在 prev_position 直到下個 M。
+                3600.0
             }
         };
 
@@ -3657,8 +3694,18 @@ impl Game {
             .map(|v| v as u32);
         let id = match id {
             Some(id) => id,
-            None => return,
+            None => {
+                log::warn!("🗑️ entity_delete called WITHOUT id! payload={}", data);
+                return;
+            }
         };
+
+        // [DEBUG-STRESS] 無條件 log 每次 entity_delete 呼叫（即使 id 不在 map）
+        let known_type = self.network_entities.get(&id).map(|e| e.entity_type.clone());
+        log::info!(
+            "🗑️ entity_delete id={} known_type={:?} payload={}",
+            id, known_type, data,
+        );
 
         if let Some(entity) = self.network_entities.remove(&id) {
             scene.graph.remove_node(entity.node);
