@@ -2,8 +2,24 @@
 use fyrox::engine::executor::Executor;
 use fyrox::event_loop::EventLoop;
 use fyrox::core::log::Log;
+use simplelog::{
+    CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, ColorChoice, WriteLogger,
+};
+use std::fs::File;
 
 fn main() {
+    // Standard log crate backend：每次啟動 truncate omfx_app.log，同時印到 console。
+    // omfx.log 是 fyrox 自己的 log（fyrox::core::log::Log），不走 standard log macros。
+    // 我們的 log::info! / warn! 走 simplelog → omfx_app.log + 終端機。
+    let cfg = ConfigBuilder::new()
+        .set_time_format_rfc3339()
+        .build();
+    let log_file = File::create("omfx_app.log").expect("create omfx_app.log");
+    let _ = CombinedLogger::init(vec![
+        TermLogger::new(LevelFilter::Info, cfg.clone(), TerminalMode::Mixed, ColorChoice::Auto),
+        WriteLogger::new(LevelFilter::Info, cfg, log_file),
+    ]);
+
     Log::set_file_name("omfx.log");
 
     let mut executor = Executor::from_params(
