@@ -635,6 +635,11 @@ struct FrameProfile {
     events_drained: u64,
     creeps_seen: u64,
     projectiles_seen: u64,
+    pure_render_ms_total: f64,
+    capped_render_ms_total: f64,
+    draw_calls_total: u64,
+    triangles_total: u64,
+    last_fps: usize,
 }
 
 impl FrameProfile {
@@ -667,6 +672,23 @@ impl FrameProfile {
             self.creeps_seen as f64 / w,
             self.projectiles_seen as f64 / w,
         );
+        log::info!(
+            "omfx_render window={} avg(ms) pure={:.2} capped={:.2} fps={} draw_calls={:.0} triangles={:.0}",
+            Self::WINDOW,
+            self.pure_render_ms_total / Self::WINDOW as f64,
+            self.capped_render_ms_total / Self::WINDOW as f64,
+            self.last_fps,
+            self.draw_calls_total as f64 / Self::WINDOW as f64,
+            self.triangles_total as f64 / Self::WINDOW as f64,
+        );
+    }
+
+    fn record_render_stats(&mut self, stats: &fyrox::renderer::stats::Statistics) {
+        self.pure_render_ms_total += (stats.pure_frame_time as f64) * 1000.0;
+        self.capped_render_ms_total += (stats.capped_frame_time as f64) * 1000.0;
+        self.draw_calls_total += stats.geometry.draw_calls as u64;
+        self.triangles_total += stats.geometry.triangles_rendered as u64;
+        self.last_fps = stats.frames_per_second;
     }
 
     fn reset_window(&mut self) {
@@ -680,6 +702,11 @@ impl FrameProfile {
         self.events_drained = 0;
         self.creeps_seen = 0;
         self.projectiles_seen = 0;
+        self.pure_render_ms_total = 0.0;
+        self.capped_render_ms_total = 0.0;
+        self.draw_calls_total = 0;
+        self.triangles_total = 0;
+        // last_fps is just-overwritten each frame, no reset needed
     }
 }
 
@@ -887,6 +914,15 @@ pub struct Game {
     /// 計時：每滿 1 秒 roll over
     #[visit(skip)] #[reflect(hidden)]
     net_stats_elapsed: f32,
+    /// FPS 計算：累積本秒 frame 數
+    #[visit(skip)] #[reflect(hidden)]
+    fps_frame_count: u32,
+    /// FPS 計算：累積本秒實際耗時（dt 加總）
+    #[visit(skip)] #[reflect(hidden)]
+    fps_accum_time: f32,
+    /// 上一秒結算的 FPS 顯示字串（例 "FPS 60 (16.7ms)"），尚未結算時為空
+    #[visit(skip)] #[reflect(hidden)]
+    fps_display: String,
 }
 
 /// 技能詳細資訊（後端一次性廣播，用於 tooltip）
@@ -1388,6 +1424,18 @@ impl Plugin for Game {
             self.net_wire_bytes_last_sec = self.net_wire_bytes_current;
             self.net_wire_bytes_current = 0;
             self.net_stats_elapsed -= 1.0;
+        }
+
+        // FPS 統計：每秒結算一次顯示字串
+        self.fps_frame_count += 1;
+        self.fps_accum_time += context.dt;
+        if self.fps_accum_time >= 1.0 {
+            let frames = self.fps_frame_count.max(1);
+            let fps = (frames as f32 / self.fps_accum_time).round() as u32;
+            let frame_ms = (self.fps_accum_time * 1000.0) / frames as f32;
+            self.fps_display = format!("FPS {} ({:.1}ms)", fps, frame_ms);
+            self.fps_frame_count = 0;
+            self.fps_accum_time = 0.0;
         }
 
         // 2. Receive events from NetworkBridge, push into EventBuffer
@@ -2036,7 +2084,7 @@ impl Plugin for Game {
         }
 
         // 6. Update status text
-        let status_str = match &self.connection_status {
+        let connection_part = match &self.connection_status {
             ConnectionStatus::Disconnected => "Disconnected".to_string(),
             ConnectionStatus::Connecting => "Connecting...".to_string(),
             ConnectionStatus::Connected => {
@@ -2063,6 +2111,11 @@ impl Plugin for Game {
                 )
             }
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
+        };
+        let status_str = if self.fps_display.is_empty() {
+            connection_part
+        } else {
+            format!("{} | {}", self.fps_display, connection_part)
         };
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
@@ -2486,6 +2539,10 @@ impl Plugin for Game {
         self.frame_profile.events_drained += events_drained_local;
         self.frame_profile.creeps_seen += self.network_entities.len() as u64;
         self.frame_profile.projectiles_seen += self.client_projectiles.len() as u64;
+        // Fyrox renderer stats (real frame time including render submit + GPU + vsync wait)
+        if let fyrox::engine::GraphicsContext::Initialized(ref gc) = context.graphics_context {
+            self.frame_profile.record_render_stats(&gc.renderer.get_statistics());
+        }
         self.frame_profile.finish_frame();
 
         Ok(())
