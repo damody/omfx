@@ -1722,11 +1722,10 @@ impl Plugin for Game {
         let interp_ns = t_interp.elapsed().as_nanos();
 
         // TD 塔預覽圓圈：選中塔時每 frame 在滑鼠位置重畫 footprint + 攻擊範圍兩圈。
+        // 用 SceneDrawingContext（drawing_context 已在 update() 開頭被 clear_lines()），
+        // 不再 per-frame 增刪 24+48=72 個 RectangleBuilder node。
         let t_visual = std::time::Instant::now();
         {
-            for h in self.td_preview_nodes.drain(..) {
-                scene.graph.remove_node(h);
-            }
             if let Some(kind) = self.selected_tower_kind.clone() {
               if let Some(tpl) = self.td_templates.get(&kind).cloned() {
                 let footprint_backend = tpl.footprint_backend;
@@ -1785,31 +1784,23 @@ impl Plugin for Game {
                     )
                 };
                 // 內圈：footprint
-                let segs = build_circle_outline(
+                add_circle_lines(
                     scene,
                     mwp,
                     footprint_render,
                     24,
-                    0.04,
                     foot_color,
                     Z_REGION + 0.0002,
                 );
-                for (h, _) in segs {
-                    self.td_preview_nodes.push(h);
-                }
                 // 外圈：攻擊範圍
-                let segs = build_circle_outline(
+                add_circle_lines(
                     scene,
                     mwp,
                     range_backend * WORLD_SCALE,
                     48,
-                    0.03,
                     range_color,
                     Z_REGION + 0.0001,
                 );
-                for (h, _) in segs {
-                    self.td_preview_nodes.push(h);
-                }
               } // end of `if let Some(tpl) = ...`
             }
         }
@@ -1857,25 +1848,20 @@ impl Plugin for Game {
         }
 
         // TD 已選中塔的射程圈：每 frame 以塔位置為中心重畫；若塔已消失則自動清選
+        // 用 SceneDrawingContext（drawing_context 已在 update() 開頭被 clear_lines()），
+        // 不再 per-frame 增刪 48 個 RectangleBuilder node。
         {
-            for h in self.td_selected_range_nodes.drain(..) {
-                scene.graph.remove_node(h);
-            }
             if let Some(tid) = self.selected_tower_entity {
                 match self.network_entities.get(&tid) {
                     Some(ent) if ent.entity_type == "tower" && ent.attack_range_backend > 0.0 => {
-                        let segs = build_circle_outline(
+                        add_circle_lines(
                             scene,
                             ent.position,
                             ent.attack_range_backend * WORLD_SCALE,
                             48,
-                            0.035,
                             Color::from_rgba(255, 220, 40, 220),
                             Z_REGION + 0.0003,
                         );
-                        for (h, _) in segs {
-                            self.td_selected_range_nodes.push(h);
-                        }
                     }
                     _ => {
                         // entity 消失（被賣或打掉）→ 清選
@@ -4211,6 +4197,37 @@ fn build_circle_outline(
         }
     }
     result
+}
+
+/// Per-frame circle outline 用 `SceneDrawingContext`（single batched draw call）。
+/// 對應 `build_circle_outline` 的 RectangleBuilder 版本——在每 frame rebuild 的呼叫點用這個，
+/// 避免 24-48 次 scene-graph 增刪。座標慣例與 `build_line_segment` 一致：x 取負。
+/// 注意：drawing_context 每 frame 在 update() 開頭會 `clear_lines()`，所以僅適用 per-frame redraw。
+fn add_circle_lines(
+    scene: &mut Scene,
+    center: Vector2<f32>,
+    radius: f32,
+    segments: usize,
+    color: Color,
+    z: f32,
+) {
+    use fyrox::scene::debug::Line;
+    if radius <= 0.0 || segments < 3 {
+        return;
+    }
+    // 起點：θ=0 → (cx + r, cy)；x 翻負與 build_line_segment 對齊
+    let mut prev = Vector3::new(-(center.x + radius), center.y, z);
+    for k in 1..=segments {
+        let theta = (k as f32) * std::f32::consts::TAU / (segments as f32);
+        let (s, c) = theta.sin_cos();
+        let next = Vector3::new(
+            -(center.x + radius * c),
+            center.y + radius * s,
+            z,
+        );
+        scene.drawing_context.add_line(Line { begin: prev, end: next, color });
+        prev = next;
+    }
 }
 
 // ---------------------------------------------------------------------------
