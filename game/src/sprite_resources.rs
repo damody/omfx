@@ -29,7 +29,7 @@ use fyrox::scene::mesh::buffer::{
     VertexAttributeUsage, VertexBuffer,
 };
 use fyrox::scene::mesh::surface::{SurfaceBuilder, SurfaceData, SurfaceResource};
-use fyrox::scene::mesh::MeshBuilder;
+use fyrox::scene::mesh::{MeshBuilder, RenderPath};
 use fyrox::scene::node::Node;
 use fyrox::scene::Scene;
 
@@ -173,6 +173,7 @@ impl SharedSpriteResources {
             .with_surfaces(vec![SurfaceBuilder::new(surface)
                 .with_material(self.material.clone())
                 .build()])
+            .with_render_path(RenderPath::Forward)
             .build(&mut scene.graph)
             .to_base()
     }
