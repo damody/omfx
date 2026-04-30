@@ -643,6 +643,11 @@ struct FrameProfile {
     draw_calls_total: u64,
     triangles_total: u64,
     last_fps: usize,
+    /// Most recent per-frame snapshot (overwritten each call to `record_render_stats`).
+    /// Used by the HUD status text — window averages reset every WINDOW frames so
+    /// the instantaneous sample gives smoother live readout.
+    last_draw_calls: usize,
+    last_triangles: usize,
 }
 
 impl FrameProfile {
@@ -692,6 +697,8 @@ impl FrameProfile {
         self.draw_calls_total += stats.geometry.draw_calls as u64;
         self.triangles_total += stats.geometry.triangles_rendered as u64;
         self.last_fps = stats.frames_per_second;
+        self.last_draw_calls = stats.geometry.draw_calls;
+        self.last_triangles = stats.geometry.triangles_rendered;
     }
 
     fn reset_window(&mut self) {
@@ -2117,10 +2124,18 @@ impl Plugin for Game {
             }
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
         };
+        // Render stats from prior frame (record_render_stats() runs at end of update,
+        // so values here are 1 frame behind — fine for a live readout).
+        let render_stats_part = format!(
+            "fps: {} | draws: {} | tris: {}",
+            self.frame_profile.last_fps,
+            self.frame_profile.last_draw_calls,
+            self.frame_profile.last_triangles,
+        );
         let status_str = if self.fps_display.is_empty() {
-            connection_part
+            format!("{} | {}", render_stats_part, connection_part)
         } else {
-            format!("{} | {}", self.fps_display, connection_part)
+            format!("{} | {} | {}", self.fps_display, render_stats_part, connection_part)
         };
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
