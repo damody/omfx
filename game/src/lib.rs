@@ -755,9 +755,6 @@ pub struct Game {
     /// 目前玩家選中的塔 unit_id（例如 "tower_dart"）；None 表示未選
     #[visit(skip)] #[reflect(hidden)]
     selected_tower_kind: Option<String>,
-    /// 滑鼠位置的塔預覽圓圈 scene node（選中塔時跟著滑鼠走）。
-    #[visit(skip)] #[reflect(hidden)]
-    td_preview_nodes: Vec<Handle<Node>>,
     /// Start Round 按鈕 UI Text node。
     #[visit(skip)] #[reflect(hidden)]
     ui_start_round_button: Handle<Text>,
@@ -799,9 +796,6 @@ pub struct Game {
     /// 3 條路線升級按鈕 hit-test rect；塔未選時放螢幕外
     #[visit(skip)] #[reflect(hidden)]
     td_upgrade_button_rects: [(f32, f32, f32, f32); 3],
-    /// 選中塔的攻擊範圍圓圈 scene nodes（跟著 entity 跑）
-    #[visit(skip)] #[reflect(hidden)]
-    td_selected_range_nodes: Vec<Handle<Node>>,
     /// 進行中的爆炸特效（Bomb 塔命中時 spawn）
     #[visit(skip)] #[reflect(hidden)]
     active_explosions: Vec<ActiveExplosion>,
