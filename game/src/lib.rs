@@ -3549,18 +3549,20 @@ impl Game {
             "bullet" | "projectile" => (Color::from_rgba(255, 230, 50, 255), 0.1, Z_BULLET),
             _ => (Color::from_rgba(200, 200, 200, 255), 0.3, Z_ENEMY),
         };
+        // `color` is now unused — kept for diagnostic / future texture binding.
+        let _ = color;
 
-        let node: Handle<Node> = RectangleBuilder::new(
-            BaseBuilder::new().with_local_transform(
-                TransformBuilder::new()
-                    .with_local_position(Vector3::new(-x, y, z))
-                    .with_local_scale(Vector3::new(size, size, f32::EPSILON))
-                    .build(),
-            ),
-        )
-        .with_color(color)
-        .build(&mut scene.graph)
-        .transmute();
+        let node: Handle<Node> = {
+            let resources = self.sprite_resources.as_ref()
+                .expect("sprite_resources not initialized");
+            let material = resources.material_for(entity_type).clone();
+            let handle = resources.build_mesh(scene, material);
+            scene.graph[handle]
+                .local_transform_mut()
+                .set_position(Vector3::new(-x, y, z))
+                .set_scale(Vector3::new(size, size, 1.0));
+            handle
+        };
 
         // HP bars (if entity has health)
         let (hp_bar_bg, hp_bar_fg) = if health.is_some() {
