@@ -75,10 +75,14 @@ impl SharedSpriteResources {
 }
 
 fn make_color_material(color: Color) -> MaterialResource {
-    let mut mat = Material::standard();
-    // Fyrox 1.0.1: Material::set_property(name, MaterialProperty) — Material::bind
-    // is for resource bindings (textures); plain colors go through set_property.
-    // Standard 3D shader exposes `diffuseColor` for tinting.
+    // Use standard_2d (unlit) shader so sprites render without a lighting setup.
+    // The standard 3D shader writes through GBuffer/deferred — without scene lights
+    // the final composited fragment is black even though `diffuseColor` is set.
+    // standard_2d's Forward pass output is `ambientLight * vertexColor * diffuseTexture`
+    // (white fallback texture), so as long as the scene has ambient light the sprite
+    // is visible. We still set `diffuseColor` for forward compatibility / to keep the
+    // material self-describing for catalogs.
+    let mut mat = Material::standard_2d();
     mat.set_property("diffuseColor", MaterialProperty::Color(color));
     MaterialResource::new_embedded(mat)
 }
