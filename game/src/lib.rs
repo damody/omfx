@@ -1688,8 +1688,8 @@ impl Plugin for Game {
                 // 注意 fg_offset 在 X 方向偏移；X 翻轉後 offset 也要反向
                 scene.graph[fg]
                     .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR - 0.0001))
-                    .set_scale(Vector3::new(fg_width, 0.06, f32::EPSILON));
+                    .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR + 0.01))
+                    .set_scale(Vector3::new(fg_width, 0.06, 1.0));
             }
 
             // 更新面向箭頭位置與角度
