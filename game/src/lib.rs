@@ -1720,6 +1720,12 @@ impl Plugin for Game {
             }
         }
 
+        // Fyrox 1.0.1 doesn't auto-update hierarchical data per-frame (docs at
+        // fyrox-impl-1.0.1/src/scene/graph/mod.rs:565). Without this call, our
+        // 3D Mesh nodes have stale global_transform = identity → all sprites
+        // render at world origin (0,0,0). Force-update once per frame.
+        scene.graph.update_hierarchical_data();
+
         let interp_ns = t_interp.elapsed().as_nanos();
 
         // TD 塔預覽圓圈：選中塔時每 frame 在滑鼠位置重畫 footprint + 攻擊範圍兩圈。
