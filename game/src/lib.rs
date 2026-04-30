@@ -2585,19 +2585,30 @@ impl Plugin for Game {
                 event: WindowEvent::CursorMoved { position, .. },
                 ..
             } => {
-                // camera vertical_size * 2：MOBA=20，TD=28（對應 vertical_size=14）
-                let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
-                let local = screen_to_world_approx(
-                    position.x as f32,
-                    position.y as f32,
-                    self.window_size.x,
-                    self.window_size.y,
-                    world_height,
-                );
-                // 加上 camera 位移，得到絕對 render-world 座標
-                self.mouse_world_pos = local + self.camera_world_pos;
+                // 3D 相機 → 滑鼠 picking ray vs z=0 平面交點
+                // Fyrox `Camera::make_ray(cursor, window_size)` 內部已處理 Y 反轉
+                // 與 NDC ↔ world 轉換；無需手算 vertical_size / aspect。
+                let cursor = Vector2::new(position.x as f32, position.y as f32);
+                let scene = &context.scenes[self.scene];
+                if let Some(camera) = scene
+                    .graph
+                    .try_get(self.camera)
+                    .ok()
+                    .and_then(|n| n.cast::<fyrox::scene::camera::Camera>())
+                {
+                    let ray = camera.make_ray(cursor, self.window_size);
+                    if ray.dir.z.abs() > 1e-6 {
+                        // 相機 z=100 朝 -Z；z=0 平面交點 t = -origin.z/dir.z > 0
+                        let t = -ray.origin.z / ray.dir.z;
+                        let render_x = ray.origin.x + t * ray.dir.x;
+                        let render_y = ray.origin.y + t * ray.dir.y;
+                        // render world +X 為螢幕右；entity.position（logical）的 +X 對應
+                        // render -X（見 set_position(-pos.x, ...) 慣例），故 logical = -render
+                        self.mouse_world_pos = Vector2::new(-render_x, render_y);
+                    }
+                }
                 // 原始 pixel 座標，供 tooltip hit-test 用
-                self.mouse_screen_pos = Vector2::new(position.x as f32, position.y as f32);
+                self.mouse_screen_pos = cursor;
             }
             Event::WindowEvent {
                 event:
@@ -4240,22 +4251,6 @@ fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32, world_
     // +Y world → 螢幕上方（螢幕 pixel Y 向下，所以要反向）
     let sy = (-wy / world_height + 0.5) * window_h;
     Vector2::new(sx, sy)
-}
-
-fn screen_to_world_approx(
-    screen_x: f32,
-    screen_y: f32,
-    window_w: f32,
-    window_h: f32,
-    world_height: f32,
-) -> Vector2<f32> {
-    let aspect = window_w / window_h;
-    let world_width = world_height * aspect;
-    // 螢幕 +X → 世界 +X
-    let wx = (screen_x / window_w - 0.5) * world_width;
-    // 螢幕 +Y（向下）→ 世界 -Y
-    let wy = -(screen_y / window_h - 0.5) * world_height;
-    Vector2::new(wx, wy)
 }
 
 /// Ray-casting 點在多邊形內判定（凹/凸皆可）。與 omb/src/util/geometry.rs 同演算法。
