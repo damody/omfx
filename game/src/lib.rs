@@ -55,16 +55,17 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 // Backend → render coordinate scale (backend uses large units like 800)
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
 
-// Z layers: smaller Z = closer to camera (near plane) = renders on top.
-const Z_BULLET: f32 = 0.000;
-const Z_HP_BAR: f32 = 0.0005;
-const Z_RING: f32 = 0.00075;
-const Z_ENEMY: f32 = 0.001;
-const Z_TOWER: f32 = 0.002;
-const Z_REGION: f32 = 0.00225;
-const Z_GRID_CELL: f32 = 0.003;
-const Z_PATH: f32 = 0.004;
-const Z_BACKGROUND: f32 = 0.005;
+// Z layers in 3D camera frustum (camera at z=100 looking down -Z, near=0.1 far=1000).
+// LARGER Z = closer to camera = drawn on top.
+const Z_BACKGROUND: f32 = 0.5;
+const Z_PATH: f32 = 1.0;
+const Z_GRID_CELL: f32 = 1.5;
+const Z_REGION: f32 = 2.0;
+const Z_TOWER: f32 = 2.5;
+const Z_ENEMY: f32 = 3.0;
+const Z_RING: f32 = 3.5;
+const Z_HP_BAR: f32 = 4.0;
+const Z_BULLET: f32 = 4.5;
 
 const COLLISION_RING_SEGMENTS: usize = 24;
 const COLLISION_RING_THICKNESS: f32 = 0.025;
