@@ -1035,15 +1035,22 @@ impl Plugin for Game {
             ..Default::default()
         });
 
-        // Orthographic 2D camera
-        self.camera = CameraBuilder::new(BaseBuilder::new())
-            .with_projection(Projection::Orthographic(OrthographicProjection {
-                z_near: -0.1,
-                z_far: 16.0,
-                vertical_size: 10.0,
-            }))
-            .build(&mut scene.graph)
-            .transmute();
+        // Orthographic 3D camera positioned at z=100 looking down -Z.
+        // Larger world Z = closer to camera = drawn on top.
+        self.camera = CameraBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(0.0, 0.0, 100.0))
+                    .build(),
+            ),
+        )
+        .with_projection(Projection::Orthographic(OrthographicProjection {
+            z_near: 0.1,
+            z_far: 1000.0,
+            vertical_size: 10.0,
+        }))
+        .build(&mut scene.graph)
+        .transmute();
 
         // Point light covering entire map
         PointLightBuilder::new(
@@ -1962,15 +1969,15 @@ impl Plugin for Game {
                     .cast_mut::<fyrox::scene::camera::Camera>()
                 {
                     cam.set_projection(Projection::Orthographic(OrthographicProjection {
-                        z_near: -0.1,
-                        z_far: 16.0,
+                        z_near: 0.1,
+                        z_far: 1000.0,
                         vertical_size: 14.0, // 28 render 高 = 2800 backend，可裝下 ±1200 Y
                     }));
                 }
-                let z = scene.graph[self.camera].local_transform().position().z;
+                // Camera is at z=100 in 3D ortho frustum — preserve that on re-center.
                 scene.graph[self.camera]
                     .local_transform_mut()
-                    .set_position(Vector3::new(0.0, 0.0, z));
+                    .set_position(Vector3::new(0.0, 0.0, 100.0));
                 self.camera_world_pos = Vector2::new(0.0, 0.0);
                 self.td_camera_configured = true;
                 log::info!("🎥 TD 相機已鎖定：center=(0,0), vertical_size=14");
