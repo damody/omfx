@@ -723,6 +723,11 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     window_size: Vector2<f32>,
 
+    /// Shared sprite GPU resources (single quad + 9 materials).
+    /// Lazily initialized on first frame; reused for all entity sprite Meshes.
+    #[visit(skip)] #[reflect(hidden)]
+    sprite_resources: Option<sprite_resources::SharedSpriteResources>,
+
     // --- Network ---
     #[visit(skip)] #[reflect(hidden)]
     network: Option<NetworkBridge>,
@@ -1400,6 +1405,11 @@ impl Plugin for Game {
         // 後續 phase（爆炸 / 路徑 debug 等）會 push 新的 line 進來。
         scene.drawing_context.clear_lines();
         let frame_t0 = std::time::Instant::now();
+
+        // Lazy init shared sprite resources on first frame.
+        if self.sprite_resources.is_none() {
+            self.sprite_resources = Some(sprite_resources::SharedSpriteResources::new());
+        }
 
         // 1. Check connection status
         if let Some(ref network) = self.network {
