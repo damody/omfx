@@ -53,6 +53,25 @@ impl SharedSpriteResources {
             _ => &self.mat_default,
         }
     }
+
+    /// Build a 3D Mesh node referencing the shared quad + given material.
+    /// Caller sets local_transform afterwards (position, scale, rotation).
+    pub fn build_mesh(
+        &self,
+        scene: &mut fyrox::scene::Scene,
+        material: fyrox::material::MaterialResource,
+    ) -> fyrox::core::pool::Handle<fyrox::scene::node::Node> {
+        use fyrox::scene::base::BaseBuilder;
+        use fyrox::scene::mesh::surface::SurfaceBuilder;
+        use fyrox::scene::mesh::MeshBuilder;
+
+        MeshBuilder::new(BaseBuilder::new())
+            .with_surfaces(vec![SurfaceBuilder::new(self.quad.clone())
+                .with_material(material)
+                .build()])
+            .build(&mut scene.graph)
+            .to_base()
+    }
 }
 
 fn make_color_material(color: Color) -> MaterialResource {
