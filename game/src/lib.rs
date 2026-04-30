@@ -3567,29 +3567,18 @@ impl Game {
         // HP bars (if entity has health)
         let (hp_bar_bg, hp_bar_fg) = if health.is_some() {
             let bar_y = y + size * 0.5 + 0.1;
-            let bg = RectangleBuilder::new(
-                BaseBuilder::new().with_local_transform(
-                    TransformBuilder::new()
-                        .with_local_position(Vector3::new(-x, bar_y, Z_HP_BAR))
-                        .with_local_scale(Vector3::new(0.8, 0.06, f32::EPSILON))
-                        .build(),
-                ),
-            )
-            .with_color(Color::from_rgba(0, 0, 0, 255))
-            .build(&mut scene.graph)
-            .transmute();
+            let resources = self.sprite_resources.as_ref()
+                .expect("sprite_resources not initialized");
 
-            let fg = RectangleBuilder::new(
-                BaseBuilder::new().with_local_transform(
-                    TransformBuilder::new()
-                        .with_local_position(Vector3::new(-x, bar_y, Z_HP_BAR - 0.0001))
-                        .with_local_scale(Vector3::new(0.8, 0.06, f32::EPSILON))
-                        .build(),
-                ),
-            )
-            .with_color(Color::from_rgba(0, 220, 0, 255))
-            .build(&mut scene.graph)
-            .transmute();
+            let bg = resources.build_mesh(scene, resources.mat_hp_bg.clone());
+            scene.graph[bg].local_transform_mut()
+                .set_position(Vector3::new(-x, bar_y, Z_HP_BAR))
+                .set_scale(Vector3::new(0.8, 0.06, 1.0));
+
+            let fg = resources.build_mesh(scene, resources.mat_hp_fg.clone());
+            scene.graph[fg].local_transform_mut()
+                .set_position(Vector3::new(-x, bar_y, Z_HP_BAR + 0.01))
+                .set_scale(Vector3::new(0.8, 0.06, 1.0));
 
             (Some(bg), Some(fg))
         } else {
