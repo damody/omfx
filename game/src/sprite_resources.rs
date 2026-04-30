@@ -169,7 +169,7 @@ impl SharedSpriteResources {
         scene: &mut Scene,
         surface: SurfaceResource,
     ) -> Handle<Node> {
-        MeshBuilder::new(BaseBuilder::new())
+        MeshBuilder::new(BaseBuilder::new().with_frustum_culling(false))
             .with_surfaces(vec![SurfaceBuilder::new(surface)
                 .with_material(self.material.clone())
                 .build()])
