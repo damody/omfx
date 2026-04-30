@@ -1694,15 +1694,20 @@ impl Plugin for Game {
 
             // 更新面向箭頭位置與角度
             if let Some(arrow) = entity.facing_arrow {
+                let size: f32 = match entity.entity_type.as_str() {
+                    "hero" => 0.4,
+                    "creep" | "enemy" => 0.3,
+                    "unit" | "tower" => 0.4,
+                    _ => 0.3,
+                };
+                let length = (size * 0.7).max(0.12);
                 let render_angle = std::f32::consts::PI - entity.facing;
-                let scale = scene.graph[arrow].local_transform().scale();
-                let length = scale.x;
                 let offset_x = (length * 0.5) * render_angle.cos();
                 let offset_y = (length * 0.5) * render_angle.sin();
                 let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
                 scene.graph[arrow]
                     .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, 0.0007))
+                    .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, Z_HP_BAR + 0.02))
                     .set_rotation(rotation);
             }
 
@@ -3634,7 +3639,9 @@ impl Game {
 
         // 建立面向箭頭（只為有 health 的單位做，tower/creep/hero 都有）
         let facing_arrow = if health.is_some() {
-            Some(build_facing_arrow(scene, x, y, size, initial_facing))
+            let resources = self.sprite_resources.as_ref()
+                .expect("sprite_resources not initialized");
+            Some(build_facing_arrow(scene, resources, x, y, size, initial_facing))
         } else {
             None
         };
@@ -4073,6 +4080,7 @@ fn effect_label(key: &str) -> &str {
 
 fn build_facing_arrow(
     scene: &mut Scene,
+    resources: &sprite_resources::SharedSpriteResources,
     pos_x: f32,
     pos_y: f32,
     entity_size: f32,
@@ -4085,18 +4093,13 @@ fn build_facing_arrow(
     let offset_x = (length * 0.5) * render_angle.cos();
     let offset_y = (length * 0.5) * render_angle.sin();
     let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
-    RectangleBuilder::new(
-        BaseBuilder::new().with_local_transform(
-            TransformBuilder::new()
-                .with_local_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, 0.0007))
-                .with_local_rotation(rotation)
-                .with_local_scale(Vector3::new(length, thickness, f32::EPSILON))
-                .build(),
-        ),
-    )
-    .with_color(Color::from_rgba(255, 200, 0, 255))
-    .build(&mut scene.graph)
-    .transmute()
+    let handle = resources.build_mesh(scene, resources.mat_facing.clone());
+    scene.graph[handle]
+        .local_transform_mut()
+        .set_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, Z_HP_BAR + 0.02))
+        .set_scale(Vector3::new(length, thickness, 1.0))
+        .set_rotation(rotation);
+    handle
 }
 
 fn build_path_segment(
