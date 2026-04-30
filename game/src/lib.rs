@@ -3566,8 +3566,8 @@ impl Game {
         let node: Handle<Node> = {
             let resources = self.sprite_resources.as_ref()
                 .expect("sprite_resources not initialized");
-            let material = resources.material_for(entity_type).clone();
-            let handle = resources.build_mesh(scene, material);
+            let surface = resources.surface_for(entity_type).clone();
+            let handle = resources.build_mesh(scene, surface);
             scene.graph[handle]
                 .local_transform_mut()
                 .set_position(Vector3::new(-x, y, z))
@@ -3581,12 +3581,12 @@ impl Game {
             let resources = self.sprite_resources.as_ref()
                 .expect("sprite_resources not initialized");
 
-            let bg = resources.build_mesh(scene, resources.mat_hp_bg.clone());
+            let bg = resources.build_mesh(scene, resources.surf_hp_bg.clone());
             scene.graph[bg].local_transform_mut()
                 .set_position(Vector3::new(-x, bar_y, Z_HP_BAR))
                 .set_scale(Vector3::new(0.8, 0.06, 1.0));
 
-            let fg = resources.build_mesh(scene, resources.mat_hp_fg.clone());
+            let fg = resources.build_mesh(scene, resources.surf_hp_fg.clone());
             scene.graph[fg].local_transform_mut()
                 .set_position(Vector3::new(-x, bar_y, Z_HP_BAR + 0.01))
                 .set_scale(Vector3::new(0.8, 0.06, 1.0));
@@ -4099,7 +4099,7 @@ fn build_facing_arrow(
     let offset_x = (length * 0.5) * render_angle.cos();
     let offset_y = (length * 0.5) * render_angle.sin();
     let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
-    let handle = resources.build_mesh(scene, resources.mat_facing.clone());
+    let handle = resources.build_mesh(scene, resources.surf_facing.clone());
     scene.graph[handle]
         .local_transform_mut()
         .set_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, Z_HP_BAR + 0.02))

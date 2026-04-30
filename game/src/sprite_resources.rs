@@ -1,207 +1,179 @@
-//! Shared GPU resources for 3D sprite rendering.
+//! Shared GPU resources for 3D sprite rendering using `Material::standard_2d`.
 //!
-//! All entity sprites (body / HP bar bg / HP bar fg / facing arrow) are
-//! 3D Mesh nodes pointing to a single shared 1×1 quad SurfaceResource and
-//! a per-color MaterialResource. Fyrox's renderer auto-instances Mesh nodes
-//! sharing the same (SurfaceResource, Material) → one draw call per pair.
+//! Why this layout:
+//! - `Material::standard_2d`'s Forward pass output is roughly
+//!   `ambient_light × vertexColor × diffuseTexture` (white fallback texture).
+//!   The omfx scene sets `ambient_lighting_color = Color::WHITE`, so with the
+//!   default white fallback texture the final fragment color is essentially
+//!   `vertexColor` (modulo an `S_SRGBToLinear` step on the texture sample).
+//! - `SurfaceData::make_quad` emits `StaticVertex` (position / normal /
+//!   tex_coord / tangent — NO color attribute), so `vertexColor` reads as 0
+//!   and sprites render black. We instead build a custom quad SurfaceData with
+//!   only the three attributes the shader actually consumes
+//!   (`vertexPosition`, `vertexTexCoord`, `vertexColor`) and bake the color
+//!   into all four vertices.
+//!
+//! Each entity color gets its own SurfaceResource. All SurfaceResources share
+//! one Material::standard_2d MaterialResource. Fyrox auto-instances Mesh nodes
+//! sharing the same (SurfaceResource, Material) pair, so we still get one
+//! draw call per color regardless of entity count.
 
-use fyrox::asset::untyped::ResourceKind;
-use fyrox::core::algebra::Matrix4;
+use fyrox::core::algebra::{Vector2, Vector3};
 use fyrox::core::color::Color;
-use fyrox::core::uuid::Uuid;
-use fyrox::material::shader::{ShaderResource, ShaderResourceExtension};
-use fyrox::material::{Material, MaterialProperty, MaterialResource};
-use fyrox::scene::mesh::surface::{SurfaceData, SurfaceResource};
-use std::sync::OnceLock;
+use fyrox::core::pool::Handle;
+use fyrox::material::{Material, MaterialResource};
+use fyrox::scene::base::BaseBuilder;
+use fyrox::core::math::TriangleDefinition;
+use fyrox::scene::mesh::buffer::{
+    BytesStorage, TriangleBuffer, VertexAttributeDataType, VertexAttributeDescriptor,
+    VertexAttributeUsage, VertexBuffer,
+};
+use fyrox::scene::mesh::surface::{SurfaceBuilder, SurfaceData, SurfaceResource};
+use fyrox::scene::mesh::MeshBuilder;
+use fyrox::scene::node::Node;
+use fyrox::scene::Scene;
+
+/// Per-vertex layout consumed by `Standard2DShader`'s vertex stage:
+///
+/// ```glsl
+/// layout(location = 0) in vec3 vertexPosition;
+/// layout(location = 1) in vec2 vertexTexCoord;
+/// layout(location = 2) in vec4 vertexColor;
+/// ```
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct ColoredVertex {
+    position: Vector3<f32>,
+    tex_coord: Vector2<f32>,
+    color: [u8; 4],
+}
+
+fn vertex_layout() -> &'static [VertexAttributeDescriptor] {
+    use std::sync::OnceLock;
+    static LAYOUT: OnceLock<Vec<VertexAttributeDescriptor>> = OnceLock::new();
+    LAYOUT
+        .get_or_init(|| {
+            vec![
+                VertexAttributeDescriptor {
+                    usage: VertexAttributeUsage::Position,
+                    data_type: VertexAttributeDataType::F32,
+                    size: 3,
+                    divisor: 0,
+                    shader_location: 0,
+                    normalized: false,
+                },
+                VertexAttributeDescriptor {
+                    usage: VertexAttributeUsage::TexCoord0,
+                    data_type: VertexAttributeDataType::F32,
+                    size: 2,
+                    divisor: 0,
+                    shader_location: 1,
+                    normalized: false,
+                },
+                VertexAttributeDescriptor {
+                    usage: VertexAttributeUsage::Color,
+                    data_type: VertexAttributeDataType::U8,
+                    size: 4,
+                    divisor: 0,
+                    shader_location: 2,
+                    normalized: true,
+                },
+            ]
+        })
+        .as_slice()
+}
+
+fn make_colored_quad_surface(color: Color) -> SurfaceResource {
+    let c = [color.r, color.g, color.b, color.a];
+
+    // Unit quad centered at origin in the XY plane, [-0.5, 0.5] × [-0.5, 0.5].
+    // Tex-coord origin top-left to match `SurfaceData::make_quad`.
+    let verts: Vec<ColoredVertex> = vec![
+        ColoredVertex {
+            position: Vector3::new(-0.5, -0.5, 0.0),
+            tex_coord: Vector2::new(0.0, 1.0),
+            color: c,
+        },
+        ColoredVertex {
+            position: Vector3::new(0.5, -0.5, 0.0),
+            tex_coord: Vector2::new(1.0, 1.0),
+            color: c,
+        },
+        ColoredVertex {
+            position: Vector3::new(0.5, 0.5, 0.0),
+            tex_coord: Vector2::new(1.0, 0.0),
+            color: c,
+        },
+        ColoredVertex {
+            position: Vector3::new(-0.5, 0.5, 0.0),
+            tex_coord: Vector2::new(0.0, 0.0),
+            color: c,
+        },
+    ];
+    let vertex_count = verts.len();
+    let bytes = BytesStorage::new(verts);
+    let vb = VertexBuffer::new_with_layout(vertex_layout(), vertex_count, bytes)
+        .expect("colored quad vertex buffer layout must validate");
+
+    let tris = vec![TriangleDefinition([0, 1, 2]), TriangleDefinition([0, 2, 3])];
+    let tb = TriangleBuffer::new(tris);
+
+    SurfaceResource::new_embedded(SurfaceData::new(vb, tb))
+}
 
 #[derive(Debug)]
 pub struct SharedSpriteResources {
-    pub quad: SurfaceResource,
+    // Per-color quad SurfaceResources (vertex color baked in).
+    pub surf_hero: SurfaceResource,
+    pub surf_creep: SurfaceResource,
+    pub surf_tower: SurfaceResource,
+    pub surf_projectile: SurfaceResource,
+    pub surf_default: SurfaceResource,
+    pub surf_hp_bg: SurfaceResource,
+    pub surf_hp_fg: SurfaceResource,
+    pub surf_facing: SurfaceResource,
 
-    pub mat_hero: MaterialResource,
-    pub mat_creep: MaterialResource,
-    pub mat_tower: MaterialResource,
-    pub mat_projectile: MaterialResource,
-    pub mat_default: MaterialResource,
-
-    pub mat_hp_bg: MaterialResource,
-    pub mat_hp_fg: MaterialResource,
-
-    pub mat_facing: MaterialResource,
+    // Shared `Material::standard_2d` (color is in the vertices, not a uniform).
+    pub material: MaterialResource,
 }
 
 impl SharedSpriteResources {
     pub fn new() -> Self {
-        let quad_data = SurfaceData::make_quad(&Matrix4::identity());
-        let quad = SurfaceResource::new_embedded(quad_data);
-
         Self {
-            quad,
-            mat_hero: make_color_material(Color::from_rgba(50, 180, 50, 255)),
-            mat_creep: make_color_material(Color::from_rgba(220, 40, 40, 255)),
-            mat_tower: make_color_material(Color::from_rgba(50, 100, 220, 255)),
-            mat_projectile: make_color_material(Color::from_rgba(255, 230, 50, 255)),
-            mat_default: make_color_material(Color::from_rgba(200, 200, 200, 255)),
-            mat_hp_bg: make_color_material(Color::from_rgba(0, 0, 0, 255)),
-            mat_hp_fg: make_color_material(Color::from_rgba(0, 220, 0, 255)),
-            mat_facing: make_color_material(Color::from_rgba(255, 200, 0, 255)),
+            surf_hero: make_colored_quad_surface(Color::from_rgba(50, 180, 50, 255)),
+            surf_creep: make_colored_quad_surface(Color::from_rgba(220, 40, 40, 255)),
+            surf_tower: make_colored_quad_surface(Color::from_rgba(50, 100, 220, 255)),
+            surf_projectile: make_colored_quad_surface(Color::from_rgba(255, 230, 50, 255)),
+            surf_default: make_colored_quad_surface(Color::from_rgba(200, 200, 200, 255)),
+            surf_hp_bg: make_colored_quad_surface(Color::from_rgba(0, 0, 0, 255)),
+            surf_hp_fg: make_colored_quad_surface(Color::from_rgba(0, 220, 0, 255)),
+            surf_facing: make_colored_quad_surface(Color::from_rgba(255, 200, 0, 255)),
+            material: MaterialResource::new_embedded(Material::standard_2d()),
         }
     }
 
-    pub fn material_for(&self, entity_type: &str) -> &MaterialResource {
+    pub fn surface_for(&self, entity_type: &str) -> &SurfaceResource {
         match entity_type {
-            "hero" => &self.mat_hero,
-            "creep" | "enemy" => &self.mat_creep,
-            "unit" | "tower" => &self.mat_tower,
-            "bullet" | "projectile" => &self.mat_projectile,
-            _ => &self.mat_default,
+            "hero" => &self.surf_hero,
+            "creep" | "enemy" => &self.surf_creep,
+            "unit" | "tower" => &self.surf_tower,
+            "bullet" | "projectile" => &self.surf_projectile,
+            _ => &self.surf_default,
         }
     }
 
-    /// Build a 3D Mesh node referencing the shared quad + given material.
+    /// Build a 3D Mesh node referencing a per-color quad + the shared material.
     /// Caller sets local_transform afterwards (position, scale, rotation).
     pub fn build_mesh(
         &self,
-        scene: &mut fyrox::scene::Scene,
-        material: fyrox::material::MaterialResource,
-    ) -> fyrox::core::pool::Handle<fyrox::scene::node::Node> {
-        use fyrox::scene::base::BaseBuilder;
-        use fyrox::scene::mesh::surface::SurfaceBuilder;
-        use fyrox::scene::mesh::MeshBuilder;
-
+        scene: &mut Scene,
+        surface: SurfaceResource,
+    ) -> Handle<Node> {
         MeshBuilder::new(BaseBuilder::new())
-            .with_surfaces(vec![SurfaceBuilder::new(self.quad.clone())
-                .with_material(material)
+            .with_surfaces(vec![SurfaceBuilder::new(surface)
+                .with_material(self.material.clone())
                 .build()])
             .build(&mut scene.graph)
             .to_base()
     }
-}
-
-/// Custom unlit sprite shader.
-///
-/// Why not Material::standard_2d() / standard_sprite()?
-/// - standard_2d's Forward pass output is `ambientLight * vertexColor * diffuseTexture`,
-///   it never reads `diffuseColor` (the property exists in the material struct but is
-///   ignored by the GLSL).
-/// - standard_sprite outputs `vertexColor * texture`.
-/// - SurfaceData::make_quad() emits StaticVertex (position/normal/tex_coord/tangent only,
-///   NO color attribute) → vertexColor reads as 0.0 → fragment is black regardless of
-///   ambient or material color.
-///
-/// This shader skips lighting and vertex color, outputting `properties.diffuseColor *
-/// diffuseTexture` (white fallback texture → just diffuseColor). Forward pass only;
-/// GBuffer/shadow passes disabled like the other Standard*Sprite shaders.
-const UNLIT_SPRITE_SHADER_SRC: &str = r##"(
-    name: "OmfxUnlitSprite",
-
-    resources: [
-        (
-            name: "diffuseTexture",
-            kind: Texture(kind: Sampler2D, fallback: White),
-            binding: 0
-        ),
-        (
-            name: "properties",
-            kind: PropertyGroup([
-                (
-                    name: "diffuseColor",
-                    kind: Color(r: 255, g: 255, b: 255, a: 255),
-                ),
-            ]),
-            binding: 0
-        ),
-        (
-            name: "fyrox_instanceData",
-            kind: PropertyGroup([
-                // Autogenerated
-            ]),
-            binding: 1
-        ),
-    ],
-
-    disabled_passes: ["GBuffer", "DirectionalShadow", "PointShadow", "SpotShadow"],
-
-    passes: [
-        (
-            name: "Forward",
-            draw_parameters: DrawParameters(
-                cull_face: None,
-                color_write: ColorMask(
-                    red: true,
-                    green: true,
-                    blue: true,
-                    alpha: true,
-                ),
-                depth_write: true,
-                stencil_test: None,
-                depth_test: Some(LessOrEqual),
-                blend: Some(BlendParameters(
-                    func: BlendFunc(
-                        sfactor: SrcAlpha,
-                        dfactor: OneMinusSrcAlpha,
-                        alpha_sfactor: SrcAlpha,
-                        alpha_dfactor: OneMinusSrcAlpha,
-                    ),
-                    equation: BlendEquation(
-                        rgb: Add,
-                        alpha: Add
-                    )
-                )),
-                stencil_op: StencilOp(
-                    fail: Keep,
-                    zfail: Keep,
-                    zpass: Keep,
-                    write_mask: 0xFFFF_FFFF,
-                ),
-                scissor_box: None
-            ),
-            vertex_shader:
-                r#"
-                layout(location = 0) in vec3 vertexPosition;
-                layout(location = 1) in vec2 vertexTexCoord;
-
-                out vec2 texCoord;
-
-                void main()
-                {
-                    texCoord = vertexTexCoord;
-                    gl_Position = fyrox_instanceData.worldViewProjection * vec4(vertexPosition, 1.0);
-                }
-                "#,
-            fragment_shader:
-                r#"
-                out vec4 FragColor;
-
-                in vec2 texCoord;
-
-                void main()
-                {
-                    FragColor = properties.diffuseColor * texture(diffuseTexture, texCoord);
-                }
-                "#,
-        )
-    ],
-)"##;
-
-fn unlit_sprite_shader() -> ShaderResource {
-    static SHADER: OnceLock<ShaderResource> = OnceLock::new();
-    SHADER
-        .get_or_init(|| {
-            ShaderResource::from_str(
-                Uuid::new_v4(),
-                UNLIT_SPRITE_SHADER_SRC,
-                ResourceKind::Embedded,
-            )
-            .expect("OmfxUnlitSprite shader parse failed")
-        })
-        .clone()
-}
-
-fn make_color_material(color: Color) -> MaterialResource {
-    // Custom unlit shader (above): outputs `properties.diffuseColor * diffuseTexture`.
-    // Standard shaders won't work — see UNLIT_SPRITE_SHADER_SRC doc comment for why.
-    let mut mat = Material::from_shader(unlit_sprite_shader());
-    mat.set_property("diffuseColor", MaterialProperty::Color(color));
-    MaterialResource::new_embedded(mat)
 }
