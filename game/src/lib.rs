@@ -200,7 +200,15 @@ impl EventBuffer {
 #[derive(Debug)]
 struct NetworkEntity {
     entity_type: String,
-    node: Handle<Node>,
+    /// Slot index into `Game::body_batch`（batched sprite mesh slot allocator）。
+    /// 替代之前每 entity 一個 `node: Handle<Node>` 的 4000+ Mesh 浪費。
+    body_slot: u32,
+    /// Body sprite size（render units），create 時固定
+    body_size: f32,
+    /// Body sprite z-layer（依 entity_type 決定，create 時固定）
+    body_z: f32,
+    /// Body sprite color（[r,g,b,a] u8 normalized），create 時固定
+    body_color: [u8; 4],
     hp_bar_bg: Option<Handle<Node>>,
     hp_bar_fg: Option<Handle<Node>>,
     position: Vector2<f32>,
@@ -741,6 +749,13 @@ pub struct Game {
     /// Lazily initialized on first frame; reused for all entity sprite Meshes.
     #[visit(skip)] #[reflect(hidden)]
     sprite_resources: Option<sprite_resources::SharedSpriteResources>,
+
+    /// 所有 entity body sprite 共用的 batched mesh — 1 個 mesh / 1 draw call 容納
+    /// 數千個 entity，取代之前每 entity 1 個 Mesh 的爆量 draw call 浪費。
+    /// Capacity 4096 quad（涵蓋 1800 creep + 1000 tower + 餘裕）。
+    #[visit(skip)] #[reflect(hidden)]
+    body_batch: Option<sprite_resources::BatchedSpriteMesh>,
+
 
     // --- Network ---
     #[visit(skip)] #[reflect(hidden)]
@@ -1423,6 +1438,14 @@ impl Plugin for Game {
             self.sprite_resources = Some(sprite_resources::SharedSpriteResources::new());
         }
 
+        // Lazy init body batched mesh — 4096 capacity 涵蓋大型 stress 場景。
+        if self.body_batch.is_none() {
+            let material = self.sprite_resources.as_ref().unwrap().material.clone();
+            self.body_batch = Some(sprite_resources::BatchedSpriteMesh::new(
+                scene, 4096, material,
+            ));
+        }
+
         // 1. Check connection status
         if let Some(ref network) = self.network {
             while let Ok(status) = network.status_rx.try_recv() {
@@ -1664,11 +1687,20 @@ impl Plugin for Game {
                 }
             }
 
-            // Update node position (keep same Z) — X 取負讓 +X world 投到螢幕右
-            let z = scene.graph[entity.node].local_transform().position().z;
-            scene.graph[entity.node]
-                .local_transform_mut()
-                .set_position(Vector3::new(-pos.x, pos.y, z));
+            // Body sprite 透過 batched mesh — write_quad 進 cpu_mirror，最後一次性 flush。
+            // X 取負讓 +X world 投到螢幕右。
+            if let Some(batch) = self.body_batch.as_mut() {
+                batch.write_quad(
+                    entity.body_slot,
+                    &sprite_resources::QuadParams {
+                        center: Vector2::new(-pos.x, pos.y),
+                        size: Vector2::new(entity.body_size, entity.body_size),
+                        color: entity.body_color,
+                        rotation: 0.0,
+                        z: entity.body_z,
+                    },
+                );
+            }
 
             // Update HP bar positions
             if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
@@ -1719,6 +1751,13 @@ impl Plugin for Game {
                     .local_transform_mut()
                     .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_RING));
             }
+        }
+
+        // Body batched mesh：interp loop 寫進 cpu_mirror，loop 結束後一次性 upload
+        // 整批 vertex buffer 到 GPU（單次 modify() = 單次 GPU upload = 1 個 mesh /
+        // N quad / 1 個 draw call）。
+        if let Some(batch) = self.body_batch.as_mut() {
+            batch.flush(scene);
         }
 
         // Fyrox 1.0.1 doesn't auto-update hierarchical data per-frame (docs at
@@ -3567,19 +3606,28 @@ impl Game {
             "bullet" | "projectile" => (Color::from_rgba(255, 230, 50, 255), 0.1, Z_BULLET),
             _ => (Color::from_rgba(200, 200, 200, 255), 0.3, Z_ENEMY),
         };
-        // `color` is now unused — kept for diagnostic / future texture binding.
-        let _ = color;
+        let body_color: [u8; 4] = [color.r, color.g, color.b, color.a];
 
-        let node: Handle<Node> = {
-            let resources = self.sprite_resources.as_ref()
-                .expect("sprite_resources not initialized");
-            let surface = resources.surface_for(entity_type).clone();
-            let handle = resources.build_mesh(scene, surface);
-            scene.graph[handle]
-                .local_transform_mut()
-                .set_position(Vector3::new(-x, y, z))
-                .set_scale(Vector3::new(size, size, 1.0));
-            handle
+        // Body sprite 走 batched mesh：alloc 一個 slot、寫 1 個 quad 進共用 vertex
+        // buffer。N 個 entity = 1 個 Mesh = 1 個 draw call（取代之前每 entity
+        // 1 個 Mesh、1 個 draw call 的 N 倍浪費）。
+        let body_slot = {
+            let batch = self
+                .body_batch
+                .as_mut()
+                .expect("body_batch not initialized");
+            let slot = batch.alloc();
+            batch.write_quad(
+                slot,
+                &sprite_resources::QuadParams {
+                    center: Vector2::new(-x, y),
+                    size: Vector2::new(size, size),
+                    color: body_color,
+                    rotation: 0.0,
+                    z,
+                },
+            );
+            slot
         };
 
         // HP bars (if entity has health)
@@ -3683,7 +3731,10 @@ impl Game {
 
         self.network_entities.insert(id, NetworkEntity {
             entity_type: entity_type.to_string(),
-            node,
+            body_slot,
+            body_size: size,
+            body_z: z,
+            body_color,
             hp_bar_bg,
             hp_bar_fg,
             position: pos,
@@ -3893,7 +3944,11 @@ impl Game {
         );
 
         if let Some(entity) = self.network_entities.remove(&id) {
-            scene.graph.remove_node(entity.node);
+            // Free body batched-mesh slot（寫退化 quad）— 不再 remove scene node
+            // 因為 body 沒有獨立 scene node，整批共用 batched mesh。
+            if let Some(batch) = self.body_batch.as_mut() {
+                batch.free(entity.body_slot);
+            }
             if let Some(bg) = entity.hp_bar_bg {
                 scene.graph.remove_node(bg);
             }

@@ -26,7 +26,7 @@ use fyrox::scene::base::BaseBuilder;
 use fyrox::core::math::TriangleDefinition;
 use fyrox::scene::mesh::buffer::{
     BytesStorage, TriangleBuffer, VertexAttributeDataType, VertexAttributeDescriptor,
-    VertexAttributeUsage, VertexBuffer,
+    VertexAttributeUsage, VertexBuffer, VertexTrait,
 };
 use fyrox::scene::mesh::surface::{SurfaceBuilder, SurfaceData, SurfaceResource};
 use fyrox::scene::mesh::{MeshBuilder, RenderPath};
@@ -42,10 +42,16 @@ use fyrox::scene::Scene;
 /// ```
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-struct ColoredVertex {
-    position: Vector3<f32>,
-    tex_coord: Vector2<f32>,
-    color: [u8; 4],
+pub struct ColoredVertex {
+    pub position: Vector3<f32>,
+    pub tex_coord: Vector2<f32>,
+    pub color: [u8; 4],
+}
+
+impl VertexTrait for ColoredVertex {
+    fn layout() -> &'static [VertexAttributeDescriptor] {
+        vertex_layout()
+    }
 }
 
 fn vertex_layout() -> &'static [VertexAttributeDescriptor] {
@@ -176,5 +182,216 @@ impl SharedSpriteResources {
             .with_render_path(RenderPath::Forward)
             .build(&mut scene.graph)
             .to_base()
+    }
+}
+
+/// 寫一個 quad 到 batched mesh 的參數（world-space center + size + rotation）。
+#[derive(Copy, Clone, Debug)]
+pub struct QuadParams {
+    pub center: Vector2<f32>,
+    pub size: Vector2<f32>,
+    pub color: [u8; 4],
+    pub rotation: f32,
+    pub z: f32,
+}
+
+/// N 個 entity sprite 共用一個 Mesh、一次 modify() upload 整批 vertex buffer。
+/// Fyrox 1.0.1 的 auto-batch 在 bundle 內仍逐 instance 呼叫 frame_buffer.draw()
+/// （`bundle.rs:710`），不是真 GPU instanced；要拿到 1 draw call ≡ N quad 必須
+/// 把所有 quad 放進同一個 SurfaceData 的 vertex buffer。
+///
+/// 用法：
+/// ```text
+/// let slot = batch.alloc();              // entity_create
+/// batch.write_quad(slot, &params);       // entity_create + per-frame interp loop
+/// batch.flush(scene);                     // per-frame interp loop 結束時一次性 upload
+/// batch.free(slot);                      // entity_remove
+/// ```
+///
+/// 退化 slot（free 後 / 還沒 alloc 過）用 zero-size + alpha=0 的 quad，
+/// 不會看見也不增加 fragment 工作。
+pub struct BatchedSpriteMesh {
+    mesh_handle: Handle<Node>,
+    surface: SurfaceResource,
+    capacity: u32,
+    cpu_mirror: Vec<ColoredVertex>, // capacity * 4
+    free_list: Vec<u32>,
+    next_slot: u32,
+    dirty: bool,
+}
+
+impl std::fmt::Debug for BatchedSpriteMesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchedSpriteMesh")
+            .field("capacity", &self.capacity)
+            .field("next_slot", &self.next_slot)
+            .field("free_list_len", &self.free_list.len())
+            .field("dirty", &self.dirty)
+            .finish()
+    }
+}
+
+impl BatchedSpriteMesh {
+    pub fn new(scene: &mut Scene, capacity: u32, material: MaterialResource) -> Self {
+        let vertex_count = (capacity * 4) as usize;
+        let triangle_count = (capacity * 2) as usize;
+
+        // 預先全填退化 quad（vertex 全在 origin、alpha=0）
+        let cpu_mirror: Vec<ColoredVertex> = vec![
+            ColoredVertex {
+                position: Vector3::new(0.0, 0.0, 0.0),
+                tex_coord: Vector2::new(0.0, 0.0),
+                color: [0, 0, 0, 0],
+            };
+            vertex_count
+        ];
+
+        // Triangle indices（一次建好不再變）：每 slot 兩個三角形
+        // [s*4, s*4+1, s*4+2], [s*4, s*4+2, s*4+3]
+        let mut tris: Vec<TriangleDefinition> = Vec::with_capacity(triangle_count);
+        for s in 0..capacity {
+            let base = s * 4;
+            tris.push(TriangleDefinition([base, base + 1, base + 2]));
+            tris.push(TriangleDefinition([base, base + 2, base + 3]));
+        }
+
+        let bytes = BytesStorage::new(cpu_mirror.clone());
+        let vb = VertexBuffer::new_with_layout(vertex_layout(), vertex_count, bytes)
+            .expect("batched sprite vertex buffer layout must validate");
+        let tb = TriangleBuffer::new(tris);
+        let surface = SurfaceResource::new_embedded(SurfaceData::new(vb, tb));
+
+        let mesh_handle = MeshBuilder::new(BaseBuilder::new().with_frustum_culling(false))
+            .with_surfaces(vec![SurfaceBuilder::new(surface.clone())
+                .with_material(material)
+                .build()])
+            .with_render_path(RenderPath::Forward)
+            .build(&mut scene.graph)
+            .to_base();
+
+        Self {
+            mesh_handle,
+            surface,
+            capacity,
+            cpu_mirror,
+            free_list: Vec::new(),
+            next_slot: 0,
+            dirty: false,
+        }
+    }
+
+    pub fn alloc(&mut self) -> u32 {
+        if let Some(slot) = self.free_list.pop() {
+            return slot;
+        }
+        let slot = self.next_slot;
+        debug_assert!(
+            slot < self.capacity,
+            "BatchedSpriteMesh capacity exhausted (cap={})",
+            self.capacity
+        );
+        self.next_slot += 1;
+        slot
+    }
+
+    pub fn free(&mut self, slot: u32) {
+        // 寫退化 quad（zero-size, alpha=0）讓本 slot 不可見
+        let base = (slot * 4) as usize;
+        for i in 0..4 {
+            self.cpu_mirror[base + i] = ColoredVertex {
+                position: Vector3::new(0.0, 0.0, 0.0),
+                tex_coord: Vector2::new(0.0, 0.0),
+                color: [0, 0, 0, 0],
+            };
+        }
+        self.free_list.push(slot);
+        self.dirty = true;
+    }
+
+    pub fn write_quad(&mut self, slot: u32, p: &QuadParams) {
+        let base = (slot * 4) as usize;
+        let hw = p.size.x * 0.5;
+        let hh = p.size.y * 0.5;
+
+        // 非旋轉 fast-path（多數 entity 用不到 rotation）
+        if p.rotation.abs() < f32::EPSILON {
+            self.cpu_mirror[base + 0] = ColoredVertex {
+                position: Vector3::new(p.center.x - hw, p.center.y - hh, p.z),
+                tex_coord: Vector2::new(0.0, 1.0),
+                color: p.color,
+            };
+            self.cpu_mirror[base + 1] = ColoredVertex {
+                position: Vector3::new(p.center.x + hw, p.center.y - hh, p.z),
+                tex_coord: Vector2::new(1.0, 1.0),
+                color: p.color,
+            };
+            self.cpu_mirror[base + 2] = ColoredVertex {
+                position: Vector3::new(p.center.x + hw, p.center.y + hh, p.z),
+                tex_coord: Vector2::new(1.0, 0.0),
+                color: p.color,
+            };
+            self.cpu_mirror[base + 3] = ColoredVertex {
+                position: Vector3::new(p.center.x - hw, p.center.y + hh, p.z),
+                tex_coord: Vector2::new(0.0, 0.0),
+                color: p.color,
+            };
+        } else {
+            let cos_r = p.rotation.cos();
+            let sin_r = p.rotation.sin();
+            // 旋轉 local corner (lx, ly) → world (center + R * corner)
+            let rotate = |lx: f32, ly: f32| -> (f32, f32) {
+                (
+                    p.center.x + lx * cos_r - ly * sin_r,
+                    p.center.y + lx * sin_r + ly * cos_r,
+                )
+            };
+            let (x0, y0) = rotate(-hw, -hh);
+            let (x1, y1) = rotate(hw, -hh);
+            let (x2, y2) = rotate(hw, hh);
+            let (x3, y3) = rotate(-hw, hh);
+            self.cpu_mirror[base + 0] = ColoredVertex {
+                position: Vector3::new(x0, y0, p.z),
+                tex_coord: Vector2::new(0.0, 1.0),
+                color: p.color,
+            };
+            self.cpu_mirror[base + 1] = ColoredVertex {
+                position: Vector3::new(x1, y1, p.z),
+                tex_coord: Vector2::new(1.0, 1.0),
+                color: p.color,
+            };
+            self.cpu_mirror[base + 2] = ColoredVertex {
+                position: Vector3::new(x2, y2, p.z),
+                tex_coord: Vector2::new(1.0, 0.0),
+                color: p.color,
+            };
+            self.cpu_mirror[base + 3] = ColoredVertex {
+                position: Vector3::new(x3, y3, p.z),
+                tex_coord: Vector2::new(0.0, 0.0),
+                color: p.color,
+            };
+        }
+
+        self.dirty = true;
+    }
+
+    /// Upload cpu_mirror → GPU vertex buffer。沒 dirty 直接 skip。
+    /// 一次 modify() = 一次 GPU upload；之後 N quad 共 1 draw call。
+    pub fn flush(&mut self, _scene: &mut Scene) {
+        if !self.dirty {
+            return;
+        }
+        let mut data_ref = self.surface.data_ref();
+        let mut vb_ref = data_ref.vertex_buffer.modify();
+        let dst = vb_ref
+            .cast_data_mut::<ColoredVertex>()
+            .expect("ColoredVertex layout matches");
+        debug_assert_eq!(dst.len(), self.cpu_mirror.len());
+        dst.copy_from_slice(&self.cpu_mirror);
+        drop(vb_ref); // explicit drop → triggers GPU upload
+        self.dirty = false;
+    }
+
+    pub fn mesh_handle(&self) -> Handle<Node> {
+        self.mesh_handle
     }
 }
