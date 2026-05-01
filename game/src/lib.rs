@@ -930,13 +930,8 @@ pub struct Game {
     /// 計時：每滿 1 秒 roll over
     #[visit(skip)] #[reflect(hidden)]
     net_stats_elapsed: f32,
-    /// FPS 計算：累積本秒 frame 數
-    #[visit(skip)] #[reflect(hidden)]
-    fps_frame_count: u32,
-    /// FPS 計算：累積本秒實際耗時（dt 加總）
-    #[visit(skip)] #[reflect(hidden)]
-    fps_accum_time: f32,
-    /// 上一秒結算的 FPS 顯示字串（例 "FPS 60 (16.7ms)"），尚未結算時為空
+    /// FPS 顯示字串（例 "FPS 250 (4.0ms)"），來自 Fyrox renderer 的 frames_per_second
+    /// 統計（plugin update 是 fixed 60 Hz tick，自算 frame count 沒意義）。
     #[visit(skip)] #[reflect(hidden)]
     fps_display: String,
 }
@@ -1456,16 +1451,13 @@ impl Plugin for Game {
             self.net_stats_elapsed -= 1.0;
         }
 
-        // FPS 統計：每秒結算一次顯示字串
-        self.fps_frame_count += 1;
-        self.fps_accum_time += context.dt;
-        if self.fps_accum_time >= 1.0 {
-            let frames = self.fps_frame_count.max(1);
-            let fps = (frames as f32 / self.fps_accum_time).round() as u32;
-            let frame_ms = (self.fps_accum_time * 1000.0) / frames as f32;
-            self.fps_display = format!("FPS {} ({:.1}ms)", fps, frame_ms);
-            self.fps_frame_count = 0;
-            self.fps_accum_time = 0.0;
+        // FPS 顯示：直接用 Fyrox renderer 統計的真實 render fps（plugin update
+        // 自己是 fixed 60 Hz tick，自算 frame_count 永遠 60，沒意義）。
+        // last_fps 由 frame_profile.record_render_stats 在每 frame 更新。
+        let render_fps = self.frame_profile.last_fps;
+        if render_fps > 0 {
+            let frame_ms = 1000.0 / render_fps as f32;
+            self.fps_display = format!("FPS {} ({:.1}ms)", render_fps, frame_ms);
         }
 
         // 2. Receive events from NetworkBridge, push into EventBuffer

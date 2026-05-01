@@ -28,7 +28,7 @@ fn main() {
             window_attributes: fyrox::window::WindowAttributes::default()
                 .with_title("omfx - Tower Defense")
                 .with_inner_size(fyrox::dpi::LogicalSize::new(1280.0, 720.0)),
-            vsync: true,
+            vsync: false,
             msaa_sample_count: None,
             graphics_server_constructor: Default::default(),
             named_objects: false,
