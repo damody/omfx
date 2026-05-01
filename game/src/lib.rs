@@ -2180,6 +2180,10 @@ impl Plugin for Game {
                 .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .build(&mut ui.build_ctx());
                 entity.name_label = Some(label);
+                // 重置 throttle cache：新 widget 的位置是 default (0, 0)，下面的
+                // pos_changed 比對必須一定觸發（不然新 label 永遠停在螢幕左上角）。
+                entity.last_label_pos = Vector2::new(f32::MIN, f32::MIN);
+                entity.last_label_text = String::new();
             }
 
             // Update label screen position (above HP bar) + 文字含 HP 數字
