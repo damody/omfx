@@ -81,6 +81,10 @@ const COLLISION_RING_THICKNESS: f32 = 0.025;
 /// 預設關閉：1000 entity 各 24 段 = 24 K scene node，每幀 transform update
 /// 是 stress 場景下最大 CPU 成本之一。改 true 可恢復 debug 可視化。
 const COLLISION_RING_ENABLED: bool = false;
+/// Per-frame debug 畫每個 entity 的 collision ring（走 SceneDrawingContext，
+/// 千個 entity 還是 1 個 draw call，跟 COLLISION_RING_ENABLED 的 24K scene node
+/// 路徑不同）。stress 場景開著沒事。
+const DEBUG_COLLISION_RINGS: bool = true;
 const REGION_LINE_THICKNESS: f32 = 0.04;
 const REGION_BLOCKER_SEGMENTS: usize = 12;
 const REGION_BLOCKER_THICKNESS: f32 = 0.015;
@@ -1798,11 +1802,42 @@ impl Plugin for Game {
                 }
             }
 
-            // 碰撞半徑圓環：跟隨 entity 中心平移（旋轉/長度不變）
+            // 碰撞半徑圓環：跟隨 entity 中心平移（COLLISION_RING_ENABLED 路徑：
+            // 用 RectangleBuilder 24-segment node、每幀 transform update。stress 1000
+            // entity = 24K scene node 太重，預設關。
             for (handle, offset) in &entity.collision_ring {
                 scene.graph[*handle]
                     .local_transform_mut()
                     .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_RING));
+            }
+        }
+
+        // Per-frame debug：每個 entity 的 collision ring 畫成 SceneDrawingContext lines
+        // (千個 entity 加起來 1 個 draw call，跟 COLLISION_RING_ENABLED 走 scene node 那條路
+        // 完全分開)。要看 hero / creep / tower 互相阻擋的真實 collision 範圍時用。
+        if DEBUG_COLLISION_RINGS {
+            for entity in self.network_entities.values() {
+                if entity.collision_radius_render <= 0.0 {
+                    continue;
+                }
+                if !matches!(entity.entity_type.as_str(), "hero" | "creep" | "unit" | "tower") {
+                    continue;
+                }
+                // 顏色依類型區分，方便辨識
+                let color = match entity.entity_type.as_str() {
+                    "hero" => Color::from_rgba(80, 220, 80, 220),    // 綠
+                    "creep" => Color::from_rgba(255, 60, 60, 220),   // 紅
+                    "unit" | "tower" => Color::from_rgba(80, 160, 255, 220), // 藍
+                    _ => Color::from_rgba(255, 255, 255, 220),
+                };
+                add_circle_lines(
+                    scene,
+                    entity.position,
+                    entity.collision_radius_render,
+                    24,
+                    color,
+                    Z_RING,
+                );
             }
         }
 
