@@ -7,7 +7,23 @@ use simplelog::{
 };
 use std::fs::File;
 
+#[cfg(target_os = "windows")]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(u_period: u32) -> u32;
+}
+
 fn main() {
+    // Windows 預設 timer granularity 是 15.6ms，`thread::sleep(Duration::from_millis(1))`
+    // 實際會 sleep 8-15ms 把 fps 鎖到 ~60。呼叫 timeBeginPeriod(1) 把全系統 timer
+    // resolution 降到 1ms，sleep 就會接近真實 1ms。
+    // 配合 fyrox-impl-1.0.1/src/engine/executor.rs 裡 `Event::AboutToWait` 後
+    // patch 的 `thread::sleep(Duration::from_millis(1))` 使用，避免 CPU 100% 但又不
+    // 過度限速。
+    #[cfg(target_os = "windows")]
+    unsafe {
+        timeBeginPeriod(1);
+    }
     // Standard log crate backend：每次啟動 truncate omfx_app.log，同時印到 console。
     // omfx.log 是 fyrox 自己的 log（fyrox::core::log::Log），不走 standard log macros。
     // 我們的 log::info! / warn! 走 simplelog → omfx_app.log + 終端機。
