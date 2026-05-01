@@ -57,17 +57,24 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 // Backend → render coordinate scale (backend uses large units like 800)
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
 
-// Z layers in 3D camera frustum (camera at z=100 looking down -Z, near=0.1 far=1000).
-// LARGER Z = closer to camera = drawn on top.
-const Z_BACKGROUND: f32 = 0.5;
-const Z_PATH: f32 = 1.0;
-const Z_GRID_CELL: f32 = 1.5;
-const Z_REGION: f32 = 2.0;
+// Z layers in 3D camera frustum (camera at z=-100 looking +Z, near=0.1 far=1000).
+// SMALLER Z = closer to camera = drawn on top (industry-standard 3D 慣例)。
+//
+// 為什麼是 +Z 視角不是 -Z：Fyrox 的 `Camera::calculate_matrices` 用
+// `Matrix4::look_at_rh(eye, eye+look_vec, up_vec)`，其中 look_vec 來自
+// 旋轉矩陣 col 2（identity 給 (0,0,1)），所以 default 看 +Z。
+// 旋轉 camera 看 -Z 會被 `look_at_rh` 自己重算 side = forward × up，
+// 把原本的 world -X side（跟 omfx `(-bx, by)` x-flip 慣例配對）翻成 world +X，
+// 結果整個畫面左右相反。改成 camera 在 -Z 側、看 +Z（default 方向）就避開了。
+const Z_BULLET: f32 = 0.5;
+const Z_HP_BAR: f32 = 1.0;
+const Z_RING: f32 = 1.5;
+const Z_ENEMY: f32 = 2.0;
 const Z_TOWER: f32 = 2.5;
-const Z_ENEMY: f32 = 3.0;
-const Z_RING: f32 = 3.5;
-const Z_HP_BAR: f32 = 4.0;
-const Z_BULLET: f32 = 4.5;
+const Z_REGION: f32 = 3.0;
+const Z_GRID_CELL: f32 = 3.5;
+const Z_PATH: f32 = 4.0;
+const Z_BACKGROUND: f32 = 4.5;
 
 const COLLISION_RING_SEGMENTS: usize = 24;
 const COLLISION_RING_THICKNESS: f32 = 0.025;
@@ -1036,21 +1043,14 @@ impl Plugin for Game {
             ..Default::default()
         });
 
-        // Orthographic 3D camera positioned at z=100 looking down -Z.
-        // Fyrox 的 default camera look_vector 是 +Z (從 base.local_transform identity
-        // 推出 look()=(0,0,1))。所以要看到 z=0.5..4.5 範圍的 sprite，必須把 camera
-        // 旋轉 180° 繞 Y 軸，把 look 翻成 -Z。順帶把 +X 翻成 -X — 跟我們程式碼
-        // 裡 `(-backend_x, backend_y, z)` 的 x-flip 慣例剛好抵銷，所以 backend +X
-        // 會自然投到螢幕右側。
-        // 大 Z = 靠近 camera = depth-test 排在上層。
+        // Orthographic 3D camera 放在 z=-100，default look=+Z（不旋轉）。
+        // 不旋轉相機，讓 `look_at_rh(eye, eye+look, up)` 算出的 side = world -X，
+        // 對接 omfx 各 set_position 寫死的 `(-bx, by, z)` x-flip 慣例：
+        // backend +X → world -X → view +X → 螢幕右。詳情見 Z 常數區塊註解。
         self.camera = CameraBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
-                    .with_local_position(Vector3::new(0.0, 0.0, 100.0))
-                    .with_local_rotation(UnitQuaternion::from_axis_angle(
-                        &Vector3::y_axis(),
-                        std::f32::consts::PI,
-                    ))
+                    .with_local_position(Vector3::new(0.0, 0.0, -100.0))
                     .build(),
             ),
         )
@@ -1698,7 +1698,7 @@ impl Plugin for Game {
                 // 注意 fg_offset 在 X 方向偏移；X 翻轉後 offset 也要反向
                 scene.graph[fg]
                     .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR + 0.01))
+                    .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR - 0.01))
                     .set_scale(Vector3::new(fg_width, 0.06, 1.0));
             }
 
@@ -1717,7 +1717,7 @@ impl Plugin for Game {
                 let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
                 scene.graph[arrow]
                     .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, Z_HP_BAR + 0.02))
+                    .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, Z_HP_BAR - 0.02))
                     .set_rotation(rotation);
             }
 
@@ -1806,7 +1806,7 @@ impl Plugin for Game {
                     footprint_render,
                     24,
                     foot_color,
-                    Z_REGION + 0.0002,
+                    Z_REGION - 0.0002,
                 );
                 // 外圈：攻擊範圍
                 add_circle_lines(
@@ -1815,7 +1815,7 @@ impl Plugin for Game {
                     range_backend * WORLD_SCALE,
                     48,
                     range_color,
-                    Z_REGION + 0.0001,
+                    Z_REGION - 0.0001,
                 );
               } // end of `if let Some(tpl) = ...`
             }
@@ -1841,7 +1841,7 @@ impl Plugin for Game {
                 let alpha = (255.0 * (1.0 - t)) as u8;
                 let color = Color::from_rgba(230, 70, 40, alpha.max(40));
                 if cur_r > 0.02 {
-                    let z = Z_REGION + 0.0004;
+                    let z = Z_REGION - 0.0004;
                     // 起點：θ=0 → (cx + r, cy)；x 翻負與 build_line_segment 對齊
                     let mut prev = Vector3::new(-(ex.pos.x + cur_r), ex.pos.y, z);
                     for k in 1..=SEGS {
@@ -1876,7 +1876,7 @@ impl Plugin for Game {
                             ent.attack_range_backend * WORLD_SCALE,
                             48,
                             Color::from_rgba(255, 220, 40, 220),
-                            Z_REGION + 0.0003,
+                            Z_REGION - 0.0003,
                         );
                     }
                     _ => {
@@ -1921,7 +1921,7 @@ impl Plugin for Game {
             for (h, offset) in &proj.hit_ring {
                 scene.graph[*h]
                     .local_transform_mut()
-                    .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_BULLET - 0.0001));
+                    .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_BULLET + 0.0001));
             }
             if t >= 1.0 {
                 // 方向性子彈的 damage 由後端 H 事件授權，不做 optimistic 扣血
@@ -1981,10 +1981,10 @@ impl Plugin for Game {
                         vertical_size: 14.0, // 28 render 高 = 2800 backend，可裝下 ±1200 Y
                     }));
                 }
-                // Camera is at z=100 in 3D ortho frustum — preserve that on re-center.
+                // Camera at z=-100 looking +Z (default) — preserve that on re-center.
                 scene.graph[self.camera]
                     .local_transform_mut()
-                    .set_position(Vector3::new(0.0, 0.0, 100.0));
+                    .set_position(Vector3::new(0.0, 0.0, -100.0));
                 self.camera_world_pos = Vector2::new(0.0, 0.0);
                 self.td_camera_configured = true;
                 log::info!("🎥 TD 相機已鎖定：center=(0,0), vertical_size=14");
@@ -2608,7 +2608,7 @@ impl Plugin for Game {
                 {
                     let ray = camera.make_ray(cursor, self.window_size);
                     if ray.dir.z.abs() > 1e-6 {
-                        // 相機 z=100 朝 -Z；z=0 平面交點 t = -origin.z/dir.z > 0
+                        // 相機 z=-100 朝 +Z；z=0 平面交點 t = -origin.z/dir.z > 0
                         let t = -ray.origin.z / ray.dir.z;
                         let render_x = ray.origin.x + t * ray.dir.x;
                         let render_y = ray.origin.y + t * ray.dir.y;
@@ -3178,7 +3178,7 @@ impl Game {
                     24,
                     half_width,
                     color,
-                    Z_PATH - 0.00005, // 跟線段一起渲染、略往下一點避免 z-fighting
+                    Z_PATH + 0.00005, // 跟線段一起渲染、略往下一點避免 z-fighting (smaller=top → +0.00005 = behind)
                 );
                 for (h, _) in segs {
                     self.td_path_nodes.push(h);
@@ -3452,7 +3452,7 @@ impl Game {
                     20,
                     0.03,
                     Color::from_rgba(50, 50, 50, 160),
-                    Z_BULLET - 0.0001,
+                    Z_BULLET + 0.0001,
                 )
             } else {
                 Vec::new()
@@ -3603,7 +3603,7 @@ impl Game {
 
             let fg = resources.build_mesh(scene, resources.surf_hp_fg.clone());
             scene.graph[fg].local_transform_mut()
-                .set_position(Vector3::new(-x, bar_y, Z_HP_BAR + 0.01))
+                .set_position(Vector3::new(-x, bar_y, Z_HP_BAR - 0.01))
                 .set_scale(Vector3::new(0.8, 0.06, 1.0));
 
             (Some(bg), Some(fg))
@@ -4117,7 +4117,7 @@ fn build_facing_arrow(
     let handle = resources.build_mesh(scene, resources.surf_facing.clone());
     scene.graph[handle]
         .local_transform_mut()
-        .set_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, Z_HP_BAR + 0.02))
+        .set_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, Z_HP_BAR - 0.02))
         .set_scale(Vector3::new(length, thickness, 1.0))
         .set_rotation(rotation);
     handle
