@@ -1037,11 +1037,20 @@ impl Plugin for Game {
         });
 
         // Orthographic 3D camera positioned at z=100 looking down -Z.
-        // Larger world Z = closer to camera = drawn on top.
+        // Fyrox 的 default camera look_vector 是 +Z (從 base.local_transform identity
+        // 推出 look()=(0,0,1))。所以要看到 z=0.5..4.5 範圍的 sprite，必須把 camera
+        // 旋轉 180° 繞 Y 軸，把 look 翻成 -Z。順帶把 +X 翻成 -X — 跟我們程式碼
+        // 裡 `(-backend_x, backend_y, z)` 的 x-flip 慣例剛好抵銷，所以 backend +X
+        // 會自然投到螢幕右側。
+        // 大 Z = 靠近 camera = depth-test 排在上層。
         self.camera = CameraBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
                     .with_local_position(Vector3::new(0.0, 0.0, 100.0))
+                    .with_local_rotation(UnitQuaternion::from_axis_angle(
+                        &Vector3::y_axis(),
+                        std::f32::consts::PI,
+                    ))
                     .build(),
             ),
         )
