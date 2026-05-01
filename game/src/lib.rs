@@ -930,6 +930,9 @@ pub struct Game {
     /// Ctrl 按住：蓋塔後不自動取消選塔模式（方便一次連蓋多個）
     #[visit(skip)] #[reflect(hidden)]
     ctrl_held: bool,
+    /// Alt 按住：強制顯示 name label（即使 entity 數超過 NAME_LABEL_HIDE_THRESHOLD）
+    #[visit(skip)] #[reflect(hidden)]
+    alt_held: bool,
     #[visit(skip)] #[reflect(hidden)]
     game_ended: bool,
     #[visit(skip)] #[reflect(hidden)]
@@ -2141,10 +2144,12 @@ impl Plugin for Game {
         // Stress 場景下隱藏 name label：每個 entity 1 個 UI text widget = 1 個
         // UI draw call。1500+ creep 就是 1500+ 額外 draws，視覺上也是一團糊看不清。
         // entity 數超過 NAME_LABEL_HIDE_THRESHOLD 時暫停建立並把現有的清掉。
+        // Alt 按住強制顯示（讓玩家可以在 stress 場景偶爾查 entity 名稱 / HP）。
         const NAME_LABEL_HIDE_THRESHOLD: usize = 200;
         let too_many_entities = self.network_entities.len() > NAME_LABEL_HIDE_THRESHOLD;
+        let labels_hidden = too_many_entities && !self.alt_held;
 
-        if too_many_entities {
+        if labels_hidden {
             // Bulk-remove existing labels（一次清完，避免 frame-by-frame 慢慢清）
             for (_, entity) in self.network_entities.iter_mut() {
                 if let Some(label) = entity.name_label.take() {
@@ -2158,8 +2163,8 @@ impl Plugin for Game {
             if entity.health.is_none() {
                 continue; // only show names for entities with HP bars
             }
-            if too_many_entities {
-                continue; // 太多 entity 不渲染 name label，省 N 個 UI draw call
+            if labels_hidden {
+                continue; // 太多 entity 且沒按 Alt，不渲染 name label，省 N 個 UI draw call
             }
 
             // Lazily create label
@@ -2906,6 +2911,10 @@ impl Plugin for Game {
                     }
                     KeyCode::ControlLeft | KeyCode::ControlRight => {
                         self.ctrl_held = pressed;
+                        return Ok(());
+                    }
+                    KeyCode::AltLeft | KeyCode::AltRight => {
+                        self.alt_held = pressed;
                         return Ok(());
                     }
                     _ => {}
