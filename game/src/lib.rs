@@ -209,8 +209,12 @@ struct NetworkEntity {
     body_z: f32,
     /// Body sprite color（[r,g,b,a] u8 normalized），create 時固定
     body_color: [u8; 4],
-    hp_bar_bg: Option<Handle<Node>>,
-    hp_bar_fg: Option<Handle<Node>>,
+    /// HP bar bg slot in `Game::hp_batch`（None 代表沒有 HP）。
+    hp_bg_slot: Option<u32>,
+    /// HP bar fg slot in `Game::hp_batch`（None 代表沒有 HP）。
+    hp_fg_slot: Option<u32>,
+    /// Facing arrow slot in `Game::facing_batch`（None 代表沒有 HP）。
+    facing_slot: Option<u32>,
     position: Vector2<f32>,
     health: Option<(f32, f32)>, // (current, max)
     name: String,
@@ -228,8 +232,6 @@ struct NetworkEntity {
     path_age: f32,
     // 面向角度（radians，0 = +X，CCW 正）
     facing: f32,
-    // 箭頭指示面向的子節點
-    facing_arrow: Option<Handle<Node>>,
     // 碰撞半徑（render 單位 = backend * WORLD_SCALE）
     collision_radius_render: f32,
     // 碰撞半徑視覺化圓環段：Handle + ring-local 偏移（相對 entity 中心）
@@ -755,6 +757,15 @@ pub struct Game {
     /// Capacity 4096 quad（涵蓋 1800 creep + 1000 tower + 餘裕）。
     #[visit(skip)] #[reflect(hidden)]
     body_batch: Option<sprite_resources::BatchedSpriteMesh>,
+
+    /// HP bar 黑底 + 綠條 共用 batched mesh（per-vertex color，bg/fg 兩個 slot
+    /// 一個 entity）。Capacity 8192 = 4096 entity × 2 (bg + fg)。
+    #[visit(skip)] #[reflect(hidden)]
+    hp_batch: Option<sprite_resources::BatchedSpriteMesh>,
+
+    /// Facing arrow 共用 batched mesh（with rotation）。Capacity 4096。
+    #[visit(skip)] #[reflect(hidden)]
+    facing_batch: Option<sprite_resources::BatchedSpriteMesh>,
 
 
     // --- Network ---
@@ -1438,10 +1449,23 @@ impl Plugin for Game {
             self.sprite_resources = Some(sprite_resources::SharedSpriteResources::new());
         }
 
-        // Lazy init body batched mesh — 4096 capacity 涵蓋大型 stress 場景。
+        // Lazy init batched meshes — 4 個獨立 batch（body / hp / facing），N entity = 3 draws。
         if self.body_batch.is_none() {
             let material = self.sprite_resources.as_ref().unwrap().material.clone();
             self.body_batch = Some(sprite_resources::BatchedSpriteMesh::new(
+                scene, 4096, material,
+            ));
+        }
+        if self.hp_batch.is_none() {
+            let material = self.sprite_resources.as_ref().unwrap().material.clone();
+            // 8192 = 4096 entity × 2 (bg + fg)
+            self.hp_batch = Some(sprite_resources::BatchedSpriteMesh::new(
+                scene, 8192, material,
+            ));
+        }
+        if self.facing_batch.is_none() {
+            let material = self.sprite_resources.as_ref().unwrap().material.clone();
+            self.facing_batch = Some(sprite_resources::BatchedSpriteMesh::new(
                 scene, 4096, material,
             ));
         }
@@ -1702,8 +1726,10 @@ impl Plugin for Game {
                 );
             }
 
-            // Update HP bar positions
-            if let (Some(bg), Some(fg), Some((h, m))) = (entity.hp_bar_bg, entity.hp_bar_fg, entity.health) {
+            // Update HP bar positions — 走 hp_batch
+            if let (Some(bg_slot), Some(fg_slot), Some((h, m))) =
+                (entity.hp_bg_slot, entity.hp_fg_slot, entity.health)
+            {
                 let bar_y = pos.y + 0.3;
                 // P7 layered display HP：authoritative h 減去已 applied 但 server 還沒
                 // 反映的預測扣血，讓 visual 在子彈視覺命中當下就掉血、heartbeat reconcile
@@ -1711,23 +1737,39 @@ impl Plugin for Game {
                 let pending_dmg = pending_dmg_by_target.get(&entity_id).copied().unwrap_or(0.0);
                 let display_h = (h - pending_dmg).max(0.0);
                 let hp_ratio = (display_h / m).clamp(0.0, 1.0);
-                let bar_width = 0.8;
+                let bar_w = 0.8_f32;
+                let bar_h = 0.06_f32;
 
-                scene.graph[bg]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x, bar_y, Z_HP_BAR));
-
-                let fg_width = bar_width * hp_ratio;
-                let fg_offset = (bar_width - fg_width) * 0.5;
-                // 注意 fg_offset 在 X 方向偏移；X 翻轉後 offset 也要反向
-                scene.graph[fg]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x - fg_offset, bar_y, Z_HP_BAR - 0.01))
-                    .set_scale(Vector3::new(fg_width, 0.06, 1.0));
+                if let Some(batch) = self.hp_batch.as_mut() {
+                    // bg：固定寬度
+                    batch.write_quad(
+                        bg_slot,
+                        &sprite_resources::QuadParams {
+                            center: Vector2::new(-pos.x, bar_y),
+                            size: Vector2::new(bar_w, bar_h),
+                            color: [0, 0, 0, 255],
+                            rotation: 0.0,
+                            z: Z_HP_BAR,
+                        },
+                    );
+                    // fg：寬度按 hp_ratio，左對齊（中心隨 ratio 內縮）
+                    let fg_w = bar_w * hp_ratio;
+                    let fg_offset = (bar_w - fg_w) * 0.5;
+                    batch.write_quad(
+                        fg_slot,
+                        &sprite_resources::QuadParams {
+                            center: Vector2::new(-pos.x - fg_offset, bar_y),
+                            size: Vector2::new(fg_w, bar_h),
+                            color: [0, 220, 0, 255],
+                            rotation: 0.0,
+                            z: Z_HP_BAR - 0.01,
+                        },
+                    );
+                }
             }
 
-            // 更新面向箭頭位置與角度
-            if let Some(arrow) = entity.facing_arrow {
+            // 更新面向箭頭位置與角度 — 走 facing_batch
+            if let Some(slot) = entity.facing_slot {
                 let size: f32 = match entity.entity_type.as_str() {
                     "hero" => 0.4,
                     "creep" | "enemy" => 0.3,
@@ -1735,14 +1777,22 @@ impl Plugin for Game {
                     _ => 0.3,
                 };
                 let length = (size * 0.7).max(0.12);
+                let thickness = (size * 0.15).max(0.04);
                 let render_angle = std::f32::consts::PI - entity.facing;
                 let offset_x = (length * 0.5) * render_angle.cos();
                 let offset_y = (length * 0.5) * render_angle.sin();
-                let rotation = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), render_angle);
-                scene.graph[arrow]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(-pos.x + offset_x, pos.y + offset_y, Z_HP_BAR - 0.02))
-                    .set_rotation(rotation);
+                if let Some(batch) = self.facing_batch.as_mut() {
+                    batch.write_quad(
+                        slot,
+                        &sprite_resources::QuadParams {
+                            center: Vector2::new(-pos.x + offset_x, pos.y + offset_y),
+                            size: Vector2::new(length, thickness),
+                            color: [255, 200, 0, 255],
+                            rotation: render_angle,
+                            z: Z_HP_BAR - 0.02,
+                        },
+                    );
+                }
             }
 
             // 碰撞半徑圓環：跟隨 entity 中心平移（旋轉/長度不變）
@@ -1753,10 +1803,15 @@ impl Plugin for Game {
             }
         }
 
-        // Body batched mesh：interp loop 寫進 cpu_mirror，loop 結束後一次性 upload
-        // 整批 vertex buffer 到 GPU（單次 modify() = 單次 GPU upload = 1 個 mesh /
-        // N quad / 1 個 draw call）。
+        // Batched mesh flush：interp loop 寫進各 batch 的 cpu_mirror，這裡一次性
+        // upload 整批 vertex buffer 到 GPU。每個 batch = 1 個 mesh = 1 個 draw call。
         if let Some(batch) = self.body_batch.as_mut() {
+            batch.flush(scene);
+        }
+        if let Some(batch) = self.hp_batch.as_mut() {
+            batch.flush(scene);
+        }
+        if let Some(batch) = self.facing_batch.as_mut() {
             batch.flush(scene);
         }
 
@@ -3630,23 +3685,35 @@ impl Game {
             slot
         };
 
-        // HP bars (if entity has health)
-        let (hp_bar_bg, hp_bar_fg) = if health.is_some() {
+        // HP bars (if entity has health) — 走 hp_batch 1 個 mesh / 2 個 slot per entity
+        let (hp_bg_slot, hp_fg_slot) = if health.is_some() {
             let bar_y = y + size * 0.5 + 0.1;
-            let resources = self.sprite_resources.as_ref()
-                .expect("sprite_resources not initialized");
-
-            let bg = resources.build_mesh(scene, resources.surf_hp_bg.clone());
-            scene.graph[bg].local_transform_mut()
-                .set_position(Vector3::new(-x, bar_y, Z_HP_BAR))
-                .set_scale(Vector3::new(0.8, 0.06, 1.0));
-
-            let fg = resources.build_mesh(scene, resources.surf_hp_fg.clone());
-            scene.graph[fg].local_transform_mut()
-                .set_position(Vector3::new(-x, bar_y, Z_HP_BAR - 0.01))
-                .set_scale(Vector3::new(0.8, 0.06, 1.0));
-
-            (Some(bg), Some(fg))
+            let bar_w = 0.8_f32;
+            let bar_h = 0.06_f32;
+            let batch = self.hp_batch.as_mut().expect("hp_batch not initialized");
+            let bg_slot = batch.alloc();
+            batch.write_quad(
+                bg_slot,
+                &sprite_resources::QuadParams {
+                    center: Vector2::new(-x, bar_y),
+                    size: Vector2::new(bar_w, bar_h),
+                    color: [0, 0, 0, 255],
+                    rotation: 0.0,
+                    z: Z_HP_BAR,
+                },
+            );
+            let fg_slot = batch.alloc();
+            batch.write_quad(
+                fg_slot,
+                &sprite_resources::QuadParams {
+                    center: Vector2::new(-x, bar_y),
+                    size: Vector2::new(bar_w, bar_h),
+                    color: [0, 220, 0, 255],
+                    rotation: 0.0,
+                    z: Z_HP_BAR - 0.01,
+                },
+            );
+            (Some(bg_slot), Some(fg_slot))
         } else {
             (None, None)
         };
@@ -3699,10 +3766,29 @@ impl Game {
         let initial_facing = data.get("facing").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
         // 建立面向箭頭（只為有 health 的單位做，tower/creep/hero 都有）
-        let facing_arrow = if health.is_some() {
-            let resources = self.sprite_resources.as_ref()
-                .expect("sprite_resources not initialized");
-            Some(build_facing_arrow(scene, resources, x, y, size, initial_facing))
+        // 走 facing_batch — N 個 entity = 1 個 Mesh = 1 draw call。
+        let facing_slot = if health.is_some() {
+            let length = (size * 0.7).max(0.12);
+            let thickness = (size * 0.15).max(0.04);
+            let render_angle = std::f32::consts::PI - initial_facing;
+            let offset_x = (length * 0.5) * render_angle.cos();
+            let offset_y = (length * 0.5) * render_angle.sin();
+            let batch = self
+                .facing_batch
+                .as_mut()
+                .expect("facing_batch not initialized");
+            let slot = batch.alloc();
+            batch.write_quad(
+                slot,
+                &sprite_resources::QuadParams {
+                    center: Vector2::new(-x + offset_x, y + offset_y),
+                    size: Vector2::new(length, thickness),
+                    color: [255, 200, 0, 255],
+                    rotation: render_angle,
+                    z: Z_HP_BAR - 0.02,
+                },
+            );
+            Some(slot)
         } else {
             None
         };
@@ -3735,8 +3821,9 @@ impl Game {
             body_size: size,
             body_z: z,
             body_color,
-            hp_bar_bg,
-            hp_bar_fg,
+            hp_bg_slot,
+            hp_fg_slot,
+            facing_slot,
             position: pos,
             health,
             name,
@@ -3749,7 +3836,6 @@ impl Game {
             path_nodes,
             path_age: 0.0,
             facing: initial_facing,
-            facing_arrow,
             collision_radius_render,
             collision_ring,
             tower_kind,
@@ -3944,19 +4030,21 @@ impl Game {
         );
 
         if let Some(entity) = self.network_entities.remove(&id) {
-            // Free body batched-mesh slot（寫退化 quad）— 不再 remove scene node
-            // 因為 body 沒有獨立 scene node，整批共用 batched mesh。
+            // Free batched-mesh slots — body / hp / facing 都共用各自的 batched mesh，
+            // 沒有獨立 scene node，free 只寫退化 quad（zero-size + alpha=0）。
             if let Some(batch) = self.body_batch.as_mut() {
                 batch.free(entity.body_slot);
             }
-            if let Some(bg) = entity.hp_bar_bg {
-                scene.graph.remove_node(bg);
+            if let (Some(bg), Some(fg)) = (entity.hp_bg_slot, entity.hp_fg_slot) {
+                if let Some(batch) = self.hp_batch.as_mut() {
+                    batch.free(bg);
+                    batch.free(fg);
+                }
             }
-            if let Some(fg) = entity.hp_bar_fg {
-                scene.graph.remove_node(fg);
-            }
-            if let Some(arrow) = entity.facing_arrow {
-                scene.graph.remove_node(arrow);
+            if let Some(slot) = entity.facing_slot {
+                if let Some(batch) = self.facing_batch.as_mut() {
+                    batch.free(slot);
+                }
             }
             if let Some(label) = entity.name_label {
                 self.pending_label_deletions.push(label);
