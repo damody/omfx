@@ -2138,10 +2138,28 @@ impl Plugin for Game {
             ui.send(label, WidgetMessage::Remove);
         }
 
+        // Stress 場景下隱藏 name label：每個 entity 1 個 UI text widget = 1 個
+        // UI draw call。1500+ creep 就是 1500+ 額外 draws，視覺上也是一團糊看不清。
+        // entity 數超過 NAME_LABEL_HIDE_THRESHOLD 時暫停建立並把現有的清掉。
+        const NAME_LABEL_HIDE_THRESHOLD: usize = 200;
+        let too_many_entities = self.network_entities.len() > NAME_LABEL_HIDE_THRESHOLD;
+
+        if too_many_entities {
+            // Bulk-remove existing labels（一次清完，避免 frame-by-frame 慢慢清）
+            for (_, entity) in self.network_entities.iter_mut() {
+                if let Some(label) = entity.name_label.take() {
+                    ui.send(label, WidgetMessage::Remove);
+                }
+            }
+        }
+
         // Create missing labels & update positions
         for (&entity_id, entity) in self.network_entities.iter_mut() {
             if entity.health.is_none() {
                 continue; // only show names for entities with HP bars
+            }
+            if too_many_entities {
+                continue; // 太多 entity 不渲染 name label，省 N 個 UI draw call
             }
 
             // Lazily create label
