@@ -3974,6 +3974,7 @@ name = "omfx"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "failure",
  "fyrox",
  "log",
  "omoba-core",

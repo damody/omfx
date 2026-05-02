@@ -782,6 +782,13 @@ pub struct Game {
     /// GameEvent stream) until Phase 3 retires the latter.
     #[visit(skip)] #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
+    /// Phase 3.2 sim_runner worker (full omb ECS dispatcher running off a
+    /// background thread). Dropped on `on_deinit` so the channel
+    /// disconnect lets the worker exit. Phase 3.3 will wire input feed
+    /// from `lockstep_handle`; until then the worker just blocks on
+    /// `master_seed_rx.recv()` and never ticks.
+    #[visit(skip)] #[reflect(hidden)]
+    sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
     #[visit(skip)] #[reflect(hidden)]
     connection_status: ConnectionStatus,
     #[visit(skip)] #[reflect(hidden)]
@@ -1443,6 +1450,29 @@ impl Plugin for Game {
             lockstep_player_name,
         ));
 
+        // Phase 3.2: spawn the local sim_runner worker. It blocks on the
+        // master_seed channel — Phase 3.3 will wire LockstepClient's
+        // GameStart handler to send via `sim_runner_handle.master_seed_tx`.
+        // For Phase 3.2 the worker simply parks until shutdown, which
+        // verifies the worker thread spawn + symbol resolution.
+        {
+            use std::path::PathBuf;
+            let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from("D:/omoba/scripts/target/release/base_content.dll")
+                });
+            let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("D:/omoba/omb/Story/MVP_1"));
+            log::info!(
+                "Phase 3.2 sim_runner spawn: dll={:?} scene={:?}",
+                dll_path,
+                scene_path
+            );
+            self.sim_runner_handle = Some(sim_runner::spawn_sim_runner(dll_path, scene_path));
+        }
+
         self.event_buffer = Some(EventBuffer::new());
         self.network_entities = HashMap::new();
         self.client_projectiles = HashMap::new();
@@ -1458,6 +1488,10 @@ impl Plugin for Game {
         // thread exits on next iteration when its async recv returns None
         // from the kcp reader / when its select sees disconnected channels).
         self.lockstep_handle = None;
+        // Drop sim_runner. Channel disconnect signals the worker to
+        // exit (whether it's still blocked on master_seed_rx.recv() or
+        // looping on tick_input_rx.recv()).
+        self.sim_runner_handle = None;
 
         // Drop the backend guard — its Drop impl kills the child and closes the Job Object.
         // (If Drop doesn't run, e.g. on hard kill, the OS still terminates the backend
