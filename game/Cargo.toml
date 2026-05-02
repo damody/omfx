@@ -14,6 +14,14 @@ serde_json = "1.0"
 log = "0.4"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 
+# Phase 3 lockstep simulator deps:
+# omfx imports omb-as-lib to run the full ECS dispatcher in a worker thread.
+# specs uses the forked path (matches omb) so Entity Serialize impls and
+# component types are unified across the FFI boundary.
+omobab = { path = "../../omb", default-features = false, features = ["kcp"] }
+specs = { path = "../../specs", features = ["derive", "serde"] }
+omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",

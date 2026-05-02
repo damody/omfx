@@ -44,6 +44,7 @@ pub use fyrox;
 
 mod sprite_resources;
 mod lockstep_client;
+mod sim_runner;
 
 // ---------------------------------------------------------------------------
 // Constants
