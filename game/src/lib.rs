@@ -71,6 +71,22 @@ fn convert_player_input(
     }
 }
 
+/// Phase 4.3: Fixed32 raw scaling. Vec2I stores `real_units * 1024` as sint32
+/// (see proto/game.proto: "divide by 1024 to get real units"). Backend logical
+/// coords = render coords / WORLD_SCALE; multiply that by 1024 to get the raw.
+const FIXED32_ONE: f32 = 1024.0;
+
+/// Convert an omfx render-space world position into the backend Fixed32 raw
+/// `Vec2I` used by `PlayerInput::MoveTo` / `CastAbility::target_pos`.
+fn world_render_to_vec2i(world: Vector2<f32>) -> omoba_core::kcp::game_proto::Vec2I {
+    let backend_x = world.x / WORLD_SCALE;
+    let backend_y = world.y / WORLD_SCALE;
+    omoba_core::kcp::game_proto::Vec2I {
+        x: (backend_x * FIXED32_ONE) as i32,
+        y: (backend_y * FIXED32_ONE) as i32,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -807,6 +823,13 @@ pub struct Game {
     /// GameEvent stream) until Phase 3 retires the latter.
     #[visit(skip)] #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
+    /// Phase 4.3: most recent `LockstepEvent::TickBatch.tick` observed.
+    /// Used to compute `target_tick = current_sim_tick + 3` for input
+    /// submissions (50 ms input delay at 60 Hz). Initialized to 0 via
+    /// `#[derive(Default)]`; updated each frame in the TickBatch arm of
+    /// `Game::update`.
+    #[visit(skip)] #[reflect(hidden)]
+    current_sim_tick: u32,
     /// Phase 3.2 sim_runner worker (full omb ECS dispatcher running off a
     /// background thread). Dropped on `on_deinit` so the channel
     /// disconnect lets the worker exit. Phase 3.3 will wire input feed
@@ -1621,6 +1644,8 @@ impl Plugin for Game {
                         }
                     }
                     lockstep_client::LockstepEvent::TickBatch { tick, inputs, server_events } => {
+                        // Phase 4.3: track latest sim tick for input target_tick math.
+                        self.current_sim_tick = tick;
                         if tick % 60 == 0 {
                             log::debug!(
                                 "[lockstep] tick={} inputs={} events={}",
@@ -3103,6 +3128,20 @@ impl Plugin for Game {
                             y: world_pos.y / WORLD_SCALE,
                         });
                     }
+                    // Phase 4.3: parallel lockstep input. PlayerInput::MoveTo
+                    // travels via `LockstepClientHandle.input_tx` → omb's
+                    // lockstep scheduler. Coexists with the legacy
+                    // NetworkBridge HeroMove above; Phase 4.5 cuts the latter.
+                    let target = world_render_to_vec2i(world_pos);
+                    let move_to = omoba_core::kcp::game_proto::MoveTo {
+                        target: Some(target),
+                    };
+                    let input = omoba_core::kcp::game_proto::PlayerInput {
+                        action: Some(
+                            omoba_core::kcp::game_proto::player_input::Action::MoveTo(move_to),
+                        ),
+                    };
+                    self.send_lockstep_input(input);
                 }
             }
             // LoL MVP 鍵盤輸入
@@ -3141,6 +3180,38 @@ impl Plugin for Game {
                 let send = |cmd: NetCommand| {
                     if let Some(ref t) = tx { let _ = t.send(cmd); }
                 };
+
+                // Phase 4.3: any Q/W/E/R press → parallel lockstep
+                // PlayerInput::CastAbility (ability_index 0/1/2/3). Runs
+                // alongside the legacy NetworkBridge CastAbility path
+                // (Phase 4.5 cuts legacy). Mouse world pos becomes the
+                // optional `target_pos`. Modifier-held cases (Shift = upgrade,
+                // not cast) are excluded.
+                if !self.shift_held {
+                    let ability_index_opt = match key {
+                        KeyCode::KeyQ => Some(0u32),
+                        KeyCode::KeyW => Some(1u32),
+                        KeyCode::KeyE => Some(2u32),
+                        KeyCode::KeyR => Some(3u32),
+                        _ => None,
+                    };
+                    if let Some(ability_index) = ability_index_opt {
+                        let target = world_render_to_vec2i(world);
+                        let cast = omoba_core::kcp::game_proto::CastAbility {
+                            ability_index,
+                            target_pos: Some(target),
+                            target_entity: None,
+                        };
+                        let input = omoba_core::kcp::game_proto::PlayerInput {
+                            action: Some(
+                                omoba_core::kcp::game_proto::player_input::Action::CastAbility(
+                                    cast,
+                                ),
+                            ),
+                        };
+                        self.send_lockstep_input(input);
+                    }
+                }
 
                 match key {
                     KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR | KeyCode::KeyT => {
@@ -3260,6 +3331,25 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    /// Phase 4.3: send a `PlayerInput` to the lockstep wire (omb's lockstep
+    /// scheduler). No-op if `lockstep_handle` is None (e.g. legacy-only mode).
+    /// Target tick = current_sim_tick + 3 (50 ms input delay at 60 Hz). The
+    /// underlying `GameClient` (in `omoba_core::kcp::client`) tags the
+    /// `InputSubmit` frame with the cached `player_id` from `GameStart`, so
+    /// callers don't need to know self-id.
+    ///
+    /// Runs in **parallel** with the legacy `NetworkBridge::cmd_tx` path —
+    /// Phase 4.5 cuts the legacy side. Until then a single click may produce
+    /// two server-side messages; omb-side is responsible for de-duping or
+    /// (post-Phase-4.5) ignoring the legacy command.
+    fn send_lockstep_input(&self, input: omoba_core::kcp::game_proto::PlayerInput) {
+        let Some(handle) = self.lockstep_handle.as_ref() else { return };
+        let target_tick = self.current_sim_tick.wrapping_add(3);
+        if let Err(e) = handle.input_tx.send((target_tick, input)) {
+            log::warn!("[lockstep] input_tx send failed: {e}");
+        }
+    }
+
     fn apply_event(&mut self, evt: TimestampedEvent, scene: &mut Scene) {
         match (evt.msg_type.as_str(), evt.action.as_str()) {
             // Projectiles are simulated client-side (pursuit + flight_time).
