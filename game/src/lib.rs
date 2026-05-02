@@ -134,186 +134,55 @@ const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 
 // ---------------------------------------------------------------------------
 // Network Types
-// ---------------------------------------------------------------------------
 
-/// Frontend → Backend command
-enum NetCommand {
-    PlaceTower { kind: String, x: f32, y: f32 },
-    SellTower { tower_id: u32 },
-    UpgradeTower { tower_id: u32, path: u8 },
-    HeroMove { x: f32, y: f32 },
-    ViewportUpdate { cx: f32, cy: f32, hw: f32, hh: f32 },
-    CastAbility { slot: String, x: f32, y: f32 },
-    UpgradeSkill { slot: String },
-    BuyItem { item_id: String },
-    SellItem { slot: usize },
-    UseItem { slot: usize },
-    StartRound,
-}
 
-/// Timestamped backend event (for sorted buffering)
+
+/// Seconds that a newly-spawned creep's debug path stays visible.
+const PATH_VISIBLE_SECS: f32 = 5.0;
+
+/// Phase 5.1 (pass 3): NetworkEntity is dead — apply_event populated this
+/// per-entity render registry from legacy GameEvent stream which was
+/// deleted in pass 2. The struct + `Game::network_entities` field stay in
+/// source so the orphan render loops in Game::update (interpolation, HP
+/// bars, name labels, projectile collision lookups) compile against an
+/// always-empty HashMap. Phase 5.x removes the orphan loops + this struct
+/// (estimated ~600 lines of update body cleanup).
 #[derive(Debug)]
-struct TimestampedEvent {
-    timestamp_ms: u64,
-    msg_type: String,
-    action: String,
-    data: serde_json::Value,
-    /// 解壓後 prost payload 長度。HUD 顯示「應用層」logical bytes。
-    payload_bytes: usize,
-    /// 真實 KCP/UDP wire bytes (LZ4 壓縮後 + framing)。HUD 顯示真實 bandwidth。
-    wire_bytes: usize,
-}
-
-impl PartialEq for TimestampedEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.timestamp_ms == other.timestamp_ms
-    }
-}
-
-impl Eq for TimestampedEvent {}
-
-impl PartialOrd for TimestampedEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for TimestampedEvent {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.timestamp_ms.cmp(&other.timestamp_ms)
-    }
-}
-
-/// Event buffer — sorts by timestamp, delays render_delay before consuming
-#[derive(Debug)]
-struct EventBuffer {
-    heap: BinaryHeap<Reverse<TimestampedEvent>>, // min-heap
-    render_delay_ms: u64,
-    clock_offset_ms: i64,
-    synced: bool,
-}
-
-impl EventBuffer {
-    fn new() -> Self {
-        Self {
-            heap: BinaryHeap::new(),
-            render_delay_ms: 100,
-            clock_offset_ms: 0,
-            synced: false,
-        }
-    }
-
-    fn push(&mut self, event: TimestampedEvent) {
-        self.heap.push(Reverse(event));
-    }
-
-    /// Calibrate clock using heartbeat timestamp_ms
-    fn sync_clock(&mut self, server_timestamp_ms: u64) {
-        let client_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-        let new_offset = server_timestamp_ms as i64 - client_now;
-        if self.synced {
-            // Exponential moving average, smooth jitter (alpha = 0.1)
-            self.clock_offset_ms = self.clock_offset_ms + (new_offset - self.clock_offset_ms) / 10;
-        } else {
-            self.clock_offset_ms = new_offset;
-            self.synced = true;
-        }
-    }
-
-    /// Estimate current server time
-    fn server_now_ms(&self) -> u64 {
-        let client_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-        (client_now + self.clock_offset_ms) as u64
-    }
-
-    /// Drain all events that are ready to display
-    fn drain_ready(&mut self) -> Vec<TimestampedEvent> {
-        let deadline = self.server_now_ms().saturating_sub(self.render_delay_ms);
-        let mut ready = Vec::new();
-        while let Some(Reverse(evt)) = self.heap.peek() {
-            if evt.timestamp_ms <= deadline {
-                ready.push(self.heap.pop().unwrap().0);
-            } else {
-                break;
-            }
-        }
-        ready
-    }
-}
-
-/// Backend entity → Fyrox scene node mapping
-#[derive(Debug)]
+#[allow(dead_code)]
 struct NetworkEntity {
     entity_type: String,
-    /// Slot index into `Game::body_batch`（batched sprite mesh slot allocator）。
-    /// 替代之前每 entity 一個 `node: Handle<Node>` 的 4000+ Mesh 浪費。
     body_slot: u32,
-    /// Body sprite size（render units），create 時固定
     body_size: f32,
-    /// Body sprite z-layer（依 entity_type 決定，create 時固定）
     body_z: f32,
-    /// Body sprite color（[r,g,b,a] u8 normalized），create 時固定
     body_color: [u8; 4],
-    /// HP bar bg slot in `Game::hp_batch`（None 代表沒有 HP）。
     hp_bg_slot: Option<u32>,
-    /// HP bar fg slot in `Game::hp_batch`（None 代表沒有 HP）。
     hp_fg_slot: Option<u32>,
-    /// Facing arrow slot in `Game::facing_batch`（None 代表沒有 HP）。
     facing_slot: Option<u32>,
     position: Vector2<f32>,
-    health: Option<(f32, f32)>, // (current, max)
+    health: Option<(f32, f32)>,
     name: String,
     name_label: Option<Handle<Text>>,
-    // Client-side interpolation
     prev_position: Vector2<f32>,
     target_position: Vector2<f32>,
     lerp_elapsed: f32,
-    lerp_duration: f32, // derived from move_speed + segment distance
-    // Backend-reported move speed (backend units per second); 0 for static entities.
+    lerp_duration: f32,
     move_speed: f32,
-    // Debug polyline segments (for creep path visualization)
     path_nodes: Vec<Handle<Node>>,
-    // Seconds since path_nodes were drawn; used to expire them after PATH_VISIBLE_SECS.
     path_age: f32,
-    // 面向角度（radians，0 = +X，CCW 正）
     facing: f32,
-    // 碰撞半徑（render 單位 = backend * WORLD_SCALE）
     collision_radius_render: f32,
-    // 碰撞半徑視覺化圓環段：Handle + ring-local 偏移（相對 entity 中心）
     collision_ring: Vec<(Handle<Node>, Vector2<f32>)>,
-    // TD 塔類型（"dart"/"bomb"/"tack"/"ice"）；非 TD 塔為 None
     tower_kind: Option<String>,
-    // TD 塔攻擊射程（backend 單位）；0 表示不是有射程的單位
     attack_range_backend: f32,
-    // TD tower upgrade state（3 條路線各自的 level），預設 [0,0,0]
     upgrade_levels: [u8; 3],
-    // Name label 快取：stress 場景下 1000 entity × 每幀 format!() + 兩個
-    // UI message 會吃光 frame。只在字串/位置變動超過門檻時才送。
     last_label_text: String,
     last_label_pos: Vector2<f32>,
-    // ------- P4: velocity-based extrapolation (creep-only) -------
-    // When `extrap_velocity > 0.0` the entity uses velocity extrapolation
-    // instead of lerp. Server emits creep.M only on waypoint/speed change,
-    // so between events the client advances `position` on its own using:
-    //     current = extrap_start_pos + velocity * dir * elapsed
-    // `extrap_direction` is cached from (target - start_pos).normalize() at
-    // event apply time so the per-frame render path is branchless.
-    // `extrap_elapsed` is seconds since the event arrived (wall-clock, dt-
-    // integrated in update()); matches backend tick_dt closely enough for
-    // seconds-scale segments, with heartbeat drift snap correcting error.
     extrap_velocity: f32,
     extrap_start_pos: Vector2<f32>,
     extrap_direction: Vector2<f32>,
     extrap_elapsed: f32,
-    /// Total travel time for the segment (distance / velocity). After this
-    /// the entity locks at target until a new creep.M arrives.
     extrap_duration: f32,
 }
-
-/// Seconds that a newly-spawned creep's debug path stays visible.
-const PATH_VISIBLE_SECS: f32 = 5.0;
 
 /// TD 塔的完整元資料（host + script 合併；前端快取一份，供預覽 / 按鈕 / sell 使用）。
 #[derive(Clone, Debug)]
@@ -555,133 +424,6 @@ fn create_job_and_attach(child: &std::process::Child) -> Option<windows::Win32::
     }
 }
 
-/// Sync/Async bridge
-#[derive(Debug)]
-struct NetworkBridge {
-    event_rx: crossbeam_channel::Receiver<TimestampedEvent>,
-    cmd_tx: crossbeam_channel::Sender<NetCommand>,
-    status_rx: crossbeam_channel::Receiver<ConnectionStatus>,
-}
-
-impl NetworkBridge {
-    fn spawn(server_addr: String, player_name: String) -> Self {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<NetCommand>();
-        let (status_tx, status_rx) = crossbeam_channel::unbounded();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let _ = status_tx.send(ConnectionStatus::Connecting);
-
-                // Retry forever, once per second, so the frontend can be started
-                // before the backend and will automatically attach when it comes up.
-                let mut client = {
-                    let mut attempt = 0u32;
-                    loop {
-                        match omoba_core::KcpClient::connect(&server_addr, player_name.clone()).await {
-                            Ok(c) => {
-                                let _ = status_tx.send(ConnectionStatus::Connected);
-                                break c;
-                            }
-                            Err(e) => {
-                                attempt += 1;
-                                log::info!("Connection attempt {} failed: {}, retrying in 1s...", attempt, e);
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            }
-                        }
-                    }
-                };
-
-                let mut grpc_rx = match client.subscribe_events().await {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        let _ = status_tx.send(ConnectionStatus::Failed(e.to_string()));
-                        return;
-                    }
-                };
-
-                // Event relay: tokio mpsc → crossbeam
-                let event_tx_clone = event_tx.clone();
-                let relay_events = tokio::spawn(async move {
-                    while let Some(evt) = grpc_rx.recv().await {
-                        if event_tx_clone.send(TimestampedEvent {
-                            timestamp_ms: evt.timestamp_ms,
-                            msg_type: evt.msg_type,
-                            action: evt.action,
-                            data: evt.data,
-                            payload_bytes: evt.payload_bytes,
-                            wire_bytes: evt.wire_bytes,
-                        }).is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                // Command relay: crossbeam → gRPC
-                let relay_commands = tokio::spawn(async move {
-                    loop {
-                        match cmd_rx.try_recv() {
-                            Ok(cmd) => match cmd {
-                                NetCommand::PlaceTower { kind, x, y } => {
-                                    let _ = client.send_command("tower", "create",
-                                        serde_json::json!({"kind": kind, "x": x, "y": y})).await;
-                                }
-                                NetCommand::SellTower { tower_id } => {
-                                    let _ = client.send_command("tower", "sell",
-                                        serde_json::json!({"tower_id": tower_id})).await;
-                                }
-                                NetCommand::UpgradeTower { tower_id, path } => {
-                                    let _ = client.send_command("tower", "upgrade",
-                                        serde_json::json!({"tower_id": tower_id, "path": path})).await;
-                                }
-                                NetCommand::HeroMove { x, y } => {
-                                    let _ = client.send_command("player", "move",
-                                        serde_json::json!({"x": x, "y": y})).await;
-                                }
-                                NetCommand::ViewportUpdate { cx, cy, hw, hh } => {
-                                    let _ = client.send_viewport_update(cx, cy, hw, hh).await;
-                                }
-                                NetCommand::CastAbility { slot, x, y } => {
-                                    let _ = client.send_command("player", "cast_ability",
-                                        serde_json::json!({"slot": slot, "target_pos": [x, y]})).await;
-                                }
-                                NetCommand::UpgradeSkill { slot } => {
-                                    let _ = client.send_command("player", "upgrade_skill",
-                                        serde_json::json!({"slot": slot})).await;
-                                }
-                                NetCommand::BuyItem { item_id } => {
-                                    let _ = client.send_command("player", "buy_item",
-                                        serde_json::json!({"item_id": item_id})).await;
-                                }
-                                NetCommand::SellItem { slot } => {
-                                    let _ = client.send_command("player", "sell_item",
-                                        serde_json::json!({"slot": slot})).await;
-                                }
-                                NetCommand::UseItem { slot } => {
-                                    let _ = client.send_command("player", "use_item",
-                                        serde_json::json!({"slot": slot})).await;
-                                }
-                                NetCommand::StartRound => {
-                                    let _ = client.send_command("player", "start_round",
-                                        serde_json::json!({})).await;
-                                }
-                            },
-                            Err(crossbeam_channel::TryRecvError::Empty) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            }
-                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-                        }
-                    }
-                });
-
-                let _ = tokio::join!(relay_events, relay_commands);
-            });
-        });
-
-        NetworkBridge { event_rx, cmd_tx, status_rx }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Game Plugin
@@ -816,11 +558,9 @@ pub struct Game {
 
 
     // --- Network ---
-    #[visit(skip)] #[reflect(hidden)]
-    network: Option<NetworkBridge>,
-    /// Phase 2 lockstep client (KCP tags 0x10-0x16). Logging-only consumer
-    /// of TickBatch / StateHash; runs in parallel with `network` (legacy
-    /// GameEvent stream) until Phase 3 retires the latter.
+    // Phase 5.1: legacy `network: Option<NetworkBridge>` field removed.
+    /// Lockstep client (KCP tags 0x10-0x16). Drives sim_runner via
+    /// TickBatch / StateHash on a separate background thread.
     #[visit(skip)] #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
     /// Phase 4.3: most recent `LockstepEvent::TickBatch.tick` observed.
@@ -846,8 +586,11 @@ pub struct Game {
     render_bridge: render_bridge::RenderBridge,
     #[visit(skip)] #[reflect(hidden)]
     connection_status: ConnectionStatus,
-    #[visit(skip)] #[reflect(hidden)]
-    event_buffer: Option<EventBuffer>,
+    // Phase 5.1: `event_buffer: Option<EventBuffer>` field removed.
+    // EventBuffer drove the legacy GameEvent reorder/replay pipeline.
+    // `network_entities` field kept temporarily — orphan render loops in
+    // Game::update still iterate it (always empty since apply_event is
+    // gone); Phase 5.x cleans up the loops + this field.
     #[visit(skip)] #[reflect(hidden)]
     network_entities: HashMap<u32, NetworkEntity>,
     /// BlockedRegion 線框 scene node（每個 region 一組 polygon outline segments）。
