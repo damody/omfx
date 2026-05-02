@@ -1500,6 +1500,12 @@ impl Plugin for Game {
             let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("D:/omoba/omb/Story/MVP_1"));
+            // omobab::ServerSetting::default reads "game.toml" by relative path
+            // (works for omobab.exe with cwd=omb). omfx process cwd is elsewhere,
+            // so point the lazy_static at an absolute path.
+            if std::env::var("OMB_GAME_TOML").is_err() {
+                std::env::set_var("OMB_GAME_TOML", "D:/omoba/omb/game.toml");
+            }
             log::info!(
                 "Phase 3.2 sim_runner spawn: dll={:?} scene={:?}",
                 dll_path,
