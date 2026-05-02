@@ -43,6 +43,7 @@ use omoba_core::GameEventData;
 pub use fyrox;
 
 mod sprite_resources;
+mod lockstep_client;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -775,6 +776,11 @@ pub struct Game {
     // --- Network ---
     #[visit(skip)] #[reflect(hidden)]
     network: Option<NetworkBridge>,
+    /// Phase 2 lockstep client (KCP tags 0x10-0x16). Logging-only consumer
+    /// of TickBatch / StateHash; runs in parallel with `network` (legacy
+    /// GameEvent stream) until Phase 3 retires the latter.
+    #[visit(skip)] #[reflect(hidden)]
+    lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
     #[visit(skip)] #[reflect(hidden)]
     connection_status: ConnectionStatus,
     #[visit(skip)] #[reflect(hidden)]
@@ -1422,8 +1428,20 @@ impl Plugin for Game {
         let player_name = std::env::var("OMB_PLAYER_NAME")
             .unwrap_or_else(|_| "omfx_player".to_string());
 
-        self.network = Some(NetworkBridge::spawn(server_addr, player_name));
+        self.network = Some(NetworkBridge::spawn(server_addr.clone(), player_name.clone()));
         self.connection_status = ConnectionStatus::Connecting;
+
+        // Phase 2 lockstep wire-up. Runs as a separate background thread on
+        // its own KCP connection; logging-only consumer of TickBatch /
+        // StateHash. Phase 3 will replace the legacy NetworkBridge consumer
+        // with a sim driven by these frames.
+        let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME")
+            .unwrap_or_else(|_| format!("{}_lockstep", player_name));
+        self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
+            server_addr,
+            lockstep_player_name,
+        ));
+
         self.event_buffer = Some(EventBuffer::new());
         self.network_entities = HashMap::new();
         self.client_projectiles = HashMap::new();
@@ -1435,6 +1453,10 @@ impl Plugin for Game {
     fn on_deinit(&mut self, _context: PluginContext) -> GameResult {
         // Drop network bridge (threads will stop when channels disconnect)
         self.network = None;
+        // Drop lockstep client too (input_tx drop + events_rx drop → bg
+        // thread exits on next iteration when its async recv returns None
+        // from the kcp reader / when its select sees disconnected channels).
+        self.lockstep_handle = None;
 
         // Drop the backend guard — its Drop impl kills the child and closes the Job Object.
         // (If Drop doesn't run, e.g. on hard kill, the OS still terminates the backend
@@ -1492,6 +1514,36 @@ impl Plugin for Game {
                     self.last_sent_viewport = Some((0.0, 0.0, half_width, half_height));
                 }
                 self.connection_status = status;
+            }
+        }
+
+        // Phase 2 lockstep diagnostics. Drain forwarded events from the
+        // bg thread and log them. TickBatch is sampled every 60 ticks
+        // (≈1s @ 60Hz) to avoid log spam; everything else logs every time.
+        if let Some(ref lh) = self.lockstep_handle {
+            while let Ok(ev) = lh.events_rx.try_recv() {
+                match ev {
+                    lockstep_client::LockstepEvent::Connected { master_seed, player_id } => {
+                        log::info!(
+                            "[lockstep] connected master_seed=0x{:016x} player_id={}",
+                            master_seed, player_id
+                        );
+                    }
+                    lockstep_client::LockstepEvent::TickBatch { tick, num_inputs, num_server_events } => {
+                        if tick % 60 == 0 {
+                            log::debug!(
+                                "[lockstep] tick={} inputs={} events={}",
+                                tick, num_inputs, num_server_events
+                            );
+                        }
+                    }
+                    lockstep_client::LockstepEvent::StateHash { tick, hash } => {
+                        log::info!("[lockstep] state_hash@{}=0x{:016x}", tick, hash);
+                    }
+                    lockstep_client::LockstepEvent::Disconnected { reason } => {
+                        log::warn!("[lockstep] disconnected: {}", reason);
+                    }
+                }
             }
         }
 
