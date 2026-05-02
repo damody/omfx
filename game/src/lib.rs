@@ -1421,6 +1421,34 @@ impl Plugin for Game {
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
                 self.render_bridge.update(&*snapshot, scene);
+
+                // Phase 5.x: HUD heartbeat sourced from sim snapshot
+                // (NetworkBridge GameEvent stream was cut in Phase 5.1; this
+                // restores tick / entity / hero / creep counts on the top-line
+                // status text and hp / max_hp on the hero panel).
+                self.heartbeat.tick = snapshot.tick as u64;
+                // sim_runner runs at the lockstep tick rate (60 Hz pacer).
+                self.heartbeat.game_time = (snapshot.tick as f64) / 60.0;
+                self.heartbeat.entity_count = snapshot.entities.len() as u64;
+                self.heartbeat.hero_count = snapshot.entities.iter()
+                    .filter(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
+                    .count() as u64;
+                self.heartbeat.creep_count = snapshot.entities.iter()
+                    .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
+                    .count() as u64;
+
+                // First Hero entity drives the basic hero panel. Full stats
+                // (mana / level / gold / abilities / inventory) need EntityRenderData
+                // widening + omb-side hero stats serialization — Phase 5.x followup.
+                if let Some(hero) = snapshot.entities.iter()
+                    .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
+                {
+                    self.hero_state.hp = hero.hp as f32;
+                    self.hero_state.max_hp = hero.max_hp as f32;
+                    if self.hero_state.name.is_empty() {
+                        self.hero_state.name = "(sim)".to_string();
+                    }
+                }
             }
         }
 
