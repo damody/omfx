@@ -206,11 +206,23 @@ fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Err
     Ok(world)
 }
 
-fn push_inputs_into_world(_world: &mut World, tick: u32, inputs: Vec<(u32, PlayerInput)>) {
-    // Phase 3.2 placeholder: just log. Phase 3.3 will write a
-    // `PendingPlayerInputs` resource consumed by player_tick / hero_tick.
+fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, PlayerInput)>) {
+    // Phase 3.4: write the lockstep TickBatch inputs into the host's
+    // `PendingPlayerInputs` resource so omb's `tick::player_input_tick::Sys`
+    // can drain them at the start of the dispatcher run.
+    //
+    // Replaces the resource map wholesale (lockstep contract: at most one
+    // input per player per tick — the latest TickBatch is authoritative).
+    use omobab::comp::PendingPlayerInputs;
+
+    let mut pending = world.write_resource::<PendingPlayerInputs>();
+    pending.tick = tick;
+    pending.by_player.clear();
     if !inputs.is_empty() {
         log::trace!("sim_runner: tick {} got {} inputs", tick, inputs.len());
+    }
+    for (player_id, input) in inputs {
+        pending.by_player.insert(player_id, input);
     }
 }
 

@@ -45,6 +45,7 @@ pub use fyrox;
 mod sprite_resources;
 mod lockstep_client;
 mod sim_runner;
+mod render_bridge;
 
 /// Bridge between the two distinct `PlayerInput` Rust types: omoba_core's
 /// kcp client uses its own prost-generated copy of `proto/game.proto`,
@@ -813,6 +814,13 @@ pub struct Game {
     /// `master_seed_rx.recv()` and never ticks.
     #[visit(skip)] #[reflect(hidden)]
     sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
+    /// Phase 3.4 render bridge: reads `SimWorldSnapshot` per frame and
+    /// (Phase 4) spawns / updates / despawns Fyrox sprites for each entity.
+    /// Currently a stub that logs entity render data. Always allocated
+    /// (cheap default) so the per-frame check in `update` is just a method
+    /// call, not an `Option` unwrap.
+    #[visit(skip)] #[reflect(hidden)]
+    render_bridge: render_bridge::RenderBridge,
     #[visit(skip)] #[reflect(hidden)]
     connection_status: ConnectionStatus,
     #[visit(skip)] #[reflect(hidden)]
@@ -1638,6 +1646,19 @@ impl Plugin for Game {
                         log::warn!("[lockstep] disconnected: {}", reason);
                     }
                 }
+            }
+        }
+
+        // Phase 3.4: read latest sim snapshot and (stub) update render
+        // bridge. Acquired with `try_lock` so a slow render frame doesn't
+        // block the sim worker — if the lock is contended we just skip
+        // this frame and pick up the next snapshot. Phase 4 will replace
+        // the stub `update` body with real Fyrox sprite spawn / update /
+        // despawn, retiring the NetworkBridge GameEvent → sprite pipeline
+        // below for the entities the sim authoritatively owns.
+        if let Some(ref sim) = self.sim_runner_handle {
+            if let Ok(snapshot) = sim.state.try_lock() {
+                self.render_bridge.update(&*snapshot, scene);
             }
         }
 
