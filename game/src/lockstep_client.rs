@@ -189,8 +189,20 @@ async fn run_client(
                 // a server bug. Log + ignore.
                 warn!("lockstep-client got unexpected GameStart after join — ignoring");
             }
-            Some(LockstepInbound::SnapshotResp(_)) => {
-                info!("lockstep-client received SnapshotResp (Phase 2 ignores)");
+            Some(LockstepInbound::SnapshotResp(resp)) => {
+                // Phase 5.3: server now serves real bincode-serialized
+                // WorldSnapshot bytes (was empty stub in Phase 2). Client-side
+                // fast-forward (deserialize + apply to sim_runner) is a Phase
+                // 5+ followup once observer mode is actually exercised. For
+                // now, log enough info to confirm the wire path is alive.
+                let (bytes_len, schema) = match &resp.state {
+                    Some(s) => (s.world_bytes.len(), s.schema_version),
+                    None => (0, 0),
+                };
+                info!(
+                    "lockstep-client received SnapshotResp tick={} bytes={} schema={} (Phase 5.3 logs only; apply is Phase 5+)",
+                    resp.tick, bytes_len, schema
+                );
             }
             None => {
                 warn!("lockstep-client stream closed");
