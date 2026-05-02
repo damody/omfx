@@ -1491,13 +1491,15 @@ impl Plugin for Game {
         let player_name = std::env::var("OMB_PLAYER_NAME")
             .unwrap_or_else(|_| "omfx_player".to_string());
 
-        self.network = Some(NetworkBridge::spawn(server_addr.clone(), player_name.clone()));
-        self.connection_status = ConnectionStatus::Connecting;
+        // Phase 5.1: NetworkBridge consumer cut. Phase 4.5 flipped omb's
+        // `legacy_broadcast` default OFF so the 0x02 GameEvent stream is
+        // silent. Lockstep (KCP tags 0x10–0x16) is now the sole input/state
+        // wire — driven by `lockstep_handle` below + sim_runner + render_bridge.
+        self.connection_status = ConnectionStatus::Connected;
 
-        // Phase 2 lockstep wire-up. Runs as a separate background thread on
-        // its own KCP connection; logging-only consumer of TickBatch /
-        // StateHash. Phase 3 will replace the legacy NetworkBridge consumer
-        // with a sim driven by these frames.
+        // Lockstep wire-up. Runs as a background thread on its own KCP
+        // connection. TickBatch / StateHash drive the local sim_runner
+        // (Phase 3.x) which renders via render_bridge (Phase 4.2).
         let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME")
             .unwrap_or_else(|_| format!("{}_lockstep", player_name));
         self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
@@ -1537,20 +1539,17 @@ impl Plugin for Game {
             self.sim_runner_handle = Some(sim_runner::spawn_sim_runner(dll_path, scene_path));
         }
 
-        self.event_buffer = Some(EventBuffer::new());
-        self.network_entities = HashMap::new();
-        self.client_projectiles = HashMap::new();
-        self.pending_pred_dmg = HashMap::new();
+        // Phase 5.1: legacy NetworkBridge / EventBuffer / network_entities /
+        // client_projectiles state no longer initialized — the consumer is gone.
+        // (Field declarations remain to be removed in the same Phase 5.1 cut.)
 
         Ok(())
     }
 
     fn on_deinit(&mut self, _context: PluginContext) -> GameResult {
-        // Drop network bridge (threads will stop when channels disconnect)
-        self.network = None;
-        // Drop lockstep client too (input_tx drop + events_rx drop → bg
-        // thread exits on next iteration when its async recv returns None
-        // from the kcp reader / when its select sees disconnected channels).
+        // Phase 5.1: NetworkBridge no longer owned; nothing to drop here.
+        // Drop lockstep client (input_tx drop + events_rx drop → bg thread
+        // exits on next iteration when its select sees disconnected channels).
         self.lockstep_handle = None;
         // Drop sim_runner. Channel disconnect signals the worker to
         // exit (whether it's still blocked on master_seed_rx.recv() or
@@ -1598,23 +1597,9 @@ impl Plugin for Game {
             ));
         }
 
-        // 1. Check connection status
-        if let Some(ref network) = self.network {
-            while let Ok(status) = network.status_rx.try_recv() {
-                if status == ConnectionStatus::Connected && self.connection_status != ConnectionStatus::Connected {
-                    // Send initial viewport on first connect (or reconnect — omb session is fresh,
-                    // must seed it before any visibility diff can run).
-                    let aspect = self.window_size.x / self.window_size.y;
-                    let half_height = 10.0 / WORLD_SCALE; // vertical_size in game coords
-                    let half_width = 10.0 * aspect / WORLD_SCALE;
-                    let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
-                        cx: 0.0, cy: 0.0, hw: half_width, hh: half_height,
-                    });
-                    self.last_sent_viewport = Some((0.0, 0.0, half_width, half_height));
-                }
-                self.connection_status = status;
-            }
-        }
+        // Phase 5.1: connection status / initial viewport drain removed
+        // (tracked the legacy NetworkBridge handshake which no longer exists).
+        // Lockstep `Connected` event below is now the canonical "we're up" signal.
 
         // Phase 3.3: drain lockstep events and forward to sim_runner.
         // - Connected → push master_seed (unblocks worker's blocking recv)
@@ -1715,144 +1700,11 @@ impl Plugin for Game {
             self.fps_display = format!("FPS {} ({:.1}ms)", render_fps, frame_ms);
         }
 
-        // 2. Receive events from NetworkBridge, push into EventBuffer
+        // Phase 5.1: NetworkBridge event drain + EventBuffer + heartbeat hp/pos
+        // reconciliation removed. Lockstep TickBatch (above) is the sole tick
+        // source; render_bridge owns sprite spawn/update/despawn from sim state.
         let t_events = std::time::Instant::now();
-        let mut events_drained_local: u64 = 0;
-        if let (Some(ref network), Some(ref mut buffer)) = (&self.network, &mut self.event_buffer) {
-            let mut pending_hp_sync: Option<serde_json::Value> = None;
-            // P4: buffer heartbeat pos_snapshot for post-lerp drift correction.
-            let mut pending_pos_sync: Option<serde_json::Value> = None;
-            // P7 layered: defer pending retain to AFTER hp_sync so authoritative
-            // is updated before we drop applied entries — otherwise display
-            // briefly = old_auth-0 = old_auth (UP) before hp_sync brings it
-            // down again (the「減少→增加→減少」flicker).
-            let mut pending_in_flight_set: Option<std::collections::HashSet<u32>> = None;
-            for evt in network.event_rx.try_iter() {
-                // 位元數來自 KCP/gRPC client 解包時記錄的 data_json.len()，
-                // 不在這裡做 serde_json::to_string — 那會讓 hot path 每 event 多一次 heap alloc。
-                // logical: 解壓後的 prost payload + shim 重建的字串開銷（HUD 看「應用層」量）
-                self.net_bytes_current += (evt.msg_type.len() + evt.action.len() + evt.payload_bytes + 16) as u64;
-                // wire: KCP/UDP 上的真實 bytes (LZ4 壓縮後 + 1+4 byte framing)
-                self.net_wire_bytes_current += evt.wire_bytes as u64;
-                // Heartbeat: calibrate clock immediately, don't buffer
-                if evt.msg_type == "heartbeat" && evt.action == "tick" {
-                    buffer.sync_clock(evt.timestamp_ms);
-                    if let Some(delay) = evt.data.get("render_delay_ms").and_then(|v| v.as_u64()) {
-                        buffer.render_delay_ms = delay;
-                    }
-                    self.heartbeat = parse_heartbeat(&evt.data);
-                    if let Some(snap) = evt.data.get("hp_snapshot").cloned() {
-                        pending_hp_sync = Some(snap);
-                    }
-                    if let Some(snap) = evt.data.get("pos_snapshot").cloned() {
-                        pending_pos_sync = Some(snap);
-                    }
-                    // P7 layered: server 告訴我們哪幾個 predeclared projectile 還在飛。
-                    // 不在這集合內的 pending entry 表示 server 那邊已結算（命中
-                    // 的話 hp_snapshot 帶來新 hp、cancel 的話沒效應），retain 操作
-                    // 必須延到 hp_sync 之後，避免 display 在 auth 還沒更新時瞬間
-                    // 失去 applied 預測扣血造成往上跳的 flicker。
-                    if let Some(arr) = evt.data.get("in_flight_projectiles").and_then(|v| v.as_array()) {
-                        let set: std::collections::HashSet<u32> = arr
-                            .iter()
-                            .filter_map(|v| v.as_u64().map(|n| n as u32))
-                            .collect();
-                        pending_in_flight_set = Some(set);
-                    }
-                } else {
-                    buffer.push(evt);
-                }
-            }
-
-            // 3. Drain ready events from buffer and render
-            for evt in buffer.drain_ready() {
-                events_drained_local += 1;
-                self.apply_event(evt, scene);
-            }
-
-            // Heartbeat HP reconciliation: overwrite client-predicted HP with the
-            // authoritative backend snapshot (corrects drift accumulated from
-            // optimistic damage prediction + missed/overshot hits).
-            //
-            // Task 1.5 (2026-04-24): server switched to compact keys `{"i": id, "h": hp}`
-            // and dropped max_hp. We keep whatever max_hp the entity already had (from
-            // creep.create / hero_stats / prior snapshot). Entities we've never seen a
-            // max_hp for are rare (spawned before client connected) — use hp as a
-            // temporary upper bound so the bar still renders sanely.
-            if let Some(snap) = pending_hp_sync {
-                if let Some(arr) = snap.as_array() {
-                    for item in arr {
-                        let id = item.get("i").and_then(|v| v.as_u64()).map(|v| v as u32);
-                        let hp = item.get("h").and_then(|v| v.as_f64()).map(|v| v as f32);
-                        if let (Some(id), Some(h)) = (id, hp) {
-                            if let Some(entity) = self.network_entities.get_mut(&id) {
-                                let max_hp = entity.health.map(|(_, m)| m).unwrap_or(h.max(1.0));
-                                entity.health = Some((h, max_hp));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // P7 layered: now that authoritative hp is updated, drop pending
-            // entries the server says have settled. Doing this AFTER hp_sync
-            // means display = new_auth - 0 = new_auth (smooth) instead of
-            // old_auth - 0 = old_auth (flicker UP).
-            if let Some(in_flight_set) = pending_in_flight_set {
-                self.pending_pred_dmg.retain(|proj_id, _| in_flight_set.contains(proj_id));
-            }
-
-            // P4: position drift correction from heartbeat pos_snapshot (10% sample
-            // of viewport-visible creeps). For each entry compare client's
-            // extrapolated pos to server's authoritative pos; if drift exceeds
-            // DRIFT_SNAP_THRESHOLD world units, snap to server pos and reset the
-            // extrapolation anchor so subsequent extrapolation re-accumulates error
-            // from zero.
-            if let Some(pos_snap) = pending_pos_sync {
-                const DRIFT_SNAP_THRESHOLD: f32 = 4.0; // world units
-                let threshold_render = DRIFT_SNAP_THRESHOLD * WORLD_SCALE;
-                let threshold_render_sq = threshold_render * threshold_render;
-                if let Some(arr) = pos_snap.as_array() {
-                    for item in arr {
-                        let id = item.get("i").and_then(|v| v.as_u64()).map(|v| v as u32);
-                        let sx = item.get("x").and_then(|v| v.as_f64()).map(|v| v as f32 * WORLD_SCALE);
-                        let sy = item.get("y").and_then(|v| v.as_f64()).map(|v| v as f32 * WORLD_SCALE);
-                        if let (Some(id), Some(sx), Some(sy)) = (id, sx, sy) {
-                            let server_pos = Vector2::new(sx, sy);
-                            if let Some(entity) = self.network_entities.get_mut(&id) {
-                                let dx = entity.position.x - server_pos.x;
-                                let dy = entity.position.y - server_pos.y;
-                                if dx * dx + dy * dy > threshold_render_sq {
-                                    // Snap + re-anchor. Keep direction + velocity so
-                                    // the creep continues toward its known target from
-                                    // the corrected anchor without a "hard reset" feel.
-                                    entity.position = server_pos;
-                                    entity.prev_position = server_pos;
-                                    entity.extrap_start_pos = server_pos;
-                                    entity.extrap_elapsed = 0.0;
-                                    // Recompute duration from the snapped start to the
-                                    // known target using current velocity so we don't
-                                    // over/under-shoot after the snap.
-                                    let tdx = entity.target_position.x - server_pos.x;
-                                    let tdy = entity.target_position.y - server_pos.y;
-                                    let dist_render = (tdx * tdx + tdy * tdy).sqrt();
-                                    if dist_render > f32::EPSILON {
-                                        entity.extrap_direction = Vector2::new(tdx / dist_render, tdy / dist_render);
-                                        let dist_backend = dist_render / WORLD_SCALE;
-                                        if entity.extrap_velocity > 1.0 {
-                                            entity.extrap_duration = (dist_backend / entity.extrap_velocity).clamp(0.01, 3600.0);
-                                        }
-                                    }
-                                    entity.lerp_elapsed = 0.0;
-                                    entity.lerp_duration = entity.extrap_duration.max(0.01);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        let events_drained_local: u64 = 0;
         let events_ns = t_events.elapsed().as_nanos();
 
         // 4. Interpolate entity positions (client-side lerp)
@@ -2314,55 +2166,17 @@ impl Plugin for Game {
                 self.td_camera_configured = true;
                 log::info!("🎥 TD 相機已鎖定：center=(0,0), vertical_size=14");
 
-                // 一次性送 viewport 給後端（涵蓋整張地圖）
-                if let Some(ref network) = self.network {
-                    let aspect = self.window_size.x / self.window_size.y.max(1.0);
-                    let half_height = 14.0 / WORLD_SCALE;
-                    let half_width = 14.0 * aspect / WORLD_SCALE;
-                    let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
-                        cx: 0.0,
-                        cy: 0.0,
-                        hw: half_width,
-                        hh: half_height,
-                    });
-                }
+                // Phase 5.1: viewport push to legacy NetworkBridge removed.
+                // Lockstep state is broadcast in full to all clients regardless
+                // of viewport, so this hint is no longer needed.
             }
         } else {
             // MOBA 模式：相機不再跟隨英雄移動。保留 camera 在 scene.rgs 載入時的初始位置，
             // camera_world_pos 從 camera 當前 transform 反推（X 渲染負號 → world.x = -cam.x），
-            // 確保 name label 螢幕投影 (L~1806) 與 mouse_world_pos (L~2291) 仍正確。
-            // viewport 週期性同步到後端用 camera 實際位置（之後若加滑鼠拖曳鏡頭仍能正確同步）。
+            // 確保 name label 螢幕投影仍正確。
             let cam_pos = scene.graph[self.camera].local_transform().position();
             self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
-
-            self.viewport_sync_elapsed += dt;
-            if self.viewport_sync_elapsed >= 0.5 {
-                self.viewport_sync_elapsed = 0.0;
-                if let Some(ref network) = self.network {
-                    let aspect = self.window_size.x / self.window_size.y.max(1.0);
-                    let half_height = 10.0 / WORLD_SCALE;
-                    let half_width = 10.0 * aspect / WORLD_SCALE;
-                    let cx = self.camera_world_pos.x / WORLD_SCALE;
-                    let cy = self.camera_world_pos.y / WORLD_SCALE;
-                    let next = (cx, cy, half_width, half_height);
-                    let changed = match self.last_sent_viewport {
-                        None => true,
-                        Some(prev) => {
-                            const EPS: f32 = 1e-3;
-                            (prev.0 - next.0).abs() > EPS
-                                || (prev.1 - next.1).abs() > EPS
-                                || (prev.2 - next.2).abs() > EPS
-                                || (prev.3 - next.3).abs() > EPS
-                        }
-                    };
-                    if changed {
-                        let _ = network.cmd_tx.send(NetCommand::ViewportUpdate {
-                            cx, cy, hw: half_width, hh: half_height,
-                        });
-                        self.last_sent_viewport = Some(next);
-                    }
-                }
-            }
+            // Phase 5.1: periodic viewport sync to NetworkBridge removed.
         }
 
         let cam_ns = t_cam.elapsed().as_nanos();
@@ -2990,10 +2804,9 @@ impl Plugin for Game {
                         && !self.round_is_running
                         && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
                     {
-                        if let Some(ref network) = self.network {
-                            let _ = network.cmd_tx.send(NetCommand::StartRound);
-                        }
-                        log::info!("📣 送出 Start Round 指令");
+                        // Phase 5.1: legacy NetCommand::StartRound send removed.
+                        // TODO Phase 5.x: route StartRound through lockstep PlayerInput.
+                        log::info!("[phase5.1] Start Round button pressed (legacy send removed; lockstep round-control pending)");
                         hit_ui = true;
                     }
                 }
@@ -3028,11 +2841,9 @@ impl Plugin for Game {
                         && screen.y >= by && screen.y <= by + bh
                     {
                         if let Some(tid) = self.selected_tower_entity {
-                            if let Some(ref network) = self.network {
-                                let _ = network.cmd_tx.send(NetCommand::SellTower { tower_id: tid });
-                            }
-                            log::info!("📣 送出 Sell Tower id={}", tid);
-                            // 本地先樂觀清空，後端確認 delete 事件後 UI 自然關閉
+                            // Phase 5.1: legacy NetCommand::SellTower send removed.
+                            // TODO Phase 5.x: route SellTower through lockstep PlayerInput.
+                            log::info!("[phase5.1] Sell Tower id={} (legacy send removed)", tid);
                             self.selected_tower_entity = None;
                         }
                         hit_ui = true;
@@ -3048,11 +2859,9 @@ impl Plugin for Game {
                             && screen.y >= by && screen.y < by + bh
                         {
                             if let Some(tid) = self.selected_tower_entity {
-                                if let Some(ref network) = self.network {
-                                    let _ = network.cmd_tx.send(
-                                        NetCommand::UpgradeTower { tower_id: tid, path });
-                                }
-                                log::info!("📣 送出 Upgrade Tower id={} path={}", tid, path);
+                                // Phase 5.1: legacy NetCommand::UpgradeTower send removed.
+                                // TODO Phase 5.x: route UpgradeTower through lockstep PlayerInput.
+                                log::info!("[phase5.1] Upgrade Tower id={} path={} (legacy send removed)", tid, path);
                             }
                             hit_ui = true;
                             break;
@@ -3064,13 +2873,12 @@ impl Plugin for Game {
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
-                        if let Some(ref network) = self.network {
-                            let _ = network.cmd_tx.send(NetCommand::PlaceTower {
-                                kind,
-                                x: world_pos.x / WORLD_SCALE,
-                                y: world_pos.y / WORLD_SCALE,
-                            });
-                        }
+                        // Phase 5.1: legacy NetCommand::PlaceTower send removed.
+                        // TODO Phase 5.x: route PlaceTower through lockstep PlayerInput.
+                        log::info!(
+                            "[phase5.1] Place Tower kind={} at ({:.1},{:.1}) (legacy send removed)",
+                            kind, world_pos.x / WORLD_SCALE, world_pos.y / WORLD_SCALE
+                        );
                         if !self.ctrl_held {
                             self.selected_tower_kind = None;
                         }
@@ -3121,17 +2929,9 @@ impl Plugin for Game {
                     self.selected_tower_entity = None;
                     log::info!("RMB 取消選中塔");
                 } else {
+                    // Phase 5.1: legacy NetCommand::HeroMove removed; lockstep
+                    // PlayerInput::MoveTo (below) is the sole authoritative path.
                     let world_pos = self.mouse_world_pos;
-                    if let Some(ref network) = self.network {
-                        let _ = network.cmd_tx.send(NetCommand::HeroMove {
-                            x: world_pos.x / WORLD_SCALE,
-                            y: world_pos.y / WORLD_SCALE,
-                        });
-                    }
-                    // Phase 4.3: parallel lockstep input. PlayerInput::MoveTo
-                    // travels via `LockstepClientHandle.input_tx` → omb's
-                    // lockstep scheduler. Coexists with the legacy
-                    // NetworkBridge HeroMove above; Phase 4.5 cuts the latter.
                     let target = world_render_to_vec2i(world_pos);
                     let move_to = omoba_core::kcp::game_proto::MoveTo {
                         target: Some(target),
@@ -3176,17 +2976,17 @@ impl Plugin for Game {
                 if !pressed { return Ok(()); }
 
                 let world = self.mouse_world_pos;
-                let tx = self.network.as_ref().map(|n| n.cmd_tx.clone());
-                let send = |cmd: NetCommand| {
-                    if let Some(ref t) = tx { let _ = t.send(cmd); }
+                // Phase 5.1: legacy `tx` / `send` closure (NetworkBridge cmd_tx)
+                // removed. UpgradeSkill / BuyItem / SellItem / UseItem are now
+                // logged-only stubs pending a Phase 5.x lockstep PlayerInput
+                // extension; W/E/R/T cast already routes through lockstep below.
+                let send_stub = |label: &str, args: &str| {
+                    log::info!("[phase5.1] legacy {} send removed (args={})", label, args);
                 };
 
-                // Phase 4.3: any Q/W/E/R press → parallel lockstep
-                // PlayerInput::CastAbility (ability_index 0/1/2/3). Runs
-                // alongside the legacy NetworkBridge CastAbility path
-                // (Phase 4.5 cuts legacy). Mouse world pos becomes the
-                // optional `target_pos`. Modifier-held cases (Shift = upgrade,
-                // not cast) are excluded.
+                // Q/W/E/R press → lockstep PlayerInput::CastAbility (ability_index
+                // 0/1/2/3). Mouse world pos becomes the optional `target_pos`.
+                // Modifier-held cases (Shift = upgrade, not cast) are excluded.
                 if !self.shift_held {
                     let ability_index_opt = match key {
                         KeyCode::KeyQ => Some(0u32),
@@ -3223,31 +3023,14 @@ impl Plugin for Game {
                             _ => unreachable!(),
                         }.to_string();
                         if self.shift_held {
-                            send(NetCommand::UpgradeSkill { slot });
+                            // Phase 5.1: legacy UpgradeSkill removed; lockstep
+                            // doesn't yet wire ability upgrade — pending Phase 5.x.
+                            send_stub("UpgradeSkill", &slot);
                         } else {
-                            // 本地樂觀啟動冷卻（後端真正拒絕時後續事件會校正）
-                            let slot_idx = match slot.as_str() {
-                                "W" => 0, "E" => 1, "R" => 2, "T" => 3, _ => 0,
-                            };
-                            let id = self.hero_state.abilities.get(slot_idx).cloned().unwrap_or_default();
-                            if !id.is_empty() {
-                                let cur_lvl = self.hero_state.ability_levels.get(&id).copied().unwrap_or(0);
-                                if cur_lvl > 0 {
-                                    if let Some(info) = self.ability_info_map.get(&id) {
-                                        let idx = (cur_lvl as usize - 1).min(info.cooldown.len().saturating_sub(1));
-                                        if let Some(&cd) = info.cooldown.get(idx) {
-                                            if cd > 0.0 {
-                                                self.hero_state.ability_cd.insert(id.clone(), cd);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            send(NetCommand::CastAbility {
-                                slot,
-                                x: world.x / WORLD_SCALE,
-                                y: world.y / WORLD_SCALE,
-                            });
+                            // Cast already sent via lockstep above; nothing to do here.
+                            // (Optimistic local cooldown bookkeeping was driven by
+                            // legacy hero_state cache that is going away with apply_event.)
+                            let _ = (slot, world);
                         }
                     }
                     KeyCode::KeyB => {
@@ -3295,16 +3078,17 @@ impl Plugin for Game {
                             KeyCode::Digit8 => 8, KeyCode::Digit9 => 9,
                             _ => unreachable!(),
                         };
+                        // Phase 5.1: legacy BuyItem / SellItem / UseItem removed
+                        // (item shop not yet on lockstep wire).
                         if self.shop_visible {
                             if let Some((id, _, _)) = SHOP_ITEMS.get(idx) {
-                                send(NetCommand::BuyItem { item_id: id.to_string() });
+                                send_stub("BuyItem", id);
                             }
                         } else if idx >= 1 && idx <= 6 {
-                            // 使用 inventory slot (1-6 → 0-5)
                             if self.shift_held {
-                                send(NetCommand::SellItem { slot: idx - 1 });
+                                send_stub("SellItem", &(idx - 1).to_string());
                             } else {
-                                send(NetCommand::UseItem { slot: idx - 1 });
+                                send_stub("UseItem", &(idx - 1).to_string());
                             }
                         }
                     }
