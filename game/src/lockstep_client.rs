@@ -28,7 +28,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use log::{error, info, warn};
 
 use omoba_core::kcp::client::LockstepInbound;
-use omoba_core::kcp::game_proto::PlayerInput;
+use omoba_core::kcp::game_proto::{PlayerInput, ServerEvent};
 use omoba_core::KcpClient;
 
 /// Diagnostics events forwarded from the lockstep background thread to the
@@ -37,7 +37,14 @@ use omoba_core::KcpClient;
 #[derive(Debug, Clone)]
 pub enum LockstepEvent {
     Connected { master_seed: u64, player_id: u32 },
-    TickBatch { tick: u32, num_inputs: usize, num_server_events: usize },
+    /// Phase 3.3: carry the full TickBatch payload (inputs + server events)
+    /// rather than just counts, so the sim_runner can drive its ECS
+    /// dispatcher with the actual player inputs.
+    TickBatch {
+        tick: u32,
+        inputs: Vec<(u32 /* player_id */, PlayerInput)>,
+        server_events: Vec<ServerEvent>,
+    },
     StateHash { tick: u32, hash: u64 },
     Disconnected { reason: String },
 }
@@ -155,10 +162,20 @@ async fn run_client(
     loop {
         match rx.recv().await {
             Some(LockstepInbound::TickBatch(b)) => {
+                // Phase 3.3: extract `Vec<(player_id, PlayerInput)>` from the
+                // generated `InputForPlayer` rows. Drop entries whose `input`
+                // field is None (proto optional message — should not happen
+                // in well-formed server output, but be defensive).
+                let inputs: Vec<(u32, PlayerInput)> = b
+                    .inputs
+                    .into_iter()
+                    .filter_map(|ifp| ifp.input.map(|inp| (ifp.player_id, inp)))
+                    .collect();
+                let server_events = b.server_events;
                 let _ = events_tx.send(LockstepEvent::TickBatch {
                     tick: b.tick,
-                    num_inputs: b.inputs.len(),
-                    num_server_events: b.server_events.len(),
+                    inputs,
+                    server_events,
                 });
             }
             Some(LockstepInbound::StateHash(sh)) => {

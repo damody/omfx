@@ -22,6 +22,9 @@ omobab = { path = "../../omb", default-features = false, features = ["kcp"] }
 specs = { path = "../../specs", features = ["derive", "serde"] }
 omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }
 failure = "0.1.8"
+# Phase 3.3: needed for re-encoding PlayerInput across the omoba_core /
+# omobab proto-type boundary at the lockstep → sim_runner bridge.
+prost = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

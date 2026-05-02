@@ -46,6 +46,30 @@ mod sprite_resources;
 mod lockstep_client;
 mod sim_runner;
 
+/// Bridge between the two distinct `PlayerInput` Rust types: omoba_core's
+/// kcp client uses its own prost-generated copy of `proto/game.proto`,
+/// while omobab (omb-as-lib) generates the same proto into a separate
+/// crate-local module. They're identical wire format, so we round-trip
+/// via prost encode/decode at the boundary instead of hand-mapping every
+/// PlayerInput oneof variant.
+fn convert_player_input(
+    src: &omoba_core::kcp::game_proto::PlayerInput,
+) -> Option<sim_runner::PlayerInput> {
+    use prost::Message;
+    let mut buf = Vec::with_capacity(src.encoded_len());
+    if let Err(e) = src.encode(&mut buf) {
+        log::error!("[lockstep] convert_player_input encode failed: {}", e);
+        return None;
+    }
+    match sim_runner::PlayerInput::decode(buf.as_slice()) {
+        Ok(out) => Some(out),
+        Err(e) => {
+            log::error!("[lockstep] convert_player_input decode failed: {}", e);
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -1552,10 +1576,22 @@ impl Plugin for Game {
             }
         }
 
-        // Phase 2 lockstep diagnostics. Drain forwarded events from the
-        // bg thread and log them. TickBatch is sampled every 60 ticks
-        // (≈1s @ 60Hz) to avoid log spam; everything else logs every time.
-        if let Some(ref lh) = self.lockstep_handle {
+        // Phase 3.3: drain lockstep events and forward to sim_runner.
+        // - Connected → push master_seed (unblocks worker's blocking recv)
+        // - TickBatch → convert inputs (omoba_core proto type → omobab proto
+        //   type) and push as TickBatchPayload so the worker advances its
+        //   ECS dispatcher one tick. Both crates generate the same
+        //   `proto/game.proto` independently, so we round-trip via prost
+        //   encode/decode at the boundary instead of hand-mapping every
+        //   PlayerInput variant.
+        // - StateHash → log only (Phase 3.4 will compare against the
+        //   sim_runner's local hash for desync detection).
+        // - Disconnected → log.
+        // TickBatch is sampled every 60 ticks (~1s @ 60Hz) to avoid log spam.
+        if let (Some(ref lh), Some(ref sim)) = (
+            self.lockstep_handle.as_ref(),
+            self.sim_runner_handle.as_ref(),
+        ) {
             while let Ok(ev) = lh.events_rx.try_recv() {
                 match ev {
                     lockstep_client::LockstepEvent::Connected { master_seed, player_id } => {
@@ -1563,17 +1599,40 @@ impl Plugin for Game {
                             "[lockstep] connected master_seed=0x{:016x} player_id={}",
                             master_seed, player_id
                         );
+                        if let Err(e) = sim.master_seed_tx.send(master_seed) {
+                            log::error!("[lockstep] failed to forward master_seed: {}", e);
+                        }
                     }
-                    lockstep_client::LockstepEvent::TickBatch { tick, num_inputs, num_server_events } => {
+                    lockstep_client::LockstepEvent::TickBatch { tick, inputs, server_events } => {
                         if tick % 60 == 0 {
                             log::debug!(
                                 "[lockstep] tick={} inputs={} events={}",
-                                tick, num_inputs, num_server_events
+                                tick, inputs.len(), server_events.len()
                             );
                         }
+                        // Bridge omoba_core's PlayerInput type → omobab's
+                        // PlayerInput type via prost re-encode. They are
+                        // identical wire format but distinct Rust types.
+                        let converted: Vec<(u32, sim_runner::PlayerInput)> = inputs
+                            .into_iter()
+                            .filter_map(|(pid, inp)| {
+                                convert_player_input(&inp).map(|out| (pid, out))
+                            })
+                            .collect();
+                        let payload = sim_runner::TickBatchPayload {
+                            tick,
+                            inputs: converted,
+                        };
+                        if let Err(e) = sim.tick_input_tx.send(payload) {
+                            log::error!("[lockstep] failed to forward tick batch: {}", e);
+                        }
+                        // server_events: Phase 3.3 ignored; Phase 5+ will
+                        // route them into the sim's event sink.
                     }
                     lockstep_client::LockstepEvent::StateHash { tick, hash } => {
                         log::info!("[lockstep] state_hash@{}=0x{:016x}", tick, hash);
+                        // Phase 3.4 will compare this against the
+                        // sim_runner's locally computed hash.
                     }
                     lockstep_client::LockstepEvent::Disconnected { reason } => {
                         log::warn!("[lockstep] disconnected: {}", reason);

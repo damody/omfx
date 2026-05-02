@@ -3980,6 +3980,7 @@ dependencies = [
  "omoba-core",
  "omoba-sim",
  "omobab",
+ "prost",
  "serde",
  "serde_json",
  "specs",
