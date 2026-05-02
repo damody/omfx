@@ -1489,10 +1489,13 @@ impl Plugin for Game {
         // verifies the worker thread spawn + symbol resolution.
         {
             use std::path::PathBuf;
+            // Default to omb/scripts/ where run.bat copies the freshly-built DLL
+            // (debug or release — whichever profile run.bat used). load_scripts_dir
+            // takes the parent dir and scans for .dll, so this works for both.
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
-                    PathBuf::from("D:/omoba/scripts/target/release/base_content.dll")
+                    PathBuf::from("D:/omoba/omb/scripts/base_content.dll")
                 });
             let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
                 .map(PathBuf::from)
