@@ -3073,9 +3073,18 @@ impl Game {
     /// on first sighting; frees slots on dropout. EntityKind::Other is
     /// skipped (internal ECS rows like RegionBlocker should not render).
     fn update_sim_batches(&mut self) {
-        let Some(ref sim) = self.sim_runner_handle else { return };
-        let Ok(snapshot) = sim.state.try_lock() else { return };
+        let Some(ref sim) = self.sim_runner_handle else {
+            log::trace!("update_sim_batches: no sim_runner_handle");
+            return;
+        };
+        let Ok(snapshot) = sim.state.try_lock() else {
+            log::trace!("update_sim_batches: snapshot try_lock contended");
+            return;
+        };
 
+        let body_present = self.body_batch.is_some();
+        let hp_present = self.hp_batch.is_some();
+        let mut wrote = 0u32;
         let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
         for e in &snapshot.entities {
             if matches!(e.kind, sim_runner::EntityKind::Other) {
@@ -3112,6 +3121,7 @@ impl Game {
                         z,
                     },
                 );
+                wrote += 1;
             }
 
             // HP bar (bg + fg). Alloc lazily — projectiles + entities w/o hp
@@ -3160,6 +3170,26 @@ impl Game {
                         );
                     }
                 }
+            }
+        }
+
+        // Periodic diagnostic so we know writes are landing on the batches.
+        if snapshot.tick % 60 == 0 {
+            let sample = snapshot.entities.iter().find(|e| !matches!(e.kind, sim_runner::EntityKind::Other));
+            if let Some(e) = sample {
+                let pos = render_bridge::world_to_render(e);
+                let slot = self.sim_entity_slots.get(&e.entity_id).map(|s| s.body_slot).unwrap_or(u32::MAX);
+                log::info!(
+                    "update_sim_batches: tick={} wrote={} slots={} body_batch={} hp_batch={} sample={{id={} kind={:?} backend=({:.0},{:.0}) render=({:.2},{:.2}) slot={}}}",
+                    snapshot.tick, wrote, self.sim_entity_slots.len(),
+                    body_present, hp_present,
+                    e.entity_id, e.kind, e.pos_x, e.pos_y, pos.x, pos.y, slot,
+                );
+            } else {
+                log::info!(
+                    "update_sim_batches: tick={} wrote={} (no non-Other entities) body_batch={} hp_batch={}",
+                    snapshot.tick, wrote, body_present, hp_present,
+                );
             }
         }
 
