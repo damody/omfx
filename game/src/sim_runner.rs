@@ -43,6 +43,20 @@ pub struct SimWorldSnapshot {
     /// `entity.death` event. Replaces the legacy omb-side `make_entity_death`
     /// emit; the snapshot diff is computed worker-locally each tick.
     pub removed_entity_ids: Vec<u32>,
+    /// TD wave number — 1-based current wave index. 0 before the first
+    /// `StartRound` flips `CurrentCreepWave.is_running`. Sourced from the
+    /// `CurrentCreepWave` resource (`wave: usize`, cast to u32 at the boundary).
+    pub round: u32,
+    /// Total number of creep waves loaded for the active scene. Sourced
+    /// from `Vec<CreepWave>` resource length. 0 in non-TD modes.
+    pub total_rounds: u32,
+    /// Current TD player lives (`PlayerLives.0`). 0 in non-TD modes (sentinel
+    /// flag — HUD switches mode based on `lives > 0`).
+    pub lives: i32,
+    /// True while a TD round is running (creeps spawning / on the path);
+    /// flips false once the wave is cleared. Mirrors
+    /// `CurrentCreepWave.is_running`.
+    pub round_is_running: bool,
 }
 
 /// Per-entity render data extracted from the ECS World at the end of
@@ -550,11 +564,35 @@ fn extract_snapshot(
         prev_alive.difference(&current_alive).copied().collect();
     *prev_alive = current_alive;
 
+    // Phase 3.2: TD HUD state — Round / Lives / round_is_running.
+    // `CurrentCreepWave.wave` is `usize` 1-based once StartRound flips
+    // `is_running`; 0 before the first round. `total_rounds` = length of
+    // the `Vec<CreepWave>` resource. `PlayerLives` is a tuple-struct
+    // wrapping `i32`. All three are read-only reads against ECS
+    // resources — no mutation, so determinism is unaffected.
+    let round: u32;
+    let total_rounds: u32;
+    let round_is_running: bool;
+    {
+        let ccw = world.read_resource::<omobab::comp::CurrentCreepWave>();
+        round = ccw.wave as u32;
+        round_is_running = ccw.is_running;
+    }
+    {
+        let waves = world.read_resource::<Vec<omobab::comp::CreepWave>>();
+        total_rounds = waves.len() as u32;
+    }
+    let lives = world.read_resource::<omobab::comp::PlayerLives>().0;
+
     SimWorldSnapshot {
         tick,
         entities: out,
         paths,
         removed_entity_ids,
+        round,
+        total_rounds,
+        lives,
+        round_is_running,
     }
 }
 

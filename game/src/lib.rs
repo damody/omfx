@@ -1548,6 +1548,15 @@ impl Plugin for Game {
                     .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
                     .count() as u64;
 
+                // Phase 3.2: TD HUD state from sim snapshot. Replaces the
+                // legacy NetworkBridge `apply_event` writes that were cut in
+                // Phase 5.1, leaving these fields stuck at default. The Start
+                // Round button text + the LIVES top-line both read these.
+                self.current_round = snapshot.round;
+                self.total_rounds = snapshot.total_rounds;
+                self.round_is_running = snapshot.round_is_running;
+                self.hero_state.lives = snapshot.lives;
+
                 // First Hero entity drives the hero panel. EntityRenderData now
                 // carries hero metadata (name / title / level / xp / gold /
                 // strength / agility / intelligence / primary_attribute) so the
