@@ -208,9 +208,22 @@ fn run_sim_loop(
 
         push_inputs_into_world(&mut world, batch.tick, batch.inputs);
 
-        // Update the Tick resource so omb-side systems see the right
-        // tick number. Phase 3.3 may also need to write DeltaTime here.
+        // Update Tick + Time + DeltaTime so time-gated systems (creep_wave,
+        // buff timers, projectile flight) actually advance. Lockstep is 60Hz
+        // (TickBroadcaster's tick_period_us = 16_667), so dt = 1/60.
+        // Without these the local sim has Tick advancing but Time stuck at 0,
+        // which makes `creep_wave` see `totaltime=0` and never spawn — exactly
+        // why Start Round fires (is_running flips) but no creeps appear.
+        const SIM_DT_S: f32 = 1.0 / 60.0;
         world.write_resource::<omobab::comp::resources::Tick>().0 = batch.tick as u64;
+        {
+            let mut t = world.write_resource::<omobab::comp::resources::Time>();
+            t.0 = (batch.tick as f64) * (SIM_DT_S as f64);
+        }
+        {
+            let mut dt = world.write_resource::<omobab::comp::resources::DeltaTime>();
+            dt.0 = omoba_sim::Fixed64::from_raw((SIM_DT_S * 1024.0) as i64);
+        }
 
         dispatcher.dispatch(&world);
         world.maintain();
