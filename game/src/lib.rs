@@ -1281,15 +1281,46 @@ impl Plugin for Game {
                 .unwrap_or_else(|_| {
                     PathBuf::from("D:/omoba/omb/scripts/base_content.dll")
                 });
-            let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("D:/omoba/omb/Story/MVP_1"));
             // omobab::ServerSetting::default reads "game.toml" by relative path
             // (works for omobab.exe with cwd=omb). omfx process cwd is elsewhere,
             // so point the lazy_static at an absolute path.
             if std::env::var("OMB_GAME_TOML").is_err() {
                 std::env::set_var("OMB_GAME_TOML", "D:/omoba/omb/game.toml");
             }
+            // Sync sim_runner's scene with omb's by parsing STORY from the same
+            // game.toml. Otherwise sim_runner loads MVP_1 while omb loads TD_1
+            // (per game.toml STORY) and the two ECS worlds diverge — sim_runner
+            // ends up with MVP_1's training enemies / blockers (~410 ghost
+            // entities) while creep paths / waves don't match omb's.
+            let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let toml_path = std::env::var("OMB_GAME_TOML")
+                        .unwrap_or_else(|_| "D:/omoba/omb/game.toml".to_string());
+                    let story = std::fs::read_to_string(&toml_path)
+                        .ok()
+                        .and_then(|s| {
+                            s.lines()
+                                .map(str::trim)
+                                .filter(|l| !l.starts_with('#'))
+                                .find_map(|l| {
+                                    let mut parts = l.splitn(2, '=');
+                                    let key = parts.next()?.trim();
+                                    if key != "STORY" { return None; }
+                                    let val = parts.next()?.trim()
+                                        .trim_start_matches('"')
+                                        .trim_end_matches('"')
+                                        .to_string();
+                                    Some(val)
+                                })
+                        })
+                        .unwrap_or_else(|| {
+                            log::warn!("game.toml missing STORY; falling back to MVP_1");
+                            "MVP_1".to_string()
+                        });
+                    log::info!("sim_runner: scene STORY={} (from game.toml)", story);
+                    PathBuf::from(format!("D:/omoba/omb/Story/{}", story))
+                });
             log::info!(
                 "Phase 3.2 sim_runner spawn: dll={:?} scene={:?}",
                 dll_path,
