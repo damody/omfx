@@ -195,6 +195,16 @@ fn run_sim_loop(
         }
     };
 
+    // Move ScriptRegistry out of the ECS resource so we can hold an &-borrow
+    // across `run_script_dispatch(&mut world, ...)` calls each tick. The omb
+    // host does the same — its `State` keeps `script_registry` as a struct
+    // field, not in ECS, exactly to avoid the borrow conflict. Replacing the
+    // resource with `Default::default()` (empty registry) is fine because
+    // nothing else queries the ECS-resident ScriptRegistry.
+    let script_registry: omobab::scripting::ScriptRegistry = std::mem::take(
+        &mut *world.write_resource::<omobab::scripting::ScriptRegistry>(),
+    );
+
     info!("sim_runner: dispatcher ready, entering tick loop");
 
     loop {
@@ -238,6 +248,26 @@ fn run_sim_loop(
         let (sink_tx, _sink_rx) = crossbeam_channel::unbounded::<omobab::transport::OutboundMsg>();
         if let Err(e) = omobab::comp::GameProcessor::process_outcomes(&mut world, &sink_tx) {
             log::warn!("sim_runner: process_outcomes failed: {}", e);
+        }
+        world.maintain();
+
+        // Run script dispatch so tower / hero / summon `on_tick` hooks fire.
+        // Towers are ScriptUnitTag-driven — without this, tower_dart / tower_
+        // bomb / tower_ice never decide to attack, so projectile_tick has
+        // nothing to advance and damage_tick has nothing to apply.
+        // omb's `State::tick` does the same after `run_systems` (see
+        // `omb/src/state/core.rs` around the `scripting::run_script_dispatch`
+        // call). Replica needs the same call to stay sim-equivalent.
+        omobab::scripting::run_script_dispatch(
+            &mut world,
+            &script_registry,
+            batch.tick as u64,
+            omoba_sim::Fixed64::from_raw((SIM_DT_S * 1024.0) as i64),
+            sink_tx.clone(),
+        );
+        // Process any outcomes scripts pushed (Projectile / Damage / etc.).
+        if let Err(e) = omobab::comp::GameProcessor::process_outcomes(&mut world, &sink_tx) {
+            log::warn!("sim_runner: process_outcomes (post-script) failed: {}", e);
         }
         world.maintain();
 
