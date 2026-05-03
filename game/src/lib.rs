@@ -184,6 +184,16 @@ struct NetworkEntity {
     extrap_duration: f32,
 }
 
+/// Per-entity UI label tracking for sim_runner-backed sprites.
+/// `last_*` fields gate UI message sends to avoid flooding the queue at
+/// 60 fps × N entities when nothing visible has changed.
+#[derive(Debug)]
+struct SimEntityLabel {
+    handle: Handle<Text>,
+    last_text: String,
+    last_pos: Vector2<f32>,
+}
+
 /// TD 塔的完整元資料（host + script 合併；前端快取一份，供預覽 / 按鈕 / sell 使用）。
 #[derive(Clone, Debug)]
 struct TdTemplate {
@@ -691,6 +701,12 @@ pub struct Game {
 
     #[visit(skip)] #[reflect(hidden)]
     pending_label_deletions: Vec<Handle<Text>>,
+
+    /// UI Text labels for entities surfaced by `render_bridge` (sim_runner-backed).
+    /// Keyed by `entity_id`. Created on first render of an entity, updated each
+    /// frame, removed when the entity drops out of the sim snapshot.
+    #[visit(skip)] #[reflect(hidden)]
+    sim_entity_labels: HashMap<u32, SimEntityLabel>,
 
     // --- UI ---
     #[visit(skip)] #[reflect(hidden)]
@@ -2049,6 +2065,100 @@ impl Plugin for Game {
                 if text != entity.last_label_text {
                     ui.send(label, TextMessage::Text(text.clone()));
                     entity.last_label_text = text;
+                }
+            }
+        }
+
+        // sim_runner-backed name labels: Phase 5.x replaces the legacy
+        // network_entities-driven loop above. Reads the same snapshot the
+        // render_bridge consumes; one Text widget per visible entity, kept
+        // in sync via `sim_entity_labels`.
+        if let Some(ref sim) = self.sim_runner_handle {
+            if let Ok(snapshot) = sim.state.try_lock() {
+                let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
+                let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
+                for entity in &snapshot.entities {
+                    if matches!(entity.kind, sim_runner::EntityKind::Other) {
+                        continue;
+                    }
+                    alive.insert(entity.entity_id);
+
+                    // Display name: prefer hero_name (heroes), else unit_id sans
+                    // template prefix, else fallback to "#<id>".
+                    let display_name = if !entity.hero_name.is_empty() {
+                        entity.hero_name.clone()
+                    } else if !entity.unit_id.is_empty() {
+                        entity.unit_id
+                            .strip_prefix("creep_")
+                            .or_else(|| entity.unit_id.strip_prefix("tower_"))
+                            .or_else(|| entity.unit_id.strip_prefix("hero_"))
+                            .or_else(|| entity.unit_id.strip_prefix("unit_"))
+                            .unwrap_or(&entity.unit_id)
+                            .to_string()
+                    } else {
+                        format!("#{}", entity.entity_id)
+                    };
+                    let text = if entity.max_hp > 0 {
+                        format!("{} {}/{}", display_name, entity.hp.max(0), entity.max_hp)
+                    } else {
+                        display_name
+                    };
+
+                    // World pos for label = entity center + slight Y offset so
+                    // it sits above the sprite + HP bar (~0.6 world units up).
+                    let label_world_y = entity.pos_y + 60.0;
+                    let screen_pos = world_to_screen_approx(
+                        entity.pos_x - self.camera_world_pos.x,
+                        label_world_y - self.camera_world_pos.y,
+                        win.x,
+                        win.y,
+                        world_height,
+                    );
+                    let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
+
+                    if let Some(slot) = self.sim_entity_labels.get_mut(&entity.entity_id) {
+                        // Update existing — gate to avoid flooding the UI queue.
+                        let pos_changed = (pos.x - slot.last_pos.x).abs() >= 1.0
+                            || (pos.y - slot.last_pos.y).abs() >= 1.0;
+                        if pos_changed {
+                            ui.send(slot.handle, WidgetMessage::DesiredPosition(pos));
+                            slot.last_pos = pos;
+                        }
+                        if text != slot.last_text {
+                            ui.send(slot.handle, TextMessage::Text(text.clone()));
+                            slot.last_text = text;
+                        }
+                    } else {
+                        // First-time spawn for this entity.
+                        let handle = TextBuilder::new(
+                            WidgetBuilder::new()
+                                .with_desired_position(pos)
+                                .with_width(180.0)
+                                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                        )
+                        .with_text(text.clone())
+                        .with_font_size(18.0.into())
+                        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                        .build(&mut ui.build_ctx());
+                        self.sim_entity_labels.insert(entity.entity_id, SimEntityLabel {
+                            handle,
+                            last_text: text,
+                            last_pos: pos,
+                        });
+                    }
+                }
+
+                // Despawn labels for entities no longer in snapshot.
+                let to_remove: Vec<u32> = self
+                    .sim_entity_labels
+                    .keys()
+                    .filter(|id| !alive.contains(id))
+                    .copied()
+                    .collect();
+                for id in to_remove {
+                    if let Some(slot) = self.sim_entity_labels.remove(&id) {
+                        ui.send(slot.handle, WidgetMessage::Remove);
+                    }
                 }
             }
         }

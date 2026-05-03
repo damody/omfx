@@ -31,6 +31,12 @@ pub use omobab::lockstep::PlayerInput;
 pub struct SimWorldSnapshot {
     pub tick: u32,
     pub entities: Vec<EntityRenderData>,
+    /// Creep checkpoint paths (world coords, raw f32 — render side applies WORLD_SCALE).
+    /// Each inner Vec is one named path's ordered list of `(x, y)` checkpoints.
+    /// Static after `init_creep_wave`; re-emitted every snapshot so the render
+    /// bridge sees them on its first read after GameStart without needing a
+    /// dedicated init-only channel.
+    pub paths: Vec<Vec<(f32, f32)>>,
 }
 
 /// Per-entity render data extracted from the ECS World at the end of
@@ -381,9 +387,21 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
         });
     }
 
+    // Creep checkpoint paths — read once per snapshot from the static
+    // `BTreeMap<String, Path>` resource populated by `init_creep_wave`. Cheap
+    // (BTree iter + small clone); avoids a dedicated init-only channel.
+    use omobab::comp::Path;
+    use std::collections::BTreeMap;
+    let paths: Vec<Vec<(f32, f32)>> = world
+        .read_resource::<BTreeMap<String, Path>>()
+        .values()
+        .map(|p| p.check_points.iter().map(|cp| (cp.pos.x, cp.pos.y)).collect())
+        .collect();
+
     SimWorldSnapshot {
         tick,
         entities: out,
+        paths,
     }
 }
 

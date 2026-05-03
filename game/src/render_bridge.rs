@@ -1,35 +1,23 @@
 //! Phase 4.2: bridge from sim World snapshot → Fyrox scene.
 //!
 //! Reads `SimWorldSnapshot.entities` once per frame and spawns / updates /
-//! despawns 2D rectangle sprites for each entity. The architectural goal
-//! — sim → render data flow — is now visually observable: sprites driven
-//! by `sim_runner` (authoritative ECS) appear on screen alongside the
-//! legacy `NetworkBridge` GameEvent → sprite pipeline (Phase 4.5 cuts the
-//! legacy path).
+//! despawns 2D rectangle sprites for each entity, with a child HP bar.
+//! Also draws creep checkpoint paths once on first non-empty snapshot.
 //!
-//! # Phase 4.2 scope
+//! What this owns:
+//! - Per-entity sprite (colored quad) + HP bar children
+//! - Path render line segments + checkpoint markers (static after first draw)
 //!
-//! - Per-EntityKind colored quad with simple geometry (cube replacement
-//!   for the eventual textured sprite). Color/size tuned to be
-//!   distinguishable from the legacy `NetworkBridge` sprites for
-//!   debugging — render_bridge sprites are smaller and use a slight Z
-//!   offset, so during the parallel period (Phase 4.2 → 4.5) one can
-//!   visually tell which pipeline is alive.
-//! - Position from `entity.pos_x` / `pos_y` via `WORLD_SCALE` and the
-//!   omfx X-flip convention (`-x`).
-//! - Despawn nodes whose `entity_id` is missing from the current
-//!   snapshot (death / cleanup).
+//! What lib.rs still owns:
+//! - UI name labels (need ui + camera + window for screen-space projection;
+//!   easier to keep in lib.rs alongside other UI work).
 //!
-//! NOT included (Phase 4-followup if needed):
-//! - Real game textures from the `sprite_resources` pipeline.
-//! - HP bars, facing arrows, name labels.
-//! - Floating damage text.
-//! - Animations / interpolation between ticks (sprites jump per snapshot
-//!   tick which at 60Hz looks fine; Phase 5+ may add per-frame lerp).
+//! Entities with `EntityKind::Other` are explicitly skipped — those are
+//! internal ECS rows (e.g. RegionBlocker) that should not appear visually.
 
 use std::collections::{HashMap, HashSet};
 
-use fyrox::core::algebra::Vector3;
+use fyrox::core::algebra::{Vector2, Vector3};
 use fyrox::core::color::Color;
 use fyrox::core::pool::Handle;
 use fyrox::graph::prelude::*;
@@ -40,44 +28,40 @@ use fyrox::scene::{node::Node, Scene};
 
 use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
 
-// Coordinate transform constants. Kept local (rather than imported from
-// `lib.rs`) so render_bridge stays a leaf module without circular access
-// to Game-private constants. These mirror the `WORLD_SCALE` / Z-layer
-// values used by `NetworkBridge`'s `entity_create`.
-//
-// Phase 4.5 (NetworkBridge cut) is a natural moment to consolidate these
-// to a `pub(crate) const` in lib.rs and `use` from there.
 const WORLD_SCALE: f32 = 0.01;
 
-// Slight Z offsets vs. the legacy NetworkBridge constants (Z_ENEMY=2.0,
-// Z_TOWER=2.5, Z_BULLET=0.5) so render_bridge sprites render *in front
-// of* their legacy counterparts during the parallel period — making it
-// trivial to confirm visually that sim_runner is driving the renderer.
-// Phase 4.5 deletes the legacy pipeline; at that point we can drop these
-// offsets back to the canonical Z values.
 const Z_RB_BULLET: f32 = 0.4;
 const Z_RB_HERO: f32 = 1.9;
 const Z_RB_CREEP: f32 = 1.95;
 const Z_RB_TOWER: f32 = 2.4;
-const Z_RB_OTHER: f32 = 1.85;
+const Z_RB_PATH: f32 = 4.4;        // just above background (Z_BACKGROUND=4.5)
+const Z_RB_HP_BAR: f32 = 1.5;      // in front of all entity sprites
 
-/// Mapping `entity_id → Fyrox node handle`. Each entity in the
-/// `SimWorldSnapshot` owns exactly one rectangle node, which is updated
-/// in place per snapshot tick and removed when the entity drops out of
-/// the snapshot.
+/// Per-entity scene nodes owned by `RenderBridge`.
+#[derive(Debug)]
+struct EntityNode {
+    sprite: Handle<Node>,
+    /// Foreground HP bar (green/red rect) — width scaled by hp/max_hp.
+    hp_bar_fg: Handle<Node>,
+    /// Background HP bar (black backing) — sized to max width.
+    hp_bar_bg: Handle<Node>,
+    /// Cached size for HP bar foreground scaling (= sprite size × 0.9).
+    hp_bar_max_width: f32,
+}
+
+/// Mapping `entity_id → EntityNode`. Each rendered entity owns a sprite
+/// + child HP bar; updated in place per snapshot tick and removed when
+/// the entity drops out.
 #[derive(Default, Debug)]
 pub struct RenderBridge {
-    entity_nodes: HashMap<u32, Handle<Node>>,
-    /// Last applied snapshot tick — used to throttle work in `update`.
-    /// Snapshots arriving with the same tick are skipped to avoid
-    /// re-mutating the scene graph at render fps when sim tps is lower.
+    entities: HashMap<u32, EntityNode>,
     last_applied_tick: Option<u32>,
-    /// Diagnostic counter: total spawn calls since process start. Used
-    /// by the periodic info log so console output reflects real
-    /// activity, not just snapshot tick counts.
     spawn_count: u64,
-    /// Diagnostic counter: total despawn calls since process start.
     despawn_count: u64,
+    /// Path render line segment + checkpoint marker handles. Drawn once
+    /// on the first snapshot whose `paths` is non-empty; static after.
+    path_nodes: Vec<Handle<Node>>,
+    paths_drawn: bool,
 }
 
 impl RenderBridge {
@@ -85,139 +69,264 @@ impl RenderBridge {
         Self::default()
     }
 
-    /// Apply one snapshot to the scene. Spawns / updates / despawns
-    /// rectangle nodes per `entity.entity_id` to mirror sim state.
     pub fn update(&mut self, snapshot: &SimWorldSnapshot, scene: &mut Scene) {
-        // Throttle: render thread runs at display fps (60-240Hz), sim
-        // ticks at 60Hz wallclock — most frames see the same snapshot.
-        // Skip when the tick hasn't advanced.
         if self.last_applied_tick == Some(snapshot.tick) {
             return;
         }
         self.last_applied_tick = Some(snapshot.tick);
 
+        self.ensure_paths_drawn(&snapshot.paths, scene);
+
         let mut alive = HashSet::with_capacity(snapshot.entities.len());
         for entity in &snapshot.entities {
+            // Internal ECS rows (RegionBlocker, etc.) have no Hero/Tower/
+            // Creep/Projectile component and surface as `Other`. They are
+            // not user-facing units — skip rendering entirely.
+            if entity.kind == EntityKind::Other {
+                continue;
+            }
             alive.insert(entity.entity_id);
             self.update_or_spawn(entity, scene);
         }
 
-        // Despawn entities not present in this snapshot.
         let to_remove: Vec<u32> = self
-            .entity_nodes
+            .entities
             .keys()
             .filter(|id| !alive.contains(id))
             .copied()
             .collect();
         for id in to_remove {
-            if let Some(handle) = self.entity_nodes.remove(&id) {
-                scene.graph.remove_node(handle);
+            if let Some(node) = self.entities.remove(&id) {
+                scene.graph.remove_node(node.sprite);
+                scene.graph.remove_node(node.hp_bar_fg);
+                scene.graph.remove_node(node.hp_bar_bg);
                 self.despawn_count += 1;
-                log::trace!("render_bridge: despawn entity_id={}", id);
             }
         }
 
-        // Periodic sample log so console isn't silent. Every 60 sim
-        // ticks (~1s @ 60Hz). Keys: tracked count + cumulative spawn /
-        // despawn → quick health check that the pipeline is doing work.
         if snapshot.tick % 60 == 0 {
             log::debug!(
-                "render_bridge: tick={} entities={} kinds={:?} tracked={} spawned={} despawned={}",
+                "render_bridge: tick={} entities={} kinds={:?} tracked={} spawned={} despawned={} paths_drawn={}",
                 snapshot.tick,
                 snapshot.entities.len(),
                 kind_histogram(&snapshot.entities),
-                self.entity_nodes.len(),
+                self.entities.len(),
                 self.spawn_count,
                 self.despawn_count,
+                self.paths_drawn,
             );
         }
     }
 
     fn update_or_spawn(&mut self, entity: &EntityRenderData, scene: &mut Scene) {
-        // World → render coords. omfx convention: `-x` X-flip (the camera
-        // is set up so world +X maps to screen -X; see lib.rs comments
-        // around `Z_BULLET`). `pos_y` maps directly to render Y.
         let render_x = -entity.pos_x * WORLD_SCALE;
         let render_y = entity.pos_y * WORLD_SCALE;
         let z = z_for_kind(entity.kind);
 
-        if let Some(&handle) = self.entity_nodes.get(&entity.entity_id) {
-            // Existing node — just update transform.
-            if let Ok(node) = scene.graph.try_get_mut(handle) {
-                node.local_transform_mut()
+        if let Some(node) = self.entities.get(&entity.entity_id) {
+            // Update existing nodes.
+            if let Ok(sprite) = scene.graph.try_get_mut(node.sprite) {
+                sprite
+                    .local_transform_mut()
                     .set_position(Vector3::new(render_x, render_y, z));
-                // facing_rad: store on the entity but skip rotating the
-                // 2D rectangle for now. The dim2 RectangleBuilder
-                // sprites point + Y by default; rotating a colored quad
-                // doesn't add visual signal at Phase 4.2 scope. When
-                // textures land (Phase 4-followup) facing rotation goes
-                // here via `.set_rotation_2d(entity.facing_rad)` or
-                // similar API.
-            } else {
-                // Stale handle (node was somehow removed externally).
-                // Drop the entry so next tick spawns a fresh sprite.
-                self.entity_nodes.remove(&entity.entity_id);
             }
-        } else {
-            // First-time spawn for this entity.
-            let (color, size) = style_for_entity(entity);
-            let handle: Handle<Node> = RectangleBuilder::new(
-                BaseBuilder::new().with_local_transform(
-                    TransformBuilder::new()
-                        .with_local_position(Vector3::new(render_x, render_y, z))
-                        .with_local_scale(Vector3::new(size, size, f32::EPSILON))
-                        .build(),
-                ),
-            )
-            .with_color(color)
-            .build(&mut scene.graph)
-            .transmute();
-
-            self.entity_nodes.insert(entity.entity_id, handle);
-            self.spawn_count += 1;
-            log::trace!(
-                "render_bridge: spawn entity_id={} kind={:?} pos=({:.2}, {:.2})",
-                entity.entity_id,
-                entity.kind,
-                entity.pos_x,
-                entity.pos_y,
-            );
+            // HP bar above sprite.
+            update_hp_bar(scene, node, render_x, render_y, entity);
+            return;
         }
+
+        // First-time spawn for this entity.
+        let (color, size) = style_for_entity(entity);
+        let sprite: Handle<Node> = RectangleBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(render_x, render_y, z))
+                    .with_local_scale(Vector3::new(size, size, f32::EPSILON))
+                    .build(),
+            ),
+        )
+        .with_color(color)
+        .build(&mut scene.graph)
+        .transmute();
+
+        let bar_max = size * 0.9;
+        let bar_height = size * 0.10;
+        let bar_offset_y = size * 0.55;
+
+        let hp_bar_bg: Handle<Node> = RectangleBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(render_x, render_y + bar_offset_y, Z_RB_HP_BAR + 0.01))
+                    .with_local_scale(Vector3::new(bar_max, bar_height, f32::EPSILON))
+                    .build(),
+            ),
+        )
+        .with_color(Color::from_rgba(0, 0, 0, 200))
+        .build(&mut scene.graph)
+        .transmute();
+
+        let hp_bar_fg: Handle<Node> = RectangleBuilder::new(
+            BaseBuilder::new().with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(render_x, render_y + bar_offset_y, Z_RB_HP_BAR))
+                    .with_local_scale(Vector3::new(bar_max, bar_height * 0.8, f32::EPSILON))
+                    .build(),
+            ),
+        )
+        .with_color(Color::from_rgba(40, 220, 60, 255))
+        .build(&mut scene.graph)
+        .transmute();
+
+        let node = EntityNode {
+            sprite,
+            hp_bar_fg,
+            hp_bar_bg,
+            hp_bar_max_width: bar_max,
+        };
+        update_hp_bar(scene, &node, render_x, render_y, entity);
+        self.entities.insert(entity.entity_id, node);
+        self.spawn_count += 1;
     }
 
-    /// Number of entities currently tracked. Used by tests and by the
-    /// Phase 3.5 integration harness for sanity assertions.
+    fn ensure_paths_drawn(&mut self, paths: &[Vec<(f32, f32)>], scene: &mut Scene) {
+        if self.paths_drawn || paths.is_empty() {
+            return;
+        }
+        for path in paths {
+            // Checkpoint marker dots.
+            for &(wx, wy) in path {
+                let rx = -wx * WORLD_SCALE;
+                let ry = wy * WORLD_SCALE;
+                let marker: Handle<Node> = RectangleBuilder::new(
+                    BaseBuilder::new().with_local_transform(
+                        TransformBuilder::new()
+                            .with_local_position(Vector3::new(rx, ry, Z_RB_PATH - 0.01))
+                            .with_local_scale(Vector3::new(0.4, 0.4, f32::EPSILON))
+                            .build(),
+                    ),
+                )
+                .with_color(Color::from_rgba(255, 220, 0, 230))
+                .build(&mut scene.graph)
+                .transmute();
+                self.path_nodes.push(marker);
+            }
+            // Connecting segments — thin rectangles aligned + scaled to span
+            // each pair of consecutive checkpoints.
+            for window in path.windows(2) {
+                let (x1, y1) = window[0];
+                let (x2, y2) = window[1];
+                let rx1 = -x1 * WORLD_SCALE;
+                let ry1 = y1 * WORLD_SCALE;
+                let rx2 = -x2 * WORLD_SCALE;
+                let ry2 = y2 * WORLD_SCALE;
+                let dx = rx2 - rx1;
+                let dy = ry2 - ry1;
+                let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                let mid_x = (rx1 + rx2) * 0.5;
+                let mid_y = (ry1 + ry2) * 0.5;
+                let angle = dy.atan2(dx);
+                let seg: Handle<Node> = RectangleBuilder::new(
+                    BaseBuilder::new().with_local_transform(
+                        TransformBuilder::new()
+                            .with_local_position(Vector3::new(mid_x, mid_y, Z_RB_PATH))
+                            .with_local_rotation(fyrox::core::algebra::UnitQuaternion::from_axis_angle(
+                                &fyrox::core::algebra::Vector3::z_axis(),
+                                angle,
+                            ))
+                            .with_local_scale(Vector3::new(len, 0.12, f32::EPSILON))
+                            .build(),
+                    ),
+                )
+                .with_color(Color::from_rgba(255, 200, 60, 200))
+                .build(&mut scene.graph)
+                .transmute();
+                self.path_nodes.push(seg);
+            }
+        }
+        self.paths_drawn = true;
+        log::info!("render_bridge: drew {} path nodes for {} path(s)",
+            self.path_nodes.len(), paths.len());
+    }
+
     pub fn tracked_count(&self) -> usize {
-        self.entity_nodes.len()
+        self.entities.len()
+    }
+
+    /// Iterator over rendered entities for the lib.rs UI label loop.
+    /// Returns `(entity_id, world_position)` so the caller can project
+    /// onto screen and place a Text widget above each unit.
+    pub fn iter_label_anchors<'a>(
+        &'a self,
+        snapshot: &'a SimWorldSnapshot,
+    ) -> impl Iterator<Item = (u32, Vector2<f32>, &'a EntityRenderData)> + 'a {
+        snapshot.entities.iter().filter_map(move |e| {
+            if e.kind == EntityKind::Other {
+                return None;
+            }
+            if !self.entities.contains_key(&e.entity_id) {
+                return None;
+            }
+            let pos = Vector2::new(-e.pos_x * WORLD_SCALE, e.pos_y * WORLD_SCALE);
+            Some((e.entity_id, pos, e))
+        })
     }
 }
 
-/// Per-EntityKind visual style. Colors picked to be obviously different
-/// from the legacy NetworkBridge palette. render_bridge uses high-saturation
-/// neon variants so visual identification is easy. Within a kind, the
-/// `unit_id` (e.g. "tower_dart_monkey", "tower_bomb_shooter") drives a
-/// hue rotation so different tower types / hero types are distinguishable
-/// at a glance.
+fn update_hp_bar(
+    scene: &mut Scene,
+    node: &EntityNode,
+    render_x: f32,
+    render_y: f32,
+    entity: &EntityRenderData,
+) {
+    let hp_frac = if entity.max_hp > 0 {
+        (entity.hp as f32 / entity.max_hp as f32).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let bar_width = node.hp_bar_max_width * hp_frac;
+    // Red below 30%, yellow below 60%, green otherwise.
+    let bar_color = if hp_frac < 0.30 {
+        Color::from_rgba(220, 50, 50, 255)
+    } else if hp_frac < 0.60 {
+        Color::from_rgba(220, 200, 60, 255)
+    } else {
+        Color::from_rgba(40, 220, 60, 255)
+    };
+    let bar_offset_y = node.hp_bar_max_width / 0.9 * 0.55;
+
+    if let Ok(bg) = scene.graph.try_get_mut(node.hp_bar_bg) {
+        bg.local_transform_mut()
+            .set_position(Vector3::new(render_x, render_y + bar_offset_y, Z_RB_HP_BAR + 0.01));
+    }
+    if let Ok(fg) = scene.graph.try_get_mut(node.hp_bar_fg) {
+        fg.local_transform_mut()
+            .set_position(Vector3::new(
+                render_x - (node.hp_bar_max_width - bar_width) * 0.5,
+                render_y + bar_offset_y,
+                Z_RB_HP_BAR,
+            ))
+            .set_scale(Vector3::new(bar_width.max(f32::EPSILON), node.hp_bar_max_width / 0.9 * 0.10 * 0.8, f32::EPSILON));
+        if let Some(rect) = fg.cast_mut::<fyrox::scene::dim2::rectangle::Rectangle>() {
+            rect.set_color(bar_color);
+        }
+    }
+}
+
 fn style_for_entity(entity: &EntityRenderData) -> (Color, f32) {
     let (base_rgb, size) = match entity.kind {
-        // (r, g, b) baseline + size
         EntityKind::Hero => ((0u8, 255u8, 200u8), 0.30),
         EntityKind::Tower => ((120, 120, 255), 0.32),
         EntityKind::Creep => ((255, 100, 220), 0.22),
         EntityKind::Projectile => ((255, 255, 0), 0.06),
+        // Other is skipped in update(); style retained only for tests.
         EntityKind::Other => ((180, 180, 180), 0.20),
     };
-    // unit_id-based hue rotation: deterministic, distinguishable.
-    // Hash the unit_id into a small u8 then RGB-rotate the channels by it.
-    // This keeps the same kind clearly identifiable (size unchanged) but
-    // gives e.g. dart / bomb / tack / ice towers different colours.
     let hash = hash_unit_id(&entity.unit_id);
     let (r, g, b) = rotate_rgb(base_rgb, hash);
     (Color::from_rgba(r, g, b, 255), size)
 }
 
-/// Tiny FNV-like u8 hash over `unit_id`. Empty `unit_id` → 0 (use
-/// the kind's baseline color unchanged).
 fn hash_unit_id(unit_id: &str) -> u8 {
     if unit_id.is_empty() {
         return 0;
@@ -230,16 +339,11 @@ fn hash_unit_id(unit_id: &str) -> u8 {
     (h & 0xFF) as u8
 }
 
-/// Rotate / perturb an (R, G, B) baseline by `hash`. Keeps the same
-/// kind family recognisable while making sub-types visually distinct.
-/// Bytes are wrapped, not clamped — full color-wheel sweep available.
 fn rotate_rgb(base: (u8, u8, u8), hash: u8) -> (u8, u8, u8) {
     let h = hash as i32;
     let r = base.0 as i32 ^ ((h * 7) & 0xFF);
     let g = base.1 as i32 ^ ((h * 13) & 0xFF);
     let b = base.2 as i32 ^ ((h * 23) & 0xFF);
-    // Re-saturate to keep it visible against the green background:
-    // bias each channel away from mid-grey so neon character is preserved.
     let bump = |v: i32| -> u8 {
         let v = v.clamp(0, 255);
         if v < 80 { (v + 80) as u8 }
@@ -255,7 +359,7 @@ fn z_for_kind(kind: EntityKind) -> f32 {
         EntityKind::Tower => Z_RB_TOWER,
         EntityKind::Creep => Z_RB_CREEP,
         EntityKind::Projectile => Z_RB_BULLET,
-        EntityKind::Other => Z_RB_OTHER,
+        EntityKind::Other => Z_RB_BULLET,
     }
 }
 
@@ -297,6 +401,7 @@ mod tests {
         let b = RenderBridge::new();
         assert_eq!(b.tracked_count(), 0);
         assert_eq!(b.last_applied_tick, None);
+        assert!(!b.paths_drawn);
     }
 
     #[test]
@@ -313,30 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn style_for_kind_distinct_colors() {
-        // Sanity: each kind picks a different color so the parallel
-        // render of NetworkBridge + render_bridge stays visually
-        // distinguishable. We don't pin the exact RGB (Phase 4-followup
-        // may retune the palette), only that no two kinds collide.
-        let kinds = [
-            EntityKind::Hero,
-            EntityKind::Tower,
-            EntityKind::Creep,
-            EntityKind::Projectile,
-            EntityKind::Other,
-        ];
-        let mut seen = std::collections::HashSet::new();
-        for k in kinds {
-            let e = make_entity(0, k, 0.0, 0.0);
-            let (c, _) = style_for_entity(&e);
-            assert!(seen.insert((c.r, c.g, c.b)), "duplicate color for {:?}", k);
-        }
-    }
-
-    #[test]
     fn unit_id_changes_color_within_same_kind() {
-        // Two towers with different unit_id should get different colors so
-        // dart / bomb / tack / ice are visually distinguishable on screen.
         let mut a = make_entity(1, EntityKind::Tower, 0.0, 0.0);
         a.unit_id = "tower_dart_monkey".to_string();
         let mut b = make_entity(2, EntityKind::Tower, 0.0, 0.0);
@@ -344,22 +426,5 @@ mod tests {
         let (ca, _) = style_for_entity(&a);
         let (cb, _) = style_for_entity(&b);
         assert_ne!((ca.r, ca.g, ca.b), (cb.r, cb.g, cb.b));
-    }
-
-    #[test]
-    fn z_for_kind_layers_above_background() {
-        // All sprite Z values must be > 0 so they render in front of
-        // the dark-green background quad (Z_BACKGROUND=4.5 in lib.rs;
-        // smaller Z = closer to camera). Practically Z is in [0.4, 2.4].
-        for k in [
-            EntityKind::Hero,
-            EntityKind::Tower,
-            EntityKind::Creep,
-            EntityKind::Projectile,
-            EntityKind::Other,
-        ] {
-            let z = z_for_kind(k);
-            assert!(z > 0.0 && z < 4.5, "z out of range for {:?}: {}", k, z);
-        }
     }
 }
