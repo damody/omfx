@@ -26,6 +26,14 @@ use specs::{Join, World, WorldExt};
 // under `lockstep::PlayerInput`.
 pub use omobab::lockstep::PlayerInput;
 
+/// Phase 4.2: render-only explosion FX entry, mirrored from
+/// `omobab::comp::outcome::ExplosionFx`. Re-exported through
+/// `SimWorldSnapshot.explosions` so the render side never needs to
+/// touch omobab types directly. `spawn_tick` is the sim tick at which
+/// the explosion was emitted; the render thread uses omfx wall clock
+/// for the actual ring-aging lifecycle (see lib.rs `active_explosions`).
+pub use omobab::comp::ExplosionFx;
+
 /// Render-thread-readable snapshot of the latest sim tick state.
 #[derive(Default, Clone, Debug)]
 pub struct SimWorldSnapshot {
@@ -71,6 +79,13 @@ pub struct SimWorldSnapshot {
     /// async). Hero panel uses this to resolve `ability_ids[i]` →
     /// display_name / icon / max_level.
     pub abilities: std::sync::Arc<Vec<AbilityDefSnapshot>>,
+    /// Phase 4.2: explosion FX events emitted this tick — one entry per
+    /// `Outcome::Explosion` processed by `process_outcomes`. Drained from
+    /// the sim's `ExplosionFxQueue` resource each tick (`std::mem::take`)
+    /// so the queue stays bounded. The render thread spawns a transient
+    /// expanding red ring per entry against omfx wall clock; sim never
+    /// reads this back, so it's not part of the determinism state.
+    pub explosions: Vec<ExplosionFx>,
 }
 
 /// Phase 4.1: One polygon region snapshot.
@@ -482,7 +497,7 @@ fn run_sim_loop(
         }
 
         let snapshot = extract_snapshot(
-            &world,
+            &mut world,
             batch.tick,
             &mut prev_alive,
             abilities_arc.clone(),
@@ -522,7 +537,7 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, Player
 }
 
 fn extract_snapshot(
-    world: &World,
+    world: &mut World,
     tick: u32,
     prev_alive: &mut std::collections::HashSet<u32>,
     abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
@@ -882,6 +897,17 @@ fn extract_snapshot(
     }
     let lives = world.read_resource::<omobab::comp::PlayerLives>().0;
 
+    // Phase 4.2: drain `ExplosionFxQueue` — process_outcomes pushes here
+    // for every Outcome::Explosion (game_processor + WorldAdapter
+    // emit_explosion). `std::mem::take` swaps in default empty Vec so the
+    // queue stays O(1) memory; sim never reads the queue back, so the
+    // write is invisible to determinism (same reason BlockedRegions is
+    // safe to read here).
+    let explosions: Vec<ExplosionFx> = {
+        let mut q = world.write_resource::<omobab::comp::ExplosionFxQueue>();
+        std::mem::take(&mut q.pending)
+    };
+
     SimWorldSnapshot {
         tick,
         entities: out,
@@ -893,6 +919,7 @@ fn extract_snapshot(
         round_is_running,
         blocked_regions,
         abilities: abilities_arc,
+        explosions,
     }
 }
 

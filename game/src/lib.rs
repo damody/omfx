@@ -665,6 +665,12 @@ pub struct Game {
     /// 進行中的爆炸特效（Bomb 塔命中時 spawn）
     #[visit(skip)] #[reflect(hidden)]
     active_explosions: Vec<ActiveExplosion>,
+    /// Phase 4.2: highest sim tick whose `snapshot.explosions` we have
+    /// already drained into `active_explosions`. Render frames can read
+    /// the same snapshot multiple times before the sim publishes the
+    /// next one — without this dedupe we'd spawn duplicate rings.
+    #[visit(skip)] #[reflect(hidden)]
+    sim_last_explosion_tick: Option<u32>,
     /// TD 路徑 check_points（render 座標）— 供 placement 預覽計算是否壓到路
     #[visit(skip)] #[reflect(hidden)]
     td_paths_render: Vec<Vec<Vector2<f32>>>,
@@ -1556,6 +1562,38 @@ impl Plugin for Game {
                 self.total_rounds = snapshot.total_rounds;
                 self.round_is_running = snapshot.round_is_running;
                 self.hero_state.lives = snapshot.lives;
+
+                // Phase 4.2: drain sim explosions into the local
+                // `active_explosions` ring buffer. Dedupe by tick so a
+                // render frame that re-reads the same snapshot doesn't
+                // spawn duplicate rings. Ring lifecycle is driven by
+                // omfx wall clock (`elapsed += dt`) so the explosion
+                // animation runs at render rate independent of the sim
+                // tick rate.
+                if !snapshot.explosions.is_empty()
+                    && self.sim_last_explosion_tick != Some(snapshot.tick)
+                {
+                    for ex in &snapshot.explosions {
+                        // World→render transform: `-x * WORLD_SCALE`
+                        // matches the projectile-impact `pos` used by
+                        // the existing local-spawn (line ~2191) so a
+                        // sim-driven explosion lands at the same place
+                        // the bullet visually exploded before.
+                        let render_pos = Vector2::new(
+                            -ex.pos_x * WORLD_SCALE,
+                            ex.pos_y * WORLD_SCALE,
+                        );
+                        let max_radius = ex.radius * WORLD_SCALE;
+                        let duration = (ex.duration_ms as f32 / 1000.0).max(0.05);
+                        self.active_explosions.push(ActiveExplosion {
+                            pos: render_pos,
+                            max_radius,
+                            duration,
+                            elapsed: 0.0,
+                        });
+                    }
+                    self.sim_last_explosion_tick = Some(snapshot.tick);
+                }
 
                 // Phase 4.5: AbilityRegistry → ability_info_map. Static
                 // after first non-empty Arc; only seed missing entries
