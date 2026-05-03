@@ -160,7 +160,7 @@ impl RenderBridge {
             }
         } else {
             // First-time spawn for this entity.
-            let (color, size) = style_for_kind(entity.kind);
+            let (color, size) = style_for_entity(entity);
             let handle: Handle<Node> = RectangleBuilder::new(
                 BaseBuilder::new().with_local_transform(
                     TransformBuilder::new()
@@ -193,18 +193,60 @@ impl RenderBridge {
 }
 
 /// Per-EntityKind visual style. Colors picked to be obviously different
-/// from the legacy NetworkBridge palette (Hero=greenish, Tower=blueish,
-/// Creep=redish, Projectile=yellow). render_bridge uses high-saturation
-/// neon variants so when both pipelines render in parallel (Phase 4.2 →
-/// 4.5) you can spot which sprite belongs to which.
-fn style_for_kind(kind: EntityKind) -> (Color, f32) {
-    match kind {
-        EntityKind::Hero => (Color::from_rgba(0, 255, 200, 255), 0.30),
-        EntityKind::Tower => (Color::from_rgba(120, 120, 255, 255), 0.32),
-        EntityKind::Creep => (Color::from_rgba(255, 100, 220, 255), 0.22),
-        EntityKind::Projectile => (Color::from_rgba(255, 255, 0, 255), 0.06),
-        EntityKind::Other => (Color::from_rgba(180, 180, 180, 255), 0.20),
+/// from the legacy NetworkBridge palette. render_bridge uses high-saturation
+/// neon variants so visual identification is easy. Within a kind, the
+/// `unit_id` (e.g. "tower_dart_monkey", "tower_bomb_shooter") drives a
+/// hue rotation so different tower types / hero types are distinguishable
+/// at a glance.
+fn style_for_entity(entity: &EntityRenderData) -> (Color, f32) {
+    let (base_rgb, size) = match entity.kind {
+        // (r, g, b) baseline + size
+        EntityKind::Hero => ((0u8, 255u8, 200u8), 0.30),
+        EntityKind::Tower => ((120, 120, 255), 0.32),
+        EntityKind::Creep => ((255, 100, 220), 0.22),
+        EntityKind::Projectile => ((255, 255, 0), 0.06),
+        EntityKind::Other => ((180, 180, 180), 0.20),
+    };
+    // unit_id-based hue rotation: deterministic, distinguishable.
+    // Hash the unit_id into a small u8 then RGB-rotate the channels by it.
+    // This keeps the same kind clearly identifiable (size unchanged) but
+    // gives e.g. dart / bomb / tack / ice towers different colours.
+    let hash = hash_unit_id(&entity.unit_id);
+    let (r, g, b) = rotate_rgb(base_rgb, hash);
+    (Color::from_rgba(r, g, b, 255), size)
+}
+
+/// Tiny FNV-like u8 hash over `unit_id`. Empty `unit_id` → 0 (use
+/// the kind's baseline color unchanged).
+fn hash_unit_id(unit_id: &str) -> u8 {
+    if unit_id.is_empty() {
+        return 0;
     }
+    let mut h: u32 = 2166136261;
+    for b in unit_id.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    (h & 0xFF) as u8
+}
+
+/// Rotate / perturb an (R, G, B) baseline by `hash`. Keeps the same
+/// kind family recognisable while making sub-types visually distinct.
+/// Bytes are wrapped, not clamped — full color-wheel sweep available.
+fn rotate_rgb(base: (u8, u8, u8), hash: u8) -> (u8, u8, u8) {
+    let h = hash as i32;
+    let r = base.0 as i32 ^ ((h * 7) & 0xFF);
+    let g = base.1 as i32 ^ ((h * 13) & 0xFF);
+    let b = base.2 as i32 ^ ((h * 23) & 0xFF);
+    // Re-saturate to keep it visible against the green background:
+    // bias each channel away from mid-grey so neon character is preserved.
+    let bump = |v: i32| -> u8 {
+        let v = v.clamp(0, 255);
+        if v < 80 { (v + 80) as u8 }
+        else if v > 200 { v as u8 }
+        else { (v + 40).min(255) as u8 }
+    };
+    (bump(r), bump(g), bump(b))
 }
 
 fn z_for_kind(kind: EntityKind) -> f32 {
@@ -246,6 +288,7 @@ mod tests {
             facing_rad: 0.0,
             hp: 100,
             max_hp: 100,
+            ..Default::default()
         }
     }
 
@@ -284,9 +327,23 @@ mod tests {
         ];
         let mut seen = std::collections::HashSet::new();
         for k in kinds {
-            let (c, _) = style_for_kind(k);
+            let e = make_entity(0, k, 0.0, 0.0);
+            let (c, _) = style_for_entity(&e);
             assert!(seen.insert((c.r, c.g, c.b)), "duplicate color for {:?}", k);
         }
+    }
+
+    #[test]
+    fn unit_id_changes_color_within_same_kind() {
+        // Two towers with different unit_id should get different colors so
+        // dart / bomb / tack / ice are visually distinguishable on screen.
+        let mut a = make_entity(1, EntityKind::Tower, 0.0, 0.0);
+        a.unit_id = "tower_dart_monkey".to_string();
+        let mut b = make_entity(2, EntityKind::Tower, 0.0, 0.0);
+        b.unit_id = "tower_bomb_shooter".to_string();
+        let (ca, _) = style_for_entity(&a);
+        let (cb, _) = style_for_entity(&b);
+        assert_ne!((ca.r, ca.g, ca.b), (cb.r, cb.g, cb.b));
     }
 
     #[test]

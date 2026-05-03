@@ -37,7 +37,7 @@ pub struct SimWorldSnapshot {
 /// every tick. Already mapped to `f32` at the boundary (Fixed64 →
 /// `to_f32_for_render`); render thread does not need to know about
 /// the deterministic sim's fixed-point types.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EntityRenderData {
     pub entity_id: u32,
     pub entity_gen: u32,
@@ -47,14 +47,32 @@ pub struct EntityRenderData {
     pub facing_rad: f32,
     pub hp: i32,
     pub max_hp: i32,
+    /// `ScriptUnitTag.unit_id` if present (e.g. "tower_dart_monkey",
+    /// "creep_balloon_red", "hero_saika_magoichi"). Empty for entities
+    /// without a script tag (rare — most spawned units have one).
+    pub unit_id: String,
+    /// Hero-only metadata. Empty / 0 when entity is not a Hero.
+    pub hero_name: String,
+    pub hero_title: String,
+    pub hero_level: i32,
+    pub hero_xp: i32,
+    pub hero_xp_next: i32,
+    pub hero_skill_points: i32,
+    pub hero_primary_attribute: String,
+    pub hero_strength: i32,
+    pub hero_agility: i32,
+    pub hero_intelligence: i32,
+    /// Gold (player resource for hero). 0 for non-hero entities.
+    pub gold: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum EntityKind {
     Hero,
     Tower,
     Creep,
     Projectile,
+    #[default]
     Other,
 }
 
@@ -232,6 +250,9 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
     // module-by-module one (some submodules like `comp::state` collide
     // with the State struct namespace).
     use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, Tower};
+    use omobab::comp::hero::AttributeType;
+    use omobab::comp::gold::Gold;
+    use omobab::scripting::ScriptUnitTag;
 
     let entities = world.entities();
     let pos_storage = world.read_storage::<Pos>();
@@ -241,6 +262,8 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
     let tower_storage = world.read_storage::<Tower>();
     let proj_storage = world.read_storage::<Projectile>();
     let creep_storage = world.read_storage::<Creep>();
+    let unit_tag_storage = world.read_storage::<ScriptUnitTag>();
+    let gold_storage = world.read_storage::<Gold>();
 
     let mut out = Vec::new();
     for (entity, pos) in (&entities, &pos_storage).join() {
@@ -280,6 +303,58 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
 
         let (px, py) = pos.xy_f32();
 
+        let unit_id = unit_tag_storage
+            .get(entity)
+            .map(|t| t.unit_id.clone())
+            .unwrap_or_default();
+        let gold = gold_storage.get(entity).map(|g| g.0).unwrap_or(0);
+
+        // Hero-only metadata. Read once per Hero entity, keep zero-cost
+        // for non-Hero rows.
+        let (
+            hero_name,
+            hero_title,
+            hero_level,
+            hero_xp,
+            hero_xp_next,
+            hero_skill_points,
+            hero_primary_attribute,
+            hero_strength,
+            hero_agility,
+            hero_intelligence,
+        ) = if let Some(h) = hero_storage.get(entity) {
+            let attr = match h.primary_attribute {
+                AttributeType::Strength => "力量",
+                AttributeType::Agility => "敏捷",
+                AttributeType::Intelligence => "智力",
+            };
+            (
+                h.name.clone(),
+                h.title.clone(),
+                h.level,
+                h.experience,
+                h.experience_to_next,
+                h.skill_points,
+                attr.to_string(),
+                h.strength,
+                h.agility,
+                h.intelligence,
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                0,
+                0,
+                0,
+            )
+        };
+
         out.push(EntityRenderData {
             entity_id: entity.id(),
             // specs `Generation::id()` returns i32 (1-based, with sign
@@ -291,6 +366,18 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
             facing_rad: facing,
             hp,
             max_hp,
+            unit_id,
+            hero_name,
+            hero_title,
+            hero_level,
+            hero_xp,
+            hero_xp_next,
+            hero_skill_points,
+            hero_primary_attribute,
+            hero_strength,
+            hero_agility,
+            hero_intelligence,
+            gold,
         });
     }
 

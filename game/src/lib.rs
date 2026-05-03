@@ -1437,17 +1437,26 @@ impl Plugin for Game {
                     .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
                     .count() as u64;
 
-                // First Hero entity drives the basic hero panel. Full stats
-                // (mana / level / gold / abilities / inventory) need EntityRenderData
-                // widening + omb-side hero stats serialization — Phase 5.x followup.
+                // First Hero entity drives the hero panel. EntityRenderData now
+                // carries hero metadata (name / title / level / xp / gold /
+                // strength / agility / intelligence / primary_attribute) so the
+                // panel can render the same way the legacy NetworkBridge path did.
                 if let Some(hero) = snapshot.entities.iter()
                     .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
                 {
                     self.hero_state.hp = hero.hp as f32;
                     self.hero_state.max_hp = hero.max_hp as f32;
-                    if self.hero_state.name.is_empty() {
-                        self.hero_state.name = "(sim)".to_string();
-                    }
+                    self.hero_state.name = hero.hero_name.clone();
+                    self.hero_state.title = hero.hero_title.clone();
+                    self.hero_state.level = hero.hero_level;
+                    self.hero_state.xp = hero.hero_xp;
+                    self.hero_state.xp_next = hero.hero_xp_next;
+                    self.hero_state.skill_points = hero.hero_skill_points;
+                    self.hero_state.primary_attribute = hero.hero_primary_attribute.clone();
+                    self.hero_state.strength = hero.hero_strength;
+                    self.hero_state.agility = hero.hero_agility;
+                    self.hero_state.intelligence = hero.hero_intelligence;
+                    self.hero_state.gold = hero.gold;
                 }
             }
         }
