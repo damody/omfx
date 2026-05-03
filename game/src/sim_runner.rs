@@ -90,6 +90,53 @@ pub struct EntityRenderData {
     pub hero_intelligence: i32,
     /// Gold (player resource for hero). 0 for non-hero entities.
     pub gold: i32,
+    /// Phase 3.3: Aggregated hero stats (final values after BuffStore /
+    /// UnitStats aggregation). `None` for non-hero entities — keeps
+    /// EntityRenderData small for the 1000-tower / 500-creep stress
+    /// path. Boxed so the Hero arm pays a heap alloc but Tower/Creep
+    /// rows pay only a single None-pointer.
+    pub hero_ext: Option<Box<HeroStatsExt>>,
+}
+
+/// Phase 3.3: Single-buff snapshot for the hero panel.
+///
+/// Mirrors the legacy `hero.stats` `buffs` array. `remaining_secs`
+/// uses `-1.0` as a sentinel for "infinite / toggle" (e.g. base_stats
+/// or sniper_mode) — render-side displays it as ∞. Otherwise the
+/// render thread decrements `remaining_secs` per frame locally; next
+/// authoritative snapshot resets the value, avoiding drift.
+#[derive(Clone, Debug, Default)]
+pub struct BuffSnapshot {
+    pub buff_id: String,
+    pub remaining_secs: f32,
+    /// Stringified payload JSON. Worst-case fallback to `Debug` repr
+    /// when the canonical JSON encoding is unavailable; the panel
+    /// listed numeric payload fields with `as_f64()`, so we keep the
+    /// JSON round-trip to preserve that.
+    pub payload_json: String,
+}
+
+/// Phase 3.3: Aggregated hero stats — the omfx-side mirror of the
+/// legacy omb `hero.stats` JSON payload. Computed via the same
+/// `BuffStore` / `UnitStats` aggregation pipeline omb used (see
+/// `omobab::ability_runtime::UnitStats`); read-only against the ECS
+/// so lockstep determinism is unaffected.
+#[derive(Clone, Debug, Default)]
+pub struct HeroStatsExt {
+    pub armor: f32,
+    pub magic_resist: f32,
+    pub attack_damage: f32,
+    pub attack_range: f32,
+    pub move_speed: f32,
+    /// Seconds per attack (asd) — 0 for non-attacking units.
+    pub attack_speed_sec: f32,
+    pub bullet_speed: f32,
+    /// Hero mana / max-mana (Phase 3.3: omb `CProperty` does not yet
+    /// have hero mana fields, so these are 0; legacy `hero.stats`
+    /// payload also wired 0). Plumbed for forward-compat.
+    pub mana: f32,
+    pub max_mana: f32,
+    pub buffs: Vec<BuffSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -385,10 +432,11 @@ fn extract_snapshot(
     // crate root, so go through the flat path instead of the
     // module-by-module one (some submodules like `comp::state` collide
     // with the State struct namespace).
-    use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, Tower};
+    use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, TAttack, Tower};
     use omobab::comp::hero::AttributeType;
     use omobab::comp::gold::Gold;
     use omobab::scripting::ScriptUnitTag;
+    use omobab::ability_runtime::{BuffStore, UnitStats};
 
     let entities = world.entities();
     let pos_storage = world.read_storage::<Pos>();
@@ -400,6 +448,12 @@ fn extract_snapshot(
     let creep_storage = world.read_storage::<Creep>();
     let unit_tag_storage = world.read_storage::<ScriptUnitTag>();
     let gold_storage = world.read_storage::<Gold>();
+    // Phase 3.3: TAttack + BuffStore for the hero stats aggregation
+    // path. BuffStore is a `World` resource; UnitStats borrows it
+    // read-only — no ECS mutation, so determinism is unaffected.
+    let tatk_storage = world.read_storage::<TAttack>();
+    let buff_store = world.read_resource::<BuffStore>();
+    let stats = UnitStats::from_refs(&*buff_store, /*is_building*/ false);
 
     let mut out = Vec::new();
     for (entity, pos) in (&entities, &pos_storage).join() {
@@ -491,6 +545,89 @@ fn extract_snapshot(
             )
         };
 
+        // Phase 3.3: aggregate final hero stats (armor / atk / range /
+        // move_speed / buffs) the same way omb's
+        // `state::resource_management::build_hero_stats_payload` did.
+        // Read-only — `UnitStats::final_*` and `BuffStore::iter_for`
+        // never mutate the ECS, so lockstep determinism is unaffected.
+        // `None` for non-Hero entities so Tower/Creep rows pay only a
+        // single null-pointer worth of size.
+        let hero_ext = if matches!(kind, EntityKind::Hero) {
+            let prop = cprop_storage.get(entity);
+            let atk = tatk_storage.get(entity);
+
+            let armor = prop
+                .map(|p| stats.final_armor(p.def_physic, entity).to_f32_for_render())
+                .unwrap_or(0.0);
+            let magic_resist = prop
+                .map(|p| stats.final_magic_resist(p.def_magic, entity).to_f32_for_render())
+                .unwrap_or(0.0);
+            let move_speed = prop
+                .map(|p| stats.final_move_speed(p.msd, entity).to_f32_for_render())
+                .unwrap_or(0.0);
+            let attack_damage = atk
+                .map(|a| stats.final_atk(a.atk_physic.v, entity).to_f32_for_render())
+                .unwrap_or(0.0);
+            let attack_range = atk
+                .map(|a| stats.final_attack_range(a.range.v, entity).to_f32_for_render())
+                .unwrap_or(0.0);
+            // attack_speed_sec = base interval / asd_mult. asd_mult = 1
+            // means base; > 1 means faster (lower interval). Mirrors
+            // the divide done in `build_hero_stats_payload`.
+            let attack_speed_sec = atk
+                .map(|a| {
+                    let asd_mult =
+                        stats.final_attack_speed_mult(entity).to_f32_for_render();
+                    let base = a.asd.v.to_f32_for_render();
+                    if asd_mult > 0.0 { base / asd_mult } else { base }
+                })
+                .unwrap_or(0.0);
+            let bullet_speed = atk
+                .map(|a| a.bullet_speed.to_f32_for_render())
+                .unwrap_or(0.0);
+            // CProperty has no hero mana fields yet; legacy
+            // `build_hero_stats_payload` wired 0 too. Plumbed for
+            // forward-compat once mana lands.
+            let mana = 0.0_f32;
+            let max_mana = 0.0_f32;
+
+            let buffs: Vec<BuffSnapshot> = buff_store
+                .iter_for(entity)
+                .map(|(id, entry)| {
+                    // BuffEntry.remaining is Fixed64 seconds; legacy
+                    // wire convention: raw == i32::MAX is the
+                    // "infinite / toggle" sentinel (sniper_mode,
+                    // base_stats). Map to -1.0 so the panel renders ∞.
+                    let remaining_secs = if entry.remaining.raw() == i32::MAX as i64 {
+                        -1.0
+                    } else {
+                        entry.remaining.to_f32_for_render()
+                    };
+                    BuffSnapshot {
+                        buff_id: id.to_string(),
+                        remaining_secs,
+                        payload_json: serde_json::to_string(&entry.payload)
+                            .unwrap_or_default(),
+                    }
+                })
+                .collect();
+
+            Some(Box::new(HeroStatsExt {
+                armor,
+                magic_resist,
+                attack_damage,
+                attack_range,
+                move_speed,
+                attack_speed_sec,
+                bullet_speed,
+                mana,
+                max_mana,
+                buffs,
+            }))
+        } else {
+            None
+        };
+
         out.push(EntityRenderData {
             entity_id: entity.id(),
             // specs `Generation::id()` returns i32 (1-based, with sign
@@ -514,6 +651,7 @@ fn extract_snapshot(
             hero_agility,
             hero_intelligence,
             gold,
+            hero_ext,
         });
     }
 

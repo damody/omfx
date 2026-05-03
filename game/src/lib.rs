@@ -1577,6 +1577,50 @@ impl Plugin for Game {
                     self.hero_state.agility = hero.hero_agility;
                     self.hero_state.intelligence = hero.hero_intelligence;
                     self.hero_state.gold = hero.gold;
+                    self.hero_state.entity_id = Some(hero.entity_id);
+
+                    // Phase 3.3: derived hero stats sourced from sim
+                    // aggregation (HeroStatsExt) — replaces the legacy
+                    // omb `hero.stats` 0.3s broadcast that Phase 5.1
+                    // cut. Mirror omb `build_hero_stats_payload` 1:1.
+                    if let Some(ext) = hero.hero_ext.as_deref() {
+                        self.hero_state.armor = ext.armor;
+                        self.hero_state.magic_resist = ext.magic_resist;
+                        self.hero_state.move_speed = ext.move_speed;
+                        self.hero_state.attack_damage = ext.attack_damage;
+                        self.hero_state.attack_interval = ext.attack_speed_sec;
+                        self.hero_state.attack_range = ext.attack_range;
+                        self.hero_state.bullet_speed = ext.bullet_speed;
+
+                        // Buff snapshot reset to authoritative values
+                        // each tick. Render-side per-frame countdown
+                        // (handled by the existing buff timer ticker
+                        // below) keeps the displayed seconds smooth
+                        // between snapshots.
+                        self.hero_state.buffs = ext
+                            .buffs
+                            .iter()
+                            .map(|b| LocalBuff {
+                                id: b.buff_id.clone(),
+                                remaining: b.remaining_secs,
+                                payload: serde_json::from_str(&b.payload_json)
+                                    .unwrap_or(serde_json::Value::Null),
+                            })
+                            .collect();
+                    } else {
+                        // Hero entity exists but aggregation missing
+                        // (shouldn't happen — UnitStats path always
+                        // runs for the Hero arm). Zero out to avoid
+                        // stale legacy values.
+                        self.hero_state.armor = 0.0;
+                        self.hero_state.magic_resist = 0.0;
+                        self.hero_state.move_speed = 0.0;
+                        self.hero_state.attack_damage = 0.0;
+                        self.hero_state.attack_interval = 0.0;
+                        self.hero_state.attack_range = 0.0;
+                        self.hero_state.bullet_speed = 0.0;
+                        self.hero_state.buffs.clear();
+                    }
                 }
             }
         }
