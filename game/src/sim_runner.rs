@@ -228,6 +228,19 @@ fn run_sim_loop(
         dispatcher.dispatch(&world);
         world.maintain();
 
+        // Phase 3 dispatcher only schedules tick systems; it does NOT include
+        // GameProcessor::process_outcomes. Without this, `creep_wave` produces
+        // `Outcome::Creep { cd }` rows that pile up in `Vec<Outcome>` but no
+        // entity is ever spawned in the local sim → snapshot.creep stays 0.
+        // mqtx is a sink (empty Vec): outcome handlers `try_send` and silently
+        // drop messages, which matches the deterministic-sim contract (host
+        // owns wire emits; replica is render-only).
+        let (sink_tx, _sink_rx) = crossbeam_channel::unbounded::<omobab::transport::OutboundMsg>();
+        if let Err(e) = omobab::comp::GameProcessor::process_outcomes(&mut world, &sink_tx) {
+            log::warn!("sim_runner: process_outcomes failed: {}", e);
+        }
+        world.maintain();
+
         let snapshot = extract_snapshot(&world, batch.tick);
         if let Ok(mut s) = state_out.lock() {
             *s = snapshot;
