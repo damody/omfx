@@ -716,6 +716,18 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     sim_entity_slots: HashMap<u32, render_bridge::SimEntitySlots>,
 
+    /// Wall-clock timestamp of first frame; used by the
+    /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` smoke loop
+    /// so a single `cargo run` can reproduce a Start-Round-then-die scenario
+    /// without manual clicks. None until first update() tick.
+    #[visit(skip)] #[reflect(hidden)]
+    auto_clock_start: Option<std::time::Instant>,
+    /// Latched once the auto Start-Round input has been emitted, so the
+    /// dispatcher only sees one StartRound (subsequent host-side reads
+    /// would warn "round already running").
+    #[visit(skip)] #[reflect(hidden)]
+    auto_start_sent: bool,
+
     // --- UI ---
     #[visit(skip)] #[reflect(hidden)]
     ui_status_text: Handle<Text>,
@@ -1368,6 +1380,50 @@ impl Plugin for Game {
         // 後續 phase（爆炸 / 路徑 debug 等）會 push 新的 line 進來。
         scene.drawing_context.clear_lines();
         let frame_t0 = std::time::Instant::now();
+
+        // Smoke-loop hooks (read once on first update). Both env vars are
+        // independent; either or both may be set. Used by automated test
+        // runs so a single `run.bat` can launch → press Start Round →
+        // exit, without a human clicking buttons.
+        let now = std::time::Instant::now();
+        if self.auto_clock_start.is_none() {
+            self.auto_clock_start = Some(now);
+        }
+        let elapsed_s = now
+            .duration_since(self.auto_clock_start.unwrap())
+            .as_secs_f32();
+        if !self.auto_start_sent {
+            if let Ok(v) = std::env::var("OMFX_AUTO_START_AFTER_SEC") {
+                if let Ok(threshold) = v.parse::<f32>() {
+                    if elapsed_s >= threshold {
+                        let input = omoba_core::kcp::game_proto::PlayerInput {
+                            action: Some(
+                                omoba_core::kcp::game_proto::player_input::Action::StartRound(
+                                    omoba_core::kcp::game_proto::StartRound {},
+                                ),
+                            ),
+                        };
+                        self.send_lockstep_input(input);
+                        log::info!(
+                            "[auto-smoke] Start Round sent at t={:.2}s (OMFX_AUTO_START_AFTER_SEC={})",
+                            elapsed_s, v
+                        );
+                        self.auto_start_sent = true;
+                    }
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("OMFX_AUTO_EXIT_AFTER_SEC") {
+            if let Ok(threshold) = v.parse::<f32>() {
+                if elapsed_s >= threshold {
+                    log::info!(
+                        "[auto-smoke] exiting at t={:.2}s (OMFX_AUTO_EXIT_AFTER_SEC={})",
+                        elapsed_s, v
+                    );
+                    std::process::exit(0);
+                }
+            }
+        }
 
         // Lazy init shared sprite resources on first frame.
         if self.sprite_resources.is_none() {
