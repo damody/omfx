@@ -207,10 +207,27 @@ fn run_sim_loop(
 
     info!("sim_runner: dispatcher ready, entering tick loop");
 
+    let mut last_starvation_log = std::time::Instant::now();
     loop {
-        let batch = match tick_input_rx.recv() {
+        // Use recv_timeout instead of recv() so a wire stall surfaces in the
+        // log as "no TickBatch in 1.0s — upstream lockstep client is the
+        // suspect" instead of looking like sim_runner is computing slowly.
+        let batch = match tick_input_rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(b) => b,
-            Err(_) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let now = std::time::Instant::now();
+                if now.duration_since(last_starvation_log).as_secs() >= 2 {
+                    let pending = tick_input_rx.len();
+                    info!(
+                        "sim_runner: no TickBatch in 1.0s (queue_len={}). \
+                         Upstream Game→lockstep_client→KCP path is the suspect.",
+                        pending,
+                    );
+                    last_starvation_log = now;
+                }
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 info!("sim_runner: input channel closed, exiting");
                 break;
             }

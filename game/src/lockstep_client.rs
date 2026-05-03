@@ -159,13 +159,46 @@ async fn run_client(
 
     // Main loop: poll inbound, drain pending outgoing inputs after each recv.
     // crossbeam_channel::try_recv is non-blocking so this stays cheap.
+    let mut last_hb_log = std::time::Instant::now();
+    let mut tick_batches_since_log: u32 = 0;
+    let mut last_known_tick: u32 = 0;
     loop {
-        match rx.recv().await {
-            Some(LockstepInbound::TickBatch(b)) => {
+        let recv_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rx.recv(),
+        ).await;
+        match recv_result {
+            Err(_elapsed) => {
+                // No KCP frame in 2s. Either omb broadcaster stalled, KCP
+                // session is dead, or omfx tokio runtime is starved.
+                warn!(
+                    "[lockstep-client] no KCP frame in 2.0s (last_known_tick={}). \
+                     Upstream omb→KCP path is the suspect.",
+                    last_known_tick,
+                );
+                continue;
+            }
+            Ok(None) => {
+                warn!("lockstep-client stream closed");
+                let _ = events_tx.send(LockstepEvent::Disconnected {
+                    reason: "stream closed".into(),
+                });
+                break;
+            }
+            Ok(Some(LockstepInbound::TickBatch(b))) => {
+                tick_batches_since_log += 1;
+                last_known_tick = b.tick;
+                let now = std::time::Instant::now();
+                if now.duration_since(last_hb_log).as_secs() >= 5 {
+                    info!(
+                        "[lockstep-client] healthy: {} TickBatch frames in last 5s (latest tick={})",
+                        tick_batches_since_log, b.tick,
+                    );
+                    last_hb_log = now;
+                    tick_batches_since_log = 0;
+                }
                 // Phase 3.3: extract `Vec<(player_id, PlayerInput)>` from the
-                // generated `InputForPlayer` rows. Drop entries whose `input`
-                // field is None (proto optional message — should not happen
-                // in well-formed server output, but be defensive).
+                // generated `InputForPlayer` rows.
                 let inputs: Vec<(u32, PlayerInput)> = b
                     .inputs
                     .into_iter()
@@ -178,23 +211,16 @@ async fn run_client(
                     server_events,
                 });
             }
-            Some(LockstepInbound::StateHash(sh)) => {
+            Ok(Some(LockstepInbound::StateHash(sh))) => {
                 let _ = events_tx.send(LockstepEvent::StateHash {
                     tick: sh.tick,
                     hash: sh.hash,
                 });
             }
-            Some(LockstepInbound::GameStart(_)) => {
-                // Already consumed by join_lockstep; second arrival would be
-                // a server bug. Log + ignore.
+            Ok(Some(LockstepInbound::GameStart(_))) => {
                 warn!("lockstep-client got unexpected GameStart after join — ignoring");
             }
-            Some(LockstepInbound::SnapshotResp(resp)) => {
-                // Phase 5.3: server now serves real bincode-serialized
-                // WorldSnapshot bytes (was empty stub in Phase 2). Client-side
-                // fast-forward (deserialize + apply to sim_runner) is a Phase
-                // 5+ followup once observer mode is actually exercised. For
-                // now, log enough info to confirm the wire path is alive.
+            Ok(Some(LockstepInbound::SnapshotResp(resp))) => {
                 let (bytes_len, schema) = match &resp.state {
                     Some(s) => (s.world_bytes.len(), s.schema_version),
                     None => (0, 0),
@@ -203,13 +229,6 @@ async fn run_client(
                     "lockstep-client received SnapshotResp tick={} bytes={} schema={} (Phase 5.3 logs only; apply is Phase 5+)",
                     resp.tick, bytes_len, schema
                 );
-            }
-            None => {
-                warn!("lockstep-client stream closed");
-                let _ = events_tx.send(LockstepEvent::Disconnected {
-                    reason: "stream closed".into(),
-                });
-                break;
             }
         }
 
