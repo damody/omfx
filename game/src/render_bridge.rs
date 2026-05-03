@@ -23,6 +23,17 @@ use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
 const WORLD_SCALE: f32 = 0.01;
 const Z_RB_PATH: f32 = 4.4;
 
+/// Path zigzag line thickness in render units. Computed `64.0 *
+/// WORLD_SCALE * 2.0 = 1.28`. Matches the legacy MVP "thick cream
+/// zigzag" reference (image 6) — the prior `0.12` value was the tail
+/// end of an earlier per-segment marker design. The thicker line
+/// covers the corner waypoints cleanly, so individual checkpoint
+/// dots are no longer needed.
+const PATH_LINE_THICKNESS: f32 = 64.0 * WORLD_SCALE * 2.0;
+/// Pale tan / cream path color (RGBA). Replaces the earlier
+/// `(255, 200, 60)` yellow.
+const PATH_COLOR: (u8, u8, u8, u8) = (170, 140, 90, 255);
+
 #[derive(Default, Debug)]
 pub struct RenderBridge {
     last_applied_tick: Option<u32>,
@@ -61,22 +72,8 @@ impl RenderBridge {
             return;
         }
         for path in paths {
-            for &(wx, wy) in path {
-                let rx = -wx * WORLD_SCALE;
-                let ry = wy * WORLD_SCALE;
-                let marker: Handle<Node> = RectangleBuilder::new(
-                    BaseBuilder::new().with_local_transform(
-                        TransformBuilder::new()
-                            .with_local_position(Vector3::new(rx, ry, Z_RB_PATH - 0.01))
-                            .with_local_scale(Vector3::new(0.4, 0.4, f32::EPSILON))
-                            .build(),
-                    ),
-                )
-                .with_color(Color::from_rgba(255, 220, 0, 230))
-                .build(&mut scene.graph)
-                .transmute();
-                self.path_nodes.push(marker);
-            }
+            // Phase 3.1: per-checkpoint marker dots removed — the thicker
+            // PATH_LINE_THICKNESS line covers corners cleanly.
             for window in path.windows(2) {
                 let (x1, y1) = window[0];
                 let (x2, y2) = window[1];
@@ -98,11 +95,11 @@ impl RenderBridge {
                                 &fyrox::core::algebra::Vector3::z_axis(),
                                 angle,
                             ))
-                            .with_local_scale(Vector3::new(len, 0.12, f32::EPSILON))
+                            .with_local_scale(Vector3::new(len, PATH_LINE_THICKNESS, f32::EPSILON))
                             .build(),
                     ),
                 )
-                .with_color(Color::from_rgba(255, 200, 60, 200))
+                .with_color(Color::from_rgba(PATH_COLOR.0, PATH_COLOR.1, PATH_COLOR.2, PATH_COLOR.3))
                 .build(&mut scene.graph)
                 .transmute();
                 self.path_nodes.push(seg);
