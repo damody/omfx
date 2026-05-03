@@ -2884,9 +2884,39 @@ impl Plugin for Game {
                             && screen.y >= by && screen.y < by + bh
                         {
                             if let Some(tid) = self.selected_tower_entity {
-                                // Phase 5.1: legacy NetCommand::UpgradeTower send removed.
-                                // TODO Phase 5.x: route UpgradeTower through lockstep PlayerInput.
-                                log::info!("[phase5.1] Upgrade Tower id={} path={} (legacy send removed)", tid, path);
+                                // Phase 2.3: TowerUpgrade lockstep input. tid is
+                                // the tower entity id; `path` is 0/1/2; `level`
+                                // is the post-upgrade level (current_level + 1)
+                                // sourced from the cached
+                                // `network_entities[tid].upgrade_levels` that
+                                // the Sell/Upgrade panel already reads above.
+                                // omb's drain handler treats `level` as a hint
+                                // and recomputes the actual target from the
+                                // entity's own `upgrade_levels[path] + 1`,
+                                // so a stale snapshot here still produces the
+                                // correct upgrade.
+                                let current_level = self
+                                    .network_entities
+                                    .get(&tid)
+                                    .map(|e| e.upgrade_levels[path as usize])
+                                    .unwrap_or(0);
+                                let target_level = current_level + 1;
+                                let input = omoba_core::kcp::game_proto::PlayerInput {
+                                    action: Some(
+                                        omoba_core::kcp::game_proto::player_input::Action::TowerUpgrade(
+                                            omoba_core::kcp::game_proto::TowerUpgradeInput {
+                                                tower_entity_id: tid,
+                                                path: path as u32,
+                                                level: target_level as u32,
+                                            },
+                                        ),
+                                    ),
+                                };
+                                self.send_lockstep_input(input);
+                                log::info!(
+                                    "Tower upgrade lockstep input submitted: eid={} path={} level={}",
+                                    tid, path, target_level
+                                );
                             }
                             hit_ui = true;
                             break;

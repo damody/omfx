@@ -281,6 +281,13 @@ fn run_sim_loop(
         omobab::comp::GameProcessor::drain_pending_tower_sells(&mut world);
         world.maintain();
 
+        // Phase 2.3: drain `PendingTowerUpgradeQueue` from TowerUpgrade
+        // inputs. Mirrors omb's `state::core::tick`. Gold deduction +
+        // upgrade_levels increment + BuffStore stat-mod adds need to run on
+        // host and replica in sync so the snapshot stays consistent.
+        omobab::comp::GameProcessor::drain_pending_tower_upgrades(&mut world);
+        world.maintain();
+
         // Phase 3 dispatcher only schedules tick systems; it does NOT include
         // GameProcessor::process_outcomes. Without this, `creep_wave` produces
         // `Outcome::Creep { cd }` rows that pile up in `Vec<Outcome>` but no
