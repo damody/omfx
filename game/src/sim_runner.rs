@@ -398,6 +398,34 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
         .map(|p| p.check_points.iter().map(|cp| (cp.pos.x, cp.pos.y)).collect())
         .collect();
 
+    // DIAGNOSTIC: dump entity kind histogram + samples every second so we can
+    // pinpoint why sim_runner accumulates ghost entities (411 reported with
+    // empty Structures + BlockedRegions). Remove after root cause is fixed.
+    if tick % 60 == 0 && !out.is_empty() {
+        let mut counts = [0u32; 5];
+        for e in &out {
+            counts[match e.kind {
+                EntityKind::Hero => 0,
+                EntityKind::Tower => 1,
+                EntityKind::Creep => 2,
+                EntityKind::Projectile => 3,
+                EntityKind::Other => 4,
+            }] += 1;
+        }
+        log::info!(
+            "[sim_runner] tick={} total={} hero={} tower={} creep={} proj={} other={}",
+            tick, out.len(), counts[0], counts[1], counts[2], counts[3], counts[4],
+        );
+        // First 10 non-hero entities — show their pos / unit_id to hint at origin.
+        for (i, e) in out.iter().filter(|e| !matches!(e.kind, EntityKind::Hero)).enumerate().take(10) {
+            log::info!(
+                "  [{}] id={} gen={} kind={:?} unit_id={:?} pos=({:.0},{:.0}) hp={}/{}",
+                i, e.entity_id, e.entity_gen, e.kind, e.unit_id,
+                e.pos_x, e.pos_y, e.hp, e.max_hp,
+            );
+        }
+    }
+
     SimWorldSnapshot {
         tick,
         entities: out,
