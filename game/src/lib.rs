@@ -2717,7 +2717,7 @@ impl Plugin for Game {
                 let screen = self.mouse_screen_pos;
                 let mut hit_ui = false;
 
-                // 1. Start Round 按鈕
+                // 1. Start Round 按鈕 — Phase 5.x lockstep send
                 {
                     let (bx, by, bw, bh) = self.start_round_button_rect;
                     if screen.x >= bx && screen.x <= bx + bw
@@ -2725,9 +2725,15 @@ impl Plugin for Game {
                         && !self.round_is_running
                         && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
                     {
-                        // Phase 5.1: legacy NetCommand::StartRound send removed.
-                        // TODO Phase 5.x: route StartRound through lockstep PlayerInput.
-                        log::info!("[phase5.1] Start Round button pressed (legacy send removed; lockstep round-control pending)");
+                        let input = omoba_core::kcp::game_proto::PlayerInput {
+                            action: Some(
+                                omoba_core::kcp::game_proto::player_input::Action::StartRound(
+                                    omoba_core::kcp::game_proto::StartRound {},
+                                ),
+                            ),
+                        };
+                        self.send_lockstep_input(input);
+                        log::info!("Start Round → lockstep PlayerInput::StartRound sent");
                         hit_ui = true;
                     }
                 }
