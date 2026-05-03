@@ -57,6 +57,43 @@ pub struct SimWorldSnapshot {
     /// flips false once the wave is cleared. Mirrors
     /// `CurrentCreepWave.is_running`.
     pub round_is_running: bool,
+    /// Phase 4.1: BlockedRegion polygons — non-walkable map regions sourced
+    /// from `BlockedRegions(Vec<BlockedRegion>)`. Static map data after
+    /// `state::initialization` loads them; cheap to clone each tick (TD_1 is
+    /// empty; MVP_1/DEBUG_1 have a handful). Render side draws a red
+    /// polygon outline per region; `circle` is currently always `None` since
+    /// omb `BlockedRegion` has no radius field, but the field is plumbed
+    /// for forward-compat (eg. circular blockers).
+    pub blocked_regions: Vec<BlockedRegionSnapshot>,
+    /// Phase 4.5: AbilityRegistry — static-ish ability metadata loaded from
+    /// the script DLL at game start. `Arc` wrapped so each tick clone is
+    /// O(1); rebuilt lazily once the registry is non-empty (script load is
+    /// async). Hero panel uses this to resolve `ability_ids[i]` →
+    /// display_name / icon / max_level.
+    pub abilities: std::sync::Arc<Vec<AbilityDefSnapshot>>,
+}
+
+/// Phase 4.1: One polygon region snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct BlockedRegionSnapshot {
+    /// Polygon vertices in world coords (raw f32 — render side applies
+    /// WORLD_SCALE + `-x` flip just like the path-segment renderer).
+    pub points: Vec<(f32, f32)>,
+    /// Optional center + radius for an orange circular blocker. omb
+    /// `BlockedRegion` has no radius today, so this is always `None`;
+    /// kept for forward-compat with future circular regions.
+    pub circle: Option<((f32, f32), f32)>,
+}
+
+/// Phase 4.5: AbilityDef projection — only the fields the omfx hero
+/// panel needs. Stays lean (no `levels` HashMap or `properties` JSON
+/// blob) since the ability bar shows ability_id / max_level / icon.
+#[derive(Clone, Debug)]
+pub struct AbilityDefSnapshot {
+    pub ability_id: String,
+    pub display_name: String,
+    pub max_level: u8,
+    pub icon_path: String,
 }
 
 /// Per-entity render data extracted from the ECS World at the end of
@@ -96,6 +133,12 @@ pub struct EntityRenderData {
     /// path. Boxed so the Hero arm pays a heap alloc but Tower/Creep
     /// rows pay only a single None-pointer.
     pub hero_ext: Option<Box<HeroStatsExt>>,
+    /// Phase 4.3: Tower upgrade level pips per path (3 paths × 0-4 levels).
+    /// `None` for non-Tower entities. Sourced from `Tower.upgrade_levels`
+    /// component field; the existing TD sell/upgrade panel already reads
+    /// this off `network_entities`, so the snapshot variant is the
+    /// lockstep-side mirror.
+    pub upgrade_levels: Option<[u8; 3]>,
 }
 
 /// Phase 3.3: Single-buff snapshot for the hero panel.
@@ -137,6 +180,23 @@ pub struct HeroStatsExt {
     pub mana: f32,
     pub max_mana: f32,
     pub buffs: Vec<BuffSnapshot>,
+    /// Phase 4.4: Inventory item ids per slot. omb `Inventory` has 6
+    /// slots (`INVENTORY_SLOTS = 6`); each slot holds an
+    /// `Option<ItemInstance>` whose `item_id` is a `String`. `None` for
+    /// empty slots. Cooldown intentionally omitted here — the legacy
+    /// `hero_state.inventory` HUD already drives a local CD ticker
+    /// (`Vec<Option<(String, f32)>>`), and Phase 2.4 ItemUse start_cd
+    /// happens host-side; the next snapshot reset is fine.
+    pub inventory: [Option<String>; 6],
+    /// Phase 4.5: Ability levels per slot (Q/W/E/R = indices 0..3).
+    /// Sourced from `Hero.ability_levels: HashMap<String, i32>` keyed
+    /// by `ability_ids[i]`. 0 if unlearned / no ability in slot.
+    pub ability_levels: [i32; 4],
+    /// Phase 4.5: Ability ids per slot. Mirrors `Hero.abilities[i]`
+    /// (Q/W/E/R order). `None` if the hero has fewer than 4 abilities
+    /// or that slot is unset. Render side looks these up in
+    /// `SimWorldSnapshot.abilities` to resolve display name / icon.
+    pub ability_ids: [Option<String>; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -282,6 +342,16 @@ fn run_sim_loop(
     // a wire-side `entity.death` event. Replaces the legacy omb
     // `make_entity_death` emit pair.
     let mut prev_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    // Phase 4.5: AbilityRegistry → AbilityDefSnapshot Arc. Built lazily on
+    // the first tick where the registry is non-empty (script DLL load is
+    // async — the registry is populated by `scripting::registry::load`
+    // during world init, but we re-poll each tick until the Arc is set
+    // because in some scenes the registry may stay empty until a hero's
+    // script registers abilities). After build, every snapshot just clones
+    // the Arc (O(1) refcount bump).
+    let mut abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>> =
+        std::sync::Arc::new(Vec::new());
     loop {
         // Use recv_timeout instead of recv() so a wire stall surfaces in the
         // log as "no TickBatch in 1.0s — upstream lockstep client is the
@@ -388,7 +458,35 @@ fn run_sim_loop(
         }
         world.maintain();
 
-        let snapshot = extract_snapshot(&world, batch.tick, &mut prev_alive);
+        // Phase 4.5: rebuild abilities Arc lazily if it's still empty and
+        // the registry has populated. After the first non-empty build the
+        // Arc never changes (registry is immutable post-load).
+        if abilities_arc.is_empty() {
+            let reg = world.read_resource::<omobab::ability_runtime::AbilityRegistry>();
+            if !reg.is_empty() {
+                abilities_arc = std::sync::Arc::new(
+                    reg.all()
+                        .map(|d| AbilityDefSnapshot {
+                            ability_id: d.id.clone(),
+                            display_name: d.name.clone(),
+                            max_level: d.max_level,
+                            icon_path: d.icon.clone().unwrap_or_default(),
+                        })
+                        .collect(),
+                );
+                log::info!(
+                    "sim_runner: built AbilityRegistry snapshot ({} defs)",
+                    abilities_arc.len()
+                );
+            }
+        }
+
+        let snapshot = extract_snapshot(
+            &world,
+            batch.tick,
+            &mut prev_alive,
+            abilities_arc.clone(),
+        );
         if let Ok(mut s) = state_out.lock() {
             *s = snapshot;
         }
@@ -427,6 +525,7 @@ fn extract_snapshot(
     world: &World,
     tick: u32,
     prev_alive: &mut std::collections::HashSet<u32>,
+    abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
 ) -> SimWorldSnapshot {
     // omobab re-exports these via `pub use crate::comp::*;` at the
     // crate root, so go through the flat path instead of the
@@ -435,6 +534,7 @@ fn extract_snapshot(
     use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, TAttack, Tower};
     use omobab::comp::hero::AttributeType;
     use omobab::comp::gold::Gold;
+    use omobab::comp::inventory::Inventory;
     use omobab::scripting::ScriptUnitTag;
     use omobab::ability_runtime::{BuffStore, UnitStats};
 
@@ -454,6 +554,9 @@ fn extract_snapshot(
     let tatk_storage = world.read_storage::<TAttack>();
     let buff_store = world.read_resource::<BuffStore>();
     let stats = UnitStats::from_refs(&*buff_store, /*is_building*/ false);
+    // Phase 4.4: hero inventory storage — only Hero entities populate this,
+    // so the lookup is cheap for non-hero rows (None).
+    let inventory_storage = world.read_storage::<Inventory>();
 
     let mut out = Vec::new();
     for (entity, pos) in (&entities, &pos_storage).join() {
@@ -612,6 +715,34 @@ fn extract_snapshot(
                 })
                 .collect();
 
+            // Phase 4.4: inventory slots — `Inventory.slots` is
+            // `[Option<ItemInstance>; 6]`; we project to
+            // `[Option<String>; 6]` (item_id only). Empty slot → None.
+            // Hero may not have an Inventory component (unit tests / pre-
+            // pickup); in that case all slots are None.
+            let mut inventory: [Option<String>; 6] = Default::default();
+            if let Some(inv) = inventory_storage.get(entity) {
+                for (i, slot) in inv.slots.iter().enumerate().take(6) {
+                    inventory[i] = slot.as_ref().map(|it| it.item_id.clone());
+                }
+            }
+
+            // Phase 4.5: ability ids + levels per slot (Q/W/E/R = 0..3).
+            // `Hero.abilities` is a `Vec<String>` (typically length 4 but
+            // we guard against shorter); `ability_levels` is a HashMap
+            // keyed by ability id. Missing → 0 / None.
+            let mut ability_ids: [Option<String>; 4] = Default::default();
+            let mut ability_levels: [i32; 4] = [0; 4];
+            if let Some(h) = hero_storage.get(entity) {
+                for i in 0..4 {
+                    if let Some(id) = h.abilities.get(i) {
+                        let lvl = h.ability_levels.get(id).copied().unwrap_or(0);
+                        ability_levels[i] = lvl;
+                        ability_ids[i] = Some(id.clone());
+                    }
+                }
+            }
+
             Some(Box::new(HeroStatsExt {
                 armor,
                 magic_resist,
@@ -623,7 +754,19 @@ fn extract_snapshot(
                 mana,
                 max_mana,
                 buffs,
+                inventory,
+                ability_levels,
+                ability_ids,
             }))
+        } else {
+            None
+        };
+
+        // Phase 4.3: tower upgrade levels — only populated for Tower-kind
+        // entities. The 3 paths × 0-4 level array is read directly off the
+        // `Tower` component. Other kinds get `None` (zero overhead).
+        let upgrade_levels: Option<[u8; 3]> = if matches!(kind, EntityKind::Tower) {
+            tower_storage.get(entity).map(|t| t.upgrade_levels)
         } else {
             None
         };
@@ -652,6 +795,7 @@ fn extract_snapshot(
             hero_intelligence,
             gold,
             hero_ext,
+            upgrade_levels,
         });
     }
 
@@ -702,6 +846,22 @@ fn extract_snapshot(
         prev_alive.difference(&current_alive).copied().collect();
     *prev_alive = current_alive;
 
+    // Phase 4.1: BlockedRegion polygons. Static map data — TD_1 is empty,
+    // MVP_1/DEBUG_1 have a handful, so cloning each tick is cheap. The
+    // omb `BlockedRegion` has `name: String` + `points: Vec<Vec2<f32>>`
+    // (no radius); we project to `(f32, f32)` pairs since render-side
+    // already speaks raw f32 world coords. `circle` is None today since
+    // the source has no radius field; kept Optional for forward-compat.
+    let blocked_regions: Vec<BlockedRegionSnapshot> = world
+        .read_resource::<omobab::comp::BlockedRegions>()
+        .0
+        .iter()
+        .map(|r| BlockedRegionSnapshot {
+            points: r.points.iter().map(|p| (p.x, p.y)).collect(),
+            circle: None,
+        })
+        .collect();
+
     // Phase 3.2: TD HUD state — Round / Lives / round_is_running.
     // `CurrentCreepWave.wave` is `usize` 1-based once StartRound flips
     // `is_running`; 0 before the first round. `total_rounds` = length of
@@ -731,6 +891,8 @@ fn extract_snapshot(
         total_rounds,
         lives,
         round_is_running,
+        blocked_regions,
+        abilities: abilities_arc,
     }
 }
 

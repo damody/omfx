@@ -1557,6 +1557,66 @@ impl Plugin for Game {
                 self.round_is_running = snapshot.round_is_running;
                 self.hero_state.lives = snapshot.lives;
 
+                // Phase 4.5: AbilityRegistry → ability_info_map. Static
+                // after first non-empty Arc; only seed missing entries
+                // so any backend-pushed AbilityInfo (cooldown / mana_cost
+                // arrays not in registry def) isn't clobbered. The
+                // display_name / max_level / icon path covers the basic
+                // tooltip path; cooldown lookup falls back to 0 when no
+                // entry is present (existing UI handles that gracefully).
+                if !snapshot.abilities.is_empty() {
+                    for def in snapshot.abilities.iter() {
+                        let entry = self
+                            .ability_info_map
+                            .entry(def.ability_id.clone())
+                            .or_insert_with(|| AbilityInfo {
+                                id: def.ability_id.clone(),
+                                ..Default::default()
+                            });
+                        if entry.name.is_empty() {
+                            entry.name = def.display_name.clone();
+                        }
+                        if entry.max_level == 0 {
+                            entry.max_level = def.max_level as i32;
+                        }
+                    }
+                }
+
+                // Phase 4.1: BlockedRegion polygons in render coords for
+                // placement validation (`circle_hits_polygon` checks below).
+                // Static after world init, but cheap (~handful of regions max);
+                // overwrite each tick rather than dirty-flag tracking.
+                if !snapshot.blocked_regions.is_empty()
+                    && self.td_regions_render.len() != snapshot.blocked_regions.len()
+                {
+                    self.td_regions_render = snapshot
+                        .blocked_regions
+                        .iter()
+                        .map(|r| {
+                            r.points
+                                .iter()
+                                .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
+                                .collect()
+                        })
+                        .collect();
+                }
+                // Phase 3.x: TD path checkpoints in render coords for
+                // `point_segment_dist_sq` placement check. Same one-shot
+                // population pattern as regions.
+                if !snapshot.paths.is_empty()
+                    && self.td_paths_render.len() != snapshot.paths.len()
+                {
+                    self.td_paths_render = snapshot
+                        .paths
+                        .iter()
+                        .map(|p| {
+                            p.iter()
+                                .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
+                                .collect()
+                        })
+                        .collect();
+                }
+
                 // First Hero entity drives the hero panel. EntityRenderData now
                 // carries hero metadata (name / title / level / xp / gold /
                 // strength / agility / intelligence / primary_attribute) so the
@@ -1607,6 +1667,69 @@ impl Plugin for Game {
                                     .unwrap_or(serde_json::Value::Null),
                             })
                             .collect();
+
+                        // Phase 4.4: hero inventory from snapshot. Each
+                        // slot becomes `Some((item_id, cd))` — cd starts
+                        // at 0 since the snapshot doesn't carry per-item
+                        // cooldown today (Inventory.ItemInstance has it
+                        // but we only project item_id; the local CD
+                        // ticker that decrements `(_, cd)` each frame
+                        // remains harmless when cd=0). Empty slots map
+                        // to `None`, matching the legacy UI contract.
+                        // Resize to 6 in case the hero state was
+                        // initialised with a smaller Vec earlier.
+                        if self.hero_state.inventory.len() < 6 {
+                            self.hero_state.inventory.resize(6, None);
+                        }
+                        for (i, slot) in ext.inventory.iter().enumerate().take(6) {
+                            let prev_cd = self
+                                .hero_state
+                                .inventory
+                                .get(i)
+                                .and_then(|s| s.as_ref())
+                                .map(|(prev_id, cd)| {
+                                    // Preserve CD only if the same item
+                                    // is still in the slot (otherwise
+                                    // the slot was swapped — reset CD).
+                                    if Some(prev_id.as_str()) == slot.as_deref() {
+                                        *cd
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .unwrap_or(0.0);
+                            self.hero_state.inventory[i] =
+                                slot.as_ref().map(|id| (id.clone(), prev_cd));
+                        }
+
+                        // Phase 4.5: ability ids + levels from snapshot.
+                        // `Hero.abilities` (Vec<String>) drives the
+                        // Q/W/E/R order; `ability_levels[i]` mirrors the
+                        // omb HashMap projection. Local `ability_cd` is
+                        // ticked down per-frame; we only seed it to 0
+                        // for newly-discovered ability ids so an
+                        // in-flight CD isn't reset on every snapshot.
+                        let new_abilities: Vec<String> = ext
+                            .ability_ids
+                            .iter()
+                            .filter_map(|opt| opt.clone())
+                            .collect();
+                        if new_abilities != self.hero_state.abilities {
+                            self.hero_state.abilities = new_abilities.clone();
+                        }
+                        self.hero_state.ability_levels.clear();
+                        for (i, id_opt) in ext.ability_ids.iter().enumerate() {
+                            if let Some(id) = id_opt {
+                                self.hero_state.ability_levels.insert(
+                                    id.clone(),
+                                    ext.ability_levels[i],
+                                );
+                                self.hero_state
+                                    .ability_cd
+                                    .entry(id.clone())
+                                    .or_insert(0.0);
+                            }
+                        }
                     } else {
                         // Hero entity exists but aggregation missing
                         // (shouldn't happen — UnitStats path always
@@ -2253,8 +2376,36 @@ impl Plugin for Game {
                     } else {
                         format!("#{}", entity.entity_id)
                     };
+                    // Phase 4.3: tower upgrade pips appended to the label
+                    // when any path is upgraded. Avoids spawning N×3 new
+                    // scene nodes for the 1000-tower stress path; reuses
+                    // the existing per-entity Text widget. Format mirrors
+                    // the right-panel dot style ("●○○") so the legend is
+                    // visually consistent. Skipped when all paths are 0.
+                    let pip_suffix = entity.upgrade_levels
+                        .filter(|lv| lv.iter().any(|&n| n > 0))
+                        .map(|lv| {
+                            let dots: Vec<String> = lv
+                                .iter()
+                                .map(|&n| {
+                                    let filled = (n as usize).min(4);
+                                    let empty = 4 - filled;
+                                    "●".repeat(filled) + &"○".repeat(empty)
+                                })
+                                .collect();
+                            format!(" [{}|{}|{}]", dots[0], dots[1], dots[2])
+                        })
+                        .unwrap_or_default();
                     let text = if entity.max_hp > 0 {
-                        format!("{} {}/{}", display_name, entity.hp.max(0), entity.max_hp)
+                        format!(
+                            "{} {}/{}{}",
+                            display_name,
+                            entity.hp.max(0),
+                            entity.max_hp,
+                            pip_suffix
+                        )
+                    } else if !pip_suffix.is_empty() {
+                        format!("{}{}", display_name, pip_suffix)
                     } else {
                         display_name
                     };

@@ -22,6 +22,20 @@ use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
 
 const WORLD_SCALE: f32 = 0.01;
 const Z_RB_PATH: f32 = 4.4;
+/// Phase 4.1: Z layer for BlockedRegion outlines. Drawn slightly above
+/// the path layer so the red outline is visible if a region overlaps a
+/// path (legacy reference: same Z as the old map.regions debug overlay).
+const Z_RB_REGION: f32 = 4.5;
+/// Phase 4.1: Region outline thickness (render units). Half the path
+/// thickness so the red border doesn't dominate over the cream path.
+const REGION_LINE_THICKNESS: f32 = PATH_LINE_THICKNESS * 0.5;
+/// Phase 4.1: Region outline color — red (matches the legacy
+/// "blocked region" overlay convention; the alternative orange is
+/// reserved for `circle` blockers when they exist).
+const REGION_OUTLINE_COLOR: (u8, u8, u8, u8) = (255, 80, 80, 255);
+/// Phase 4.1: Optional circle blocker color — orange. Currently unused
+/// (omb `BlockedRegion` has no radius), but plumbed for forward-compat.
+const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = (255, 165, 0, 255);
 
 /// Path zigzag line thickness in render units. Computed `64.0 *
 /// WORLD_SCALE * 2.0 = 1.28`. Matches the legacy MVP "thick cream
@@ -39,6 +53,11 @@ pub struct RenderBridge {
     last_applied_tick: Option<u32>,
     path_nodes: Vec<Handle<Node>>,
     paths_drawn: bool,
+    /// Phase 4.1: BlockedRegion outline scene nodes (one segment per
+    /// polygon edge). Static after first draw — `regions_drawn` gates
+    /// re-creation just like `paths_drawn`.
+    region_nodes: Vec<Handle<Node>>,
+    regions_drawn: bool,
 }
 
 impl RenderBridge {
@@ -55,16 +74,123 @@ impl RenderBridge {
         self.last_applied_tick = Some(snapshot.tick);
 
         self.ensure_paths_drawn(&snapshot.paths, scene);
+        self.ensure_blocked_regions_drawn(&snapshot.blocked_regions, scene);
 
         if snapshot.tick % 60 == 0 {
             log::debug!(
-                "render_bridge: tick={} entities={} kinds={:?} paths_drawn={}",
+                "render_bridge: tick={} entities={} kinds={:?} paths_drawn={} regions_drawn={}",
                 snapshot.tick,
                 snapshot.entities.len(),
                 kind_histogram(&snapshot.entities),
                 self.paths_drawn,
+                self.regions_drawn,
             );
         }
+    }
+
+    /// Phase 4.1: draw red polygon outlines for each BlockedRegion plus
+    /// optional orange filled circle markers (forward-compat — no source
+    /// data has a radius today). One-shot like `ensure_paths_drawn` —
+    /// regions are static after `state::initialization`. Called every
+    /// tick but only does work the first time `blocked_regions` is
+    /// non-empty (matches the lazy paths-init pattern, since the omb
+    /// scene loader populates the resource before the first dispatch
+    /// but TD_1 has zero regions and won't trigger the draw at all).
+    fn ensure_blocked_regions_drawn(
+        &mut self,
+        regions: &[crate::sim_runner::BlockedRegionSnapshot],
+        scene: &mut Scene,
+    ) {
+        if self.regions_drawn || regions.is_empty() {
+            return;
+        }
+        let mut polygon_segments: usize = 0;
+        let mut circles: usize = 0;
+        for region in regions {
+            if region.points.len() >= 2 {
+                // Polygon outline = N edges; close the loop with last→first.
+                let n = region.points.len();
+                for i in 0..n {
+                    let (x1, y1) = region.points[i];
+                    let (x2, y2) = region.points[(i + 1) % n];
+                    let rx1 = -x1 * WORLD_SCALE;
+                    let ry1 = y1 * WORLD_SCALE;
+                    let rx2 = -x2 * WORLD_SCALE;
+                    let ry2 = y2 * WORLD_SCALE;
+                    let dx = rx2 - rx1;
+                    let dy = ry2 - ry1;
+                    let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                    let mid_x = (rx1 + rx2) * 0.5;
+                    let mid_y = (ry1 + ry2) * 0.5;
+                    let angle = dy.atan2(dx);
+                    let seg: Handle<Node> = RectangleBuilder::new(
+                        BaseBuilder::new().with_local_transform(
+                            TransformBuilder::new()
+                                .with_local_position(Vector3::new(mid_x, mid_y, Z_RB_REGION))
+                                .with_local_rotation(
+                                    fyrox::core::algebra::UnitQuaternion::from_axis_angle(
+                                        &fyrox::core::algebra::Vector3::z_axis(),
+                                        angle,
+                                    ),
+                                )
+                                .with_local_scale(Vector3::new(
+                                    len,
+                                    REGION_LINE_THICKNESS,
+                                    f32::EPSILON,
+                                ))
+                                .build(),
+                        ),
+                    )
+                    .with_color(Color::from_rgba(
+                        REGION_OUTLINE_COLOR.0,
+                        REGION_OUTLINE_COLOR.1,
+                        REGION_OUTLINE_COLOR.2,
+                        REGION_OUTLINE_COLOR.3,
+                    ))
+                    .build(&mut scene.graph)
+                    .transmute();
+                    self.region_nodes.push(seg);
+                    polygon_segments += 1;
+                }
+            }
+            // Optional circle marker — currently never set since omb
+            // BlockedRegion has no radius field. Plumbed so future
+            // circular blockers (e.g. tower footprint) can land here
+            // without touching render code.
+            if let Some(((cx, cy), r)) = region.circle {
+                let rx = -cx * WORLD_SCALE;
+                let ry = cy * WORLD_SCALE;
+                let rr = r * WORLD_SCALE;
+                // Approximate circle with a square sprite — cheap and
+                // good enough for a debug overlay; renderer can swap to
+                // a proper circle texture later.
+                let node: Handle<Node> = RectangleBuilder::new(
+                    BaseBuilder::new().with_local_transform(
+                        TransformBuilder::new()
+                            .with_local_position(Vector3::new(rx, ry, Z_RB_REGION))
+                            .with_local_scale(Vector3::new(rr * 2.0, rr * 2.0, f32::EPSILON))
+                            .build(),
+                    ),
+                )
+                .with_color(Color::from_rgba(
+                    REGION_CIRCLE_COLOR.0,
+                    REGION_CIRCLE_COLOR.1,
+                    REGION_CIRCLE_COLOR.2,
+                    REGION_CIRCLE_COLOR.3,
+                ))
+                .build(&mut scene.graph)
+                .transmute();
+                self.region_nodes.push(node);
+                circles += 1;
+            }
+        }
+        self.regions_drawn = true;
+        log::info!(
+            "render_bridge: drew {} region segments + {} circle markers for {} region(s)",
+            polygon_segments,
+            circles,
+            regions.len()
+        );
     }
 
     fn ensure_paths_drawn(&mut self, paths: &[Vec<(f32, f32)>], scene: &mut Scene) {
