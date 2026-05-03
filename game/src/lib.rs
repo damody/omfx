@@ -2251,6 +2251,18 @@ impl Plugin for Game {
                 }
 
                 // Despawn labels for entities no longer in snapshot.
+                // Phase 1.6: snapshot now carries explicit `removed_entity_ids`
+                // (diff computed worker-locally in sim_runner), replacing the
+                // legacy omb `entity.death` GameEvent. We still keep the
+                // `alive`-set sweep below as a belt-and-suspenders defense
+                // against any cache rows whose eid never appeared in
+                // `removed_entity_ids` (e.g. labels created before the very
+                // first prev_alive snapshot was populated).
+                for &eid in &snapshot.removed_entity_ids {
+                    if let Some(slot) = self.sim_entity_labels.remove(&eid) {
+                        ui.send(slot.handle, WidgetMessage::Remove);
+                    }
+                }
                 let to_remove: Vec<u32> = self
                     .sim_entity_labels
                     .keys()
@@ -3220,6 +3232,22 @@ impl Game {
         }
 
         // Free slots for entities that disappeared from the snapshot.
+        // Phase 1.6: prefer the explicit `removed_entity_ids` diff produced
+        // worker-side in sim_runner over the `alive`-set sweep — it's a
+        // tighter signal (only those who died this tick) and replaces the
+        // legacy wire-side `entity.death` event. The sweep below stays as
+        // defense for early-frame eids that pre-date the first prev_alive set.
+        for &eid in &snapshot.removed_entity_ids {
+            if let Some(slots) = self.sim_entity_slots.remove(&eid) {
+                if let Some(batch) = self.body_batch.as_mut() {
+                    batch.free(slots.body_slot);
+                }
+                if let Some(batch) = self.hp_batch.as_mut() {
+                    if let Some(bg) = slots.hp_bg_slot { batch.free(bg); }
+                    if let Some(fg) = slots.hp_fg_slot { batch.free(fg); }
+                }
+            }
+        }
         let to_remove: Vec<u32> = self
             .sim_entity_slots
             .keys()

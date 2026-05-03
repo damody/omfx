@@ -37,6 +37,12 @@ pub struct SimWorldSnapshot {
     /// bridge sees them on its first read after GameStart without needing a
     /// dedicated init-only channel.
     pub paths: Vec<Vec<(f32, f32)>>,
+    /// Entity ids that were alive in the previous snapshot but are no longer
+    /// present in the current ECS world. Used by the render thread to free
+    /// per-eid scene caches (labels, batch slots) without needing a wire-side
+    /// `entity.death` event. Replaces the legacy omb-side `make_entity_death`
+    /// emit; the snapshot diff is computed worker-locally each tick.
+    pub removed_entity_ids: Vec<u32>,
 }
 
 /// Per-entity render data extracted from the ECS World at the end of
@@ -208,6 +214,13 @@ fn run_sim_loop(
     info!("sim_runner: dispatcher ready, entering tick loop");
 
     let mut last_starvation_log = std::time::Instant::now();
+    // Worker-local set of entity ids alive in the previous snapshot. Diff
+    // against the current snapshot's ids each tick to populate
+    // `SimWorldSnapshot.removed_entity_ids` — the render thread uses this to
+    // free per-eid scene caches (labels, batch slots) instead of relying on
+    // a wire-side `entity.death` event. Replaces the legacy omb
+    // `make_entity_death` emit pair.
+    let mut prev_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
     loop {
         // Use recv_timeout instead of recv() so a wire stall surfaces in the
         // log as "no TickBatch in 1.0s — upstream lockstep client is the
@@ -288,7 +301,7 @@ fn run_sim_loop(
         }
         world.maintain();
 
-        let snapshot = extract_snapshot(&world, batch.tick);
+        let snapshot = extract_snapshot(&world, batch.tick, &mut prev_alive);
         if let Ok(mut s) = state_out.lock() {
             *s = snapshot;
         }
@@ -323,7 +336,11 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, Player
     }
 }
 
-fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
+fn extract_snapshot(
+    world: &World,
+    tick: u32,
+    prev_alive: &mut std::collections::HashSet<u32>,
+) -> SimWorldSnapshot {
     // omobab re-exports these via `pub use crate::comp::*;` at the
     // crate root, so go through the flat path instead of the
     // module-by-module one (some submodules like `comp::state` collide
@@ -499,10 +516,19 @@ fn extract_snapshot(world: &World, tick: u32) -> SimWorldSnapshot {
         }
     }
 
+    // Diff vs. previous tick's alive set → the entity ids that just dropped
+    // out. Render thread uses this to free per-eid scene caches.
+    let current_alive: std::collections::HashSet<u32> =
+        out.iter().map(|e| e.entity_id).collect();
+    let removed_entity_ids: Vec<u32> =
+        prev_alive.difference(&current_alive).copied().collect();
+    *prev_alive = current_alive;
+
     SimWorldSnapshot {
         tick,
         entities: out,
         paths,
+        removed_entity_ids,
     }
 }
 
