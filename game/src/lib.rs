@@ -2883,12 +2883,35 @@ impl Plugin for Game {
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
-                        // Phase 5.1: legacy NetCommand::PlaceTower send removed.
-                        // TODO Phase 5.x: route PlaceTower through lockstep PlayerInput.
-                        log::info!(
-                            "[phase5.1] Place Tower kind={} at ({:.1},{:.1}) (legacy send removed)",
-                            kind, world_pos.x / WORLD_SCALE, world_pos.y / WORLD_SCALE
-                        );
+                        // Phase 2.1: TowerPlace lockstep input. selected_tower_kind
+                        // is the unit_id string (e.g. "tower_dart") — convert to
+                        // proto u32 kind_id via omoba_template_ids::tower_by_name.
+                        match omoba_template_ids::tower_by_name(&kind) {
+                            Some(tid) => {
+                                let pos = world_render_to_vec2i(world_pos);
+                                let input = omoba_core::kcp::game_proto::PlayerInput {
+                                    action: Some(
+                                        omoba_core::kcp::game_proto::player_input::Action::TowerPlace(
+                                            omoba_core::kcp::game_proto::TowerPlace {
+                                                tower_kind_id: tid.0 as u32,
+                                                pos: Some(pos),
+                                            },
+                                        ),
+                                    ),
+                                };
+                                self.send_lockstep_input(input);
+                                log::info!(
+                                    "Tower place lockstep input submitted: kind='{}' kind_id={} pos=({}, {})",
+                                    kind, tid.0, pos.x, pos.y
+                                );
+                            }
+                            None => {
+                                log::warn!(
+                                    "Tower place: unknown kind name '{}' (no template_ids match) — skipped",
+                                    kind
+                                );
+                            }
+                        }
                         if !self.ctrl_held {
                             self.selected_tower_kind = None;
                         }

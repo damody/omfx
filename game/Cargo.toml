@@ -21,6 +21,10 @@ tokio = { version = "1.0", features = ["rt-multi-thread"] }
 omobab = { path = "../../omb", default-features = false, features = ["kcp"] }
 specs = { path = "../../specs", features = ["derive", "serde"] }
 omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }
+# Phase 2.1: TowerPlace UI handler converts the selected tower kind name
+# (`td_template_order` entries like "tower_dart") to the proto `tower_kind_id`
+# u32 via `omoba_template_ids::tower_by_name`.
+omoba-template-ids = { path = "../../omoba-template-ids" }
 failure = "0.1.8"
 # Phase 3.3: needed for re-encoding PlayerInput across the omoba_core /
 # omobab proto-type boundary at the lockstep → sim_runner bridge.

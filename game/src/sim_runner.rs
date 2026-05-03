@@ -268,6 +268,13 @@ fn run_sim_loop(
         dispatcher.dispatch(&world);
         world.maintain();
 
+        // Phase 2.1: drain `PendingTowerSpawnQueue` filled by
+        // `player_input_tick::Sys` during the dispatch above. Mirrors the same
+        // call in omb's `state::core::tick` so host + replica spawn TD towers
+        // deterministically from `PlayerInputEnum::TowerPlace` inputs.
+        omobab::comp::GameProcessor::drain_pending_tower_spawns(&mut world);
+        world.maintain();
+
         // Phase 3 dispatcher only schedules tick systems; it does NOT include
         // GameProcessor::process_outcomes. Without this, `creep_wave` produces
         // `Outcome::Creep { cd }` rows that pile up in `Vec<Outcome>` but no
