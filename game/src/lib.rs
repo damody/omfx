@@ -708,6 +708,14 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     sim_entity_labels: HashMap<u32, SimEntityLabel>,
 
+    /// Batched-mesh slot ownership for sim_runner-backed entities, keyed by
+    /// `entity_id`. body_batch + hp_batch slots are allocated on first
+    /// sighting and freed when the entity drops from the snapshot. This is
+    /// the draw-call-saving path: 1000 creeps + 1000 towers ≈ 2 draws total
+    /// (one per batch), vs. one node-per-entity which is one draw per quad.
+    #[visit(skip)] #[reflect(hidden)]
+    sim_entity_slots: HashMap<u32, render_bridge::SimEntitySlots>,
+
     // --- UI ---
     #[visit(skip)] #[reflect(hidden)]
     ui_status_text: Handle<Text>,
@@ -1720,6 +1728,13 @@ impl Plugin for Game {
                 );
             }
         }
+
+        // Phase 5.x: write sim_runner-backed entities into body_batch + hp_batch
+        // BEFORE flushing. Replaces the per-entity RectangleBuilder spawn from
+        // earlier 4.2 render_bridge — each entity used to be a separate scene
+        // node = separate draw call (1000 entities → 3000+ draws). Now the
+        // entire entity set goes through 2-3 batched meshes = 2-3 draws total.
+        self.update_sim_batches();
 
         // Batched mesh flush：interp loop 寫進各 batch 的 cpu_mirror，這裡一次性
         // upload 整批 vertex buffer 到 GPU。每個 batch = 1 個 mesh = 1 個 draw call。
@@ -3053,6 +3068,121 @@ impl Game {
     /// Phase 4.5 cuts the legacy side. Until then a single click may produce
     /// two server-side messages; omb-side is responsible for de-duping or
     /// (post-Phase-4.5) ignoring the legacy command.
+    /// Phase 5.x: each tick, mirror sim_runner snapshot entities into the
+    /// shared body_batch + hp_batch CPU mirrors. Allocates a slot per entity
+    /// on first sighting; frees slots on dropout. EntityKind::Other is
+    /// skipped (internal ECS rows like RegionBlocker should not render).
+    fn update_sim_batches(&mut self) {
+        let Some(ref sim) = self.sim_runner_handle else { return };
+        let Ok(snapshot) = sim.state.try_lock() else { return };
+
+        let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
+        for e in &snapshot.entities {
+            if matches!(e.kind, sim_runner::EntityKind::Other) {
+                continue;
+            }
+            alive.insert(e.entity_id);
+
+            let pos = render_bridge::world_to_render(e);
+            let (color, size, z) = render_bridge::style_for_entity(e);
+
+            // Body slot: alloc on first sighting, then write_quad each tick.
+            let slots_entry = self.sim_entity_slots.entry(e.entity_id);
+            let slots = slots_entry.or_insert_with(|| {
+                let body_slot = self
+                    .body_batch
+                    .as_mut()
+                    .map(|b| b.alloc())
+                    .unwrap_or(0);
+                render_bridge::SimEntitySlots {
+                    body_slot,
+                    hp_bg_slot: None,
+                    hp_fg_slot: None,
+                }
+            });
+
+            if let Some(batch) = self.body_batch.as_mut() {
+                batch.write_quad(
+                    slots.body_slot,
+                    &sprite_resources::QuadParams {
+                        center: pos,
+                        size: Vector2::new(size, size),
+                        color,
+                        rotation: 0.0,
+                        z,
+                    },
+                );
+            }
+
+            // HP bar (bg + fg). Alloc lazily — projectiles + entities w/o hp
+            // skip allocating to keep capacity for actual units.
+            if e.max_hp > 0 {
+                if slots.hp_bg_slot.is_none() {
+                    if let Some(batch) = self.hp_batch.as_mut() {
+                        slots.hp_bg_slot = Some(batch.alloc());
+                        slots.hp_fg_slot = Some(batch.alloc());
+                    }
+                }
+                if let (Some(bg), Some(fg)) = (slots.hp_bg_slot, slots.hp_fg_slot) {
+                    let bar_w = (size * 1.6).max(0.4);
+                    let bar_h = 0.06_f32;
+                    let bar_y = pos.y + size * 0.55;
+                    let hp_ratio = (e.hp as f32 / e.max_hp as f32).clamp(0.0, 1.0);
+                    let bar_color: [u8; 4] = if hp_ratio < 0.30 {
+                        [220, 50, 50, 255]
+                    } else if hp_ratio < 0.60 {
+                        [220, 200, 60, 255]
+                    } else {
+                        [40, 220, 60, 255]
+                    };
+                    if let Some(batch) = self.hp_batch.as_mut() {
+                        batch.write_quad(
+                            bg,
+                            &sprite_resources::QuadParams {
+                                center: Vector2::new(pos.x, bar_y),
+                                size: Vector2::new(bar_w, bar_h),
+                                color: [0, 0, 0, 220],
+                                rotation: 0.0,
+                                z: Z_HP_BAR + 0.01,
+                            },
+                        );
+                        let fg_w = bar_w * hp_ratio;
+                        let fg_offset = (bar_w - fg_w) * 0.5;
+                        batch.write_quad(
+                            fg,
+                            &sprite_resources::QuadParams {
+                                center: Vector2::new(pos.x - fg_offset, bar_y),
+                                size: Vector2::new(fg_w.max(0.001), bar_h * 0.8),
+                                color: bar_color,
+                                rotation: 0.0,
+                                z: Z_HP_BAR,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Free slots for entities that disappeared from the snapshot.
+        let to_remove: Vec<u32> = self
+            .sim_entity_slots
+            .keys()
+            .filter(|id| !alive.contains(id))
+            .copied()
+            .collect();
+        for id in to_remove {
+            if let Some(slots) = self.sim_entity_slots.remove(&id) {
+                if let Some(batch) = self.body_batch.as_mut() {
+                    batch.free(slots.body_slot);
+                }
+                if let Some(batch) = self.hp_batch.as_mut() {
+                    if let Some(bg) = slots.hp_bg_slot { batch.free(bg); }
+                    if let Some(fg) = slots.hp_fg_slot { batch.free(fg); }
+                }
+            }
+        }
+    }
+
     fn send_lockstep_input(&self, input: omoba_core::kcp::game_proto::PlayerInput) {
         let Some(handle) = self.lockstep_handle.as_ref() else { return };
         // +3 was the original Phase 4.3 lookahead for localhost zero-latency.
