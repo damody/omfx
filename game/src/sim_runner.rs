@@ -288,6 +288,12 @@ fn run_sim_loop(
         omobab::comp::GameProcessor::drain_pending_tower_upgrades(&mut world);
         world.maintain();
 
+        // Phase 2.4: drain `PendingItemUseQueue` from ItemUse inputs.
+        // Mirrors omb's `state::core::tick`. Inventory cooldown + CProperty
+        // (HP / msd) mutations need to run on host and replica in sync.
+        omobab::comp::GameProcessor::drain_pending_item_uses(&mut world);
+        world.maintain();
+
         // Phase 3 dispatcher only schedules tick systems; it does NOT include
         // GameProcessor::process_outcomes. Without this, `creep_wave` produces
         // `Outcome::Creep { cd }` rows that pile up in `Vec<Outcome>` but no

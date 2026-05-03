@@ -3156,8 +3156,15 @@ impl Plugin for Game {
                             KeyCode::Digit8 => 8, KeyCode::Digit9 => 9,
                             _ => unreachable!(),
                         };
-                        // Phase 5.1: legacy BuyItem / SellItem / UseItem removed
-                        // (item shop not yet on lockstep wire).
+                        // Phase 5.1: legacy BuyItem / SellItem removed (item
+                        // shop not yet on lockstep wire). Phase 2.4: UseItem
+                        // wired through lockstep PlayerInput — Digit1..=6
+                        // (shop closed) maps to slot 0..=5; hotbar UI not yet
+                        // implemented (Phase 4.4 will add inventory icons in
+                        // SimWorldSnapshot.HeroStatsExt + render), so the
+                        // keyboard binding is the only entry point right
+                        // now. Shift+Digit kept on the legacy stub since
+                        // SellItem isn't on the lockstep proto yet.
                         if self.shop_visible {
                             if let Some((id, _, _)) = SHOP_ITEMS.get(idx) {
                                 send_stub("BuyItem", id);
@@ -3166,7 +3173,20 @@ impl Plugin for Game {
                             if self.shift_held {
                                 send_stub("SellItem", &(idx - 1).to_string());
                             } else {
-                                send_stub("UseItem", &(idx - 1).to_string());
+                                let slot_idx = (idx - 1) as u32;
+                                let input = omoba_core::kcp::game_proto::PlayerInput {
+                                    action: Some(
+                                        omoba_core::kcp::game_proto::player_input::Action::ItemUse(
+                                            omoba_core::kcp::game_proto::ItemUse {
+                                                item_slot: slot_idx,
+                                                target_pos: None,
+                                                target_entity: None,
+                                            },
+                                        ),
+                                    ),
+                                };
+                                self.send_lockstep_input(input);
+                                log::info!("Item use lockstep input submitted: slot={}", slot_idx);
                             }
                         }
                     }
