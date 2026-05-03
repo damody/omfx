@@ -3055,7 +3055,16 @@ impl Game {
     /// (post-Phase-4.5) ignoring the legacy command.
     fn send_lockstep_input(&self, input: omoba_core::kcp::game_proto::PlayerInput) {
         let Some(handle) = self.lockstep_handle.as_ref() else { return };
-        let target_tick = self.current_sim_tick.wrapping_add(3);
+        // +3 was the original Phase 4.3 lookahead for localhost zero-latency.
+        // In practice the wire path (input_tx → tokio task → KCP write → server
+        // receive → InputBuffer.submit) takes 1-4 server ticks (~16-66ms at
+        // 60Hz), so server.current_tick has already passed the target. omb logs
+        // "late InputSubmit ... target_tick=N current_tick=N+1..N+4" and drops
+        // every input. Bump to +30 (~500ms @ 60Hz) so even loaded servers /
+        // brief stalls don't reject inputs. Cost: 500ms input lag in pure
+        // singleplayer. Acceptable for now; tune to RTT-based once we have
+        // multi-client telemetry.
+        let target_tick = self.current_sim_tick.wrapping_add(30);
         if let Err(e) = handle.input_tx.send((target_tick, input)) {
             log::warn!("[lockstep] input_tx send failed: {e}");
         }
