@@ -2851,9 +2851,24 @@ impl Plugin for Game {
                         && screen.y >= by && screen.y <= by + bh
                     {
                         if let Some(tid) = self.selected_tower_entity {
-                            // Phase 5.1: legacy NetCommand::SellTower send removed.
-                            // TODO Phase 5.x: route SellTower through lockstep PlayerInput.
-                            log::info!("[phase5.1] Sell Tower id={} (legacy send removed)", tid);
+                            // Phase 2.2: TowerSell lockstep input. tid is the
+                            // tower entity id (specs `Entity::id()` u32);
+                            // omb's drain handler resolves Entity, validates
+                            // Player faction, refunds 85% base + 75% upgrades,
+                            // and deletes the entity (snapshot diff cleans
+                            // render). selected_tower_entity is cleared
+                            // unconditionally because the entity is going away.
+                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                                action: Some(
+                                    omoba_core::kcp::game_proto::player_input::Action::TowerSell(
+                                        omoba_core::kcp::game_proto::TowerSell {
+                                            tower_entity_id: tid,
+                                        },
+                                    ),
+                                ),
+                            };
+                            self.send_lockstep_input(input);
+                            log::info!("Tower sell lockstep input submitted: eid={}", tid);
                             self.selected_tower_entity = None;
                         }
                         hit_ui = true;

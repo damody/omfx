@@ -275,6 +275,12 @@ fn run_sim_loop(
         omobab::comp::GameProcessor::drain_pending_tower_spawns(&mut world);
         world.maintain();
 
+        // Phase 2.2: drain `PendingTowerSellQueue` from TowerSell inputs.
+        // Mirrors omb's `state::core::tick`. Refund + entity delete done in
+        // sync on host and replica so snapshots stay consistent.
+        omobab::comp::GameProcessor::drain_pending_tower_sells(&mut world);
+        world.maintain();
+
         // Phase 3 dispatcher only schedules tick systems; it does NOT include
         // GameProcessor::process_outcomes. Without this, `creep_wave` produces
         // `Outcome::Creep { cd }` rows that pile up in `Vec<Outcome>` but no
