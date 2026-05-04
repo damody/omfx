@@ -1206,7 +1206,7 @@ impl Plugin for Game {
             self.ui_td_sell_name_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(-9999.0, -9999.0))
-                    .with_width(240.0)
+                    .with_width(360.0)
                     .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
             )
             .with_text(String::new())
@@ -1216,26 +1216,26 @@ impl Plugin for Game {
             self.ui_td_sell_button_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(-9999.0, -9999.0))
-                    .with_width(240.0)
+                    .with_width(360.0)
                     .with_foreground(Brush::Solid(Color::from_rgba(120, 20, 20, 255)).into()),
             )
             .with_text(String::new())
             .with_font_size(20.0.into())
             .build(&mut ui.build_ctx());
-            self.td_sell_button_rect = (-9999.0, -9999.0, 240.0, 42.0);
+            self.td_sell_button_rect = (-9999.0, -9999.0, 360.0, 42.0);
 
             // 3 條路線升級按鈕（塔被選取時才定位到可見位置）
             for i in 0..3 {
                 self.ui_td_upgrade_buttons[i] = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(Vector2::new(-9999.0, -9999.0))
-                        .with_width(240.0)
+                        .with_width(360.0)
                         .with_foreground(Brush::Solid(Color::from_rgba(20, 60, 120, 255)).into()),
                 )
                 .with_text(String::new())
                 .with_font_size(18.0.into())
                 .build(&mut ui.build_ctx());
-                self.td_upgrade_button_rects[i] = (-9999.0, -9999.0, 240.0, 38.0);
+                self.td_upgrade_button_rects[i] = (-9999.0, -9999.0, 360.0, 38.0);
             }
         }
 
@@ -2538,36 +2538,32 @@ impl Plugin for Game {
                     } else {
                         format!("#{}", entity.entity_id)
                     };
-                    // Phase 4.3: tower upgrade pips appended to the label
-                    // when any path is upgraded. Avoids spawning N×3 new
-                    // scene nodes for the 1000-tower stress path; reuses
-                    // the existing per-entity Text widget. Format mirrors
-                    // the right-panel dot style ("●○○") so the legend is
-                    // visually consistent. Skipped when all paths are 0.
-                    let pip_suffix = entity.upgrade_levels
-                        .filter(|lv| lv.iter().any(|&n| n > 0))
-                        .map(|lv| {
-                            let dots: Vec<String> = lv
-                                .iter()
-                                .map(|&n| {
-                                    let filled = (n as usize).min(4);
-                                    let empty = 4 - filled;
-                                    "●".repeat(filled) + &"○".repeat(empty)
-                                })
-                                .collect();
-                            format!(" [{}|{}|{}]", dots[0], dots[1], dots[2])
-                        })
-                        .unwrap_or_default();
-                    let text = if entity.max_hp > 0 {
+                    // Tower 標籤：只在有升級時顯示「L0/L1/L2」格式，無升級不顯示
+                    // 任何文字（也不顯示 HP — 塔不需要 HP 資訊）。Hero/Creep 走
+                    // 既有 "name HP/MaxHP" 格式。
+                    let is_tower = matches!(entity.kind, sim_runner::EntityKind::Tower);
+                    // Skip drawing a label widget for towers with no upgrades.
+                    // Mark NOT-alive so the post-loop retain step removes any
+                    // stale widget that lingered from a previous frame
+                    // (eg. tower just sold or never upgraded).
+                    if is_tower && entity.upgrade_levels.map_or(true, |lv| lv.iter().all(|&n| n == 0)) {
+                        alive.remove(&entity.entity_id);
+                        continue;
+                    }
+                    let text = if is_tower {
+                        match entity.upgrade_levels {
+                            Some(lv) if lv.iter().any(|&n| n > 0) => {
+                                format!("{}/{}/{}", lv[0], lv[1], lv[2])
+                            }
+                            _ => String::new(),
+                        }
+                    } else if entity.max_hp > 0 {
                         format!(
-                            "{} {}/{}{}",
+                            "{} {}/{}",
                             display_name,
                             entity.hp.max(0),
-                            entity.max_hp,
-                            pip_suffix
+                            entity.max_hp
                         )
-                    } else if !pip_suffix.is_empty() {
-                        format!("{}{}", display_name, pip_suffix)
                     } else {
                         display_name
                     };
@@ -2797,7 +2793,10 @@ impl Plugin for Game {
 
             // ===== TD 模式：選中塔 Sell 面板（右側，4 塔按鈕下方） =====
             {
-                let panel_w = 240.0f32;
+                // Wider panel so the upgrade button text (含 next-level
+                // upgrade name) doesn't get visually clipped by the
+                // window edge.
+                let panel_w = 360.0f32;
                 let name_h = 28.0f32;
                 let btn_h = 42.0f32;
                 let right_margin = 20.0f32;
