@@ -34,9 +34,9 @@ use fyrox::{
     },
 };
 
-use std::collections::{HashMap, BinaryHeap};
+use std::collections::{HashMap, BinaryHeap, VecDeque};
 use std::cmp::{Ordering, Reverse};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omoba_core::GameEventData;
 
@@ -69,6 +69,119 @@ fn convert_player_input(
             None
         }
     }
+}
+
+const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
+const INPUT_LATENCY_CAPACITY: usize = 120;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputActionKind {
+    TowerPlace,
+    TowerSell,
+    TowerUpgrade,
+    ItemUse,
+    StartRound,
+    MoveTo,
+    AttackTarget,
+    CastAbility,
+    NoOp,
+}
+
+impl InputActionKind {
+    fn from_player_input(input: &omoba_core::kcp::game_proto::PlayerInput) -> Self {
+        use omoba_core::kcp::game_proto::player_input::Action;
+        match input.action.as_ref() {
+            Some(Action::TowerPlace(_)) => Self::TowerPlace,
+            Some(Action::TowerSell(_)) => Self::TowerSell,
+            Some(Action::TowerUpgrade(_)) => Self::TowerUpgrade,
+            Some(Action::ItemUse(_)) => Self::ItemUse,
+            Some(Action::StartRound(_)) => Self::StartRound,
+            Some(Action::MoveTo(_)) => Self::MoveTo,
+            Some(Action::AttackTarget(_)) => Self::AttackTarget,
+            Some(Action::CastAbility(_)) => Self::CastAbility,
+            Some(Action::NoOp(_)) | None => Self::NoOp,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingInput {
+    submit_wall_clock_us: u64,
+    submit_instant: Instant,
+    target_tick: u32,
+    action_kind: InputActionKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct LatencySample {
+    pub input_id: u32,
+    pub action_kind: InputActionKind,
+    pub total_ms: u32,
+    pub submitted_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct InputLatencyMeter {
+    samples: VecDeque<LatencySample>,
+    last_compute_at: Instant,
+    cached_p50_ms: u32,
+    cached_p99_ms: u32,
+    cached_max_ms: u32,
+    cached_latest_ms: u32,
+}
+
+impl Default for InputLatencyMeter {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            last_compute_at: Instant::now(),
+            cached_p50_ms: 0,
+            cached_p99_ms: 0,
+            cached_max_ms: 0,
+            cached_latest_ms: 0,
+        }
+    }
+}
+
+impl InputLatencyMeter {
+    pub fn push(&mut self, sample: LatencySample) {
+        self.cached_latest_ms = sample.total_ms;
+        self.samples.push_back(sample);
+        while self.samples.len() > INPUT_LATENCY_CAPACITY {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn maybe_recompute(&mut self, now: Instant) {
+        if now.duration_since(self.last_compute_at) < Duration::from_secs(1) {
+            return;
+        }
+        self.last_compute_at = now;
+        if self.samples.is_empty() {
+            self.cached_p50_ms = 0;
+            self.cached_p99_ms = 0;
+            self.cached_max_ms = 0;
+            return;
+        }
+        let mut values: Vec<u32> = self.samples.iter().map(|s| s.total_ms).collect();
+        values.sort_unstable();
+        let last_idx = values.len() - 1;
+        self.cached_p50_ms = values[(values.len() / 2).min(last_idx)];
+        self.cached_p99_ms = values[((values.len() as f32 * 0.99) as usize).min(last_idx)];
+        self.cached_max_ms = values[last_idx];
+        self.cached_latest_ms = self.samples.back().map(|s| s.total_ms).unwrap_or(0);
+    }
+
+    fn has_samples(&self) -> bool {
+        !self.samples.is_empty()
+    }
+}
+
+fn wall_clock_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// Phase 4.3: Fixed32 raw scaling. Vec2I stores `real_units * 1024` as sint32
@@ -580,6 +693,14 @@ pub struct Game {
     /// `Game::update`.
     #[visit(skip)] #[reflect(hidden)]
     current_sim_tick: u32,
+    #[visit(skip)] #[reflect(hidden)]
+    pending_inputs: HashMap<u32, PendingInput>,
+    #[visit(skip)] #[reflect(hidden)]
+    pending_inputs_evict_at: Option<Instant>,
+    #[visit(skip)] #[reflect(hidden)]
+    pending_inputs_evicted: u64,
+    #[visit(skip)] #[reflect(hidden)]
+    input_latency_meter: InputLatencyMeter,
     /// Phase 3.2 sim_runner worker (full omb ECS dispatcher running off a
     /// background thread). Dropped on `on_deinit` so the channel
     /// disconnect lets the worker exit. Phase 3.3 will wire input feed
@@ -1516,10 +1637,10 @@ impl Plugin for Game {
                         // Bridge omoba_core's PlayerInput type → omobab's
                         // PlayerInput type via prost re-encode. They are
                         // identical wire format but distinct Rust types.
-                        let converted: Vec<(u32, sim_runner::PlayerInput)> = inputs
+                        let converted: Vec<(u32, sim_runner::PlayerInput, u32)> = inputs
                             .into_iter()
-                            .filter_map(|(pid, inp)| {
-                                convert_player_input(&inp).map(|out| (pid, out))
+                            .filter_map(|(pid, inp, input_id)| {
+                                convert_player_input(&inp).map(|out| (pid, out, input_id))
                             })
                             .collect();
                         let payload = sim_runner::TickBatchPayload {
@@ -1558,9 +1679,11 @@ impl Plugin for Game {
         // the stub `update` body with real Fyrox sprite spawn / update /
         // despawn, retiring the NetworkBridge GameEvent → sprite pipeline
         // below for the entities the sim authoritatively owns.
+        let mut applied_input_ids_to_pair: Option<Vec<u32>> = None;
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
                 self.render_bridge.update(&*snapshot, scene);
+                applied_input_ids_to_pair = Some(snapshot.applied_input_ids.clone());
 
                 // Phase 5.x: HUD heartbeat sourced from sim snapshot
                 // (NetworkBridge GameEvent stream was cut in Phase 5.1; this
@@ -1897,6 +2020,12 @@ impl Plugin for Game {
                 }
             }
         }
+        if let Some(ids) = applied_input_ids_to_pair.as_deref() {
+            self.pair_applied_inputs(ids);
+        } else {
+            self.evict_stale_pending_inputs();
+        }
+        self.input_latency_meter.maybe_recompute(now);
 
         // 網路流量統計：每秒 roll over
         self.net_stats_elapsed += context.dt;
@@ -2665,9 +2794,19 @@ impl Plugin for Game {
                     Some(us) => format!("{:.1} ms", us as f64 / 1000.0),
                     None => "—".into(),
                 };
+                let lag_str = if self.input_latency_meter.has_samples() {
+                    format!(
+                        "p50 {} / p99 {} ms",
+                        self.input_latency_meter.cached_p50_ms,
+                        self.input_latency_meter.cached_p99_ms,
+                    )
+                } else {
+                    "—".into()
+                };
                 format!(
-                    "Connected | Ping: {} | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
+                    "Connected | Ping: {} | Lag: {} | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
                     ping_str,
+                    lag_str,
                     self.heartbeat.tick,
                     self.heartbeat.game_time,
                     self.heartbeat.entity_count,
@@ -3847,7 +3986,53 @@ impl Game {
         }
     }
 
-    fn send_lockstep_input(&self, input: omoba_core::kcp::game_proto::PlayerInput) {
+    fn pair_applied_inputs(&mut self, applied_input_ids: &[u32]) {
+        if applied_input_ids.is_empty() {
+            self.evict_stale_pending_inputs();
+            return;
+        }
+        let render_us = wall_clock_us();
+        for &input_id in applied_input_ids {
+            let Some(pending) = self.pending_inputs.remove(&input_id) else { continue };
+            let total_ms = render_us
+                .saturating_sub(pending.submit_wall_clock_us)
+                .saturating_div(1_000)
+                .min(u64::from(u32::MAX)) as u32;
+            self.input_latency_meter.push(LatencySample {
+                input_id,
+                action_kind: pending.action_kind,
+                total_ms,
+                submitted_at: pending.submit_instant,
+            });
+            log::debug!(
+                "input_render_latency: id={} kind={:?} target_tick={} submit_us={} render_us={} total_ms={}",
+                input_id,
+                pending.action_kind,
+                pending.target_tick,
+                pending.submit_wall_clock_us,
+                render_us,
+                total_ms,
+            );
+        }
+        self.evict_stale_pending_inputs();
+    }
+
+    fn evict_stale_pending_inputs(&mut self) {
+        let now = Instant::now();
+        if let Some(next) = self.pending_inputs_evict_at {
+            if now < next {
+                return;
+            }
+        }
+        self.pending_inputs_evict_at = Some(now + Duration::from_secs(1));
+        let cutoff_us = wall_clock_us().saturating_sub(PENDING_INPUT_MAX_AGE_MS * 1_000);
+        let before = self.pending_inputs.len();
+        self.pending_inputs
+            .retain(|_, pending| pending.submit_wall_clock_us >= cutoff_us);
+        self.pending_inputs_evicted += (before - self.pending_inputs.len()) as u64;
+    }
+
+    fn send_lockstep_input(&mut self, input: omoba_core::kcp::game_proto::PlayerInput) {
         let Some(handle) = self.lockstep_handle.as_ref() else { return };
         // +3 was the original Phase 4.3 lookahead for localhost zero-latency.
         // In practice the wire path (input_tx → tokio task → KCP write → server
@@ -3859,9 +4044,20 @@ impl Game {
         // singleplayer. Acceptable for now; tune to RTT-based once we have
         // multi-client telemetry.
         let target_tick = self.current_sim_tick.wrapping_add(30);
-        if let Err(e) = handle.input_tx.send((target_tick, input)) {
+        let input_id = handle.next_input_id();
+        let action_kind = InputActionKind::from_player_input(&input);
+        let submit_wall_clock_us = wall_clock_us();
+        let submit_instant = Instant::now();
+        if let Err(e) = handle.input_tx.send((target_tick, input, input_id)) {
             log::warn!("[lockstep] input_tx send failed: {e}");
+            return;
         }
+        self.pending_inputs.insert(input_id, PendingInput {
+            submit_wall_clock_us,
+            submit_instant,
+            target_tick,
+            action_kind,
+        });
     }
 
     // Phase 5.1 (pass 2): apply_event + 30+ legacy GameEvent handler
@@ -4287,4 +4483,42 @@ fn circle_hits_polygon(center: Vector2<f32>, r: f32, poly: &[Vector2<f32>]) -> b
         if point_segment_dist_sq(center, a, b) < r2 { return true; }
     }
     false
+}
+
+#[cfg(test)]
+mod input_latency_tests {
+    use super::*;
+
+    fn sample(input_id: u32, total_ms: u32) -> LatencySample {
+        LatencySample {
+            input_id,
+            action_kind: InputActionKind::NoOp,
+            total_ms,
+            submitted_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn input_latency_meter_caps_to_recent_120_samples() {
+        let mut meter = InputLatencyMeter::default();
+        for i in 0..200 {
+            meter.push(sample(i, i));
+        }
+        assert_eq!(meter.samples.len(), INPUT_LATENCY_CAPACITY);
+        assert_eq!(meter.samples.front().unwrap().input_id, 80);
+    }
+
+    #[test]
+    fn input_latency_meter_recomputes_p50_p99_max_latest() {
+        let mut meter = InputLatencyMeter::default();
+        for i in 0..100 {
+            meter.push(sample(i, i));
+        }
+        let now = meter.last_compute_at + Duration::from_secs(1);
+        meter.maybe_recompute(now);
+        assert_eq!(meter.cached_p50_ms, 50);
+        assert_eq!(meter.cached_p99_ms, 99);
+        assert_eq!(meter.cached_max_ms, 99);
+        assert_eq!(meter.cached_latest_ms, 99);
+    }
 }

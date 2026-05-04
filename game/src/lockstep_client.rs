@@ -22,6 +22,7 @@
 //!   recv. Phase 2 has no UI sending inputs — Phase 3 will hook keyboard /
 //!   mouse to this channel.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -42,7 +43,7 @@ pub enum LockstepEvent {
     /// dispatcher with the actual player inputs.
     TickBatch {
         tick: u32,
-        inputs: Vec<(u32 /* player_id */, PlayerInput)>,
+        inputs: Vec<(u32 /* player_id */, PlayerInput, u32 /* input_id */)>,
         server_events: Vec<ServerEvent>,
     },
     StateHash { tick: u32, hash: u64 },
@@ -58,8 +59,8 @@ pub enum LockstepEvent {
     Disconnected { reason: String },
 }
 
-/// Outgoing input message: target tick + the prost PlayerInput payload.
-pub type LockstepInputMsg = (u32, PlayerInput);
+/// Outgoing input message: target tick + the prost PlayerInput payload + omfx metric id.
+pub type LockstepInputMsg = (u32, PlayerInput, u32);
 
 /// Handle to the background lockstep client. Drop kills the channels and
 /// causes the bg thread to exit on its next loop iteration.
@@ -69,9 +70,16 @@ pub struct LockstepClientHandle {
     /// Phase 2 stub — UI does not generate inputs yet. Phase 3 will use this
     /// to forward player input to the bg client which calls `submit_input`.
     pub input_tx: Sender<LockstepInputMsg>,
+    input_id_counter: AtomicU32,
     /// Keep the join handle alive so dropping the Handle takes the bg thread
     /// down too (channels close → bg thread breaks out of its loop).
     _thread: thread::JoinHandle<()>,
+}
+
+impl LockstepClientHandle {
+    pub fn next_input_id(&self) -> u32 {
+        self.input_id_counter.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 /// Spawn the lockstep client background thread.
@@ -104,6 +112,7 @@ pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClien
     LockstepClientHandle {
         events_rx,
         input_tx,
+        input_id_counter: AtomicU32::new(1),
         _thread: handle,
     }
 }
@@ -216,10 +225,10 @@ async fn run_client(
                 }
                 // Phase 3.3: extract `Vec<(player_id, PlayerInput)>` from the
                 // generated `InputForPlayer` rows.
-                let inputs: Vec<(u32, PlayerInput)> = b
+                let inputs: Vec<(u32, PlayerInput, u32)> = b
                     .inputs
                     .into_iter()
-                    .filter_map(|ifp| ifp.input.map(|inp| (ifp.player_id, inp)))
+                    .filter_map(|ifp| ifp.input.map(|inp| (ifp.player_id, inp, ifp.input_id)))
                     .collect();
                 let server_events = b.server_events;
                 let _ = events_tx.send(LockstepEvent::TickBatch {
@@ -262,8 +271,8 @@ async fn run_client(
 
         // Drain any pending input submissions without blocking. Outbound
         // InputSubmit bytes count toward the same lockstep-traffic total.
-        while let Ok((target_tick, input)) = input_rx.try_recv() {
-            match client.submit_input(target_tick, input).await {
+        while let Ok((target_tick, input, input_id)) = input_rx.try_recv() {
+            match client.submit_input(target_tick, input, input_id).await {
                 Ok((logical, wire)) => {
                     wire_delta += wire as u64;
                     logical_delta += logical as u64;

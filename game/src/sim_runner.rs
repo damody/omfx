@@ -100,6 +100,8 @@ pub struct SimWorldSnapshot {
     /// expanding red ring per entry against omfx wall clock; sim never
     /// reads this back, so it's not part of the determinism state.
     pub explosions: Vec<ExplosionFx>,
+    /// omfx-only metadata for input-to-render latency pairing; sim ECS does not read it.
+    pub applied_input_ids: Vec<u32>,
 }
 
 /// Phase 4.1: One polygon region snapshot.
@@ -270,7 +272,7 @@ pub enum EntityKind {
 #[derive(Clone, Debug)]
 pub struct TickBatchPayload {
     pub tick: u32,
-    pub inputs: Vec<(u32 /* player_id */, PlayerInput)>,
+    pub inputs: Vec<(u32 /* player_id */, PlayerInput, u32 /* input_id */)>,
 }
 
 /// Handle returned to omfx Game so the render thread can read snapshots
@@ -437,6 +439,11 @@ fn run_sim_loop(
             }
         };
 
+        let applied_input_ids = batch
+            .inputs
+            .iter()
+            .filter_map(|(_, _, input_id)| (*input_id != 0).then_some(*input_id))
+            .collect::<Vec<_>>();
         push_inputs_into_world(&mut world, batch.tick, batch.inputs);
 
         // Update Tick + Time + DeltaTime so time-gated systems (creep_wave,
@@ -607,6 +614,7 @@ fn run_sim_loop(
             abilities_arc.clone(),
             tower_templates_arc.clone(),
             tower_upgrades_arc.clone(),
+            applied_input_ids,
         );
 
         // Diagnostic for the "creep HP bars stay full" regression report
@@ -649,7 +657,7 @@ fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Err
     Ok(world)
 }
 
-fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, PlayerInput)>) {
+fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, PlayerInput, u32)>) {
     // Phase 3.4: write the lockstep TickBatch inputs into the host's
     // `PendingPlayerInputs` resource so omb's `tick::player_input_tick::Sys`
     // can drain them at the start of the dispatcher run.
@@ -664,7 +672,7 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, Player
     if !inputs.is_empty() {
         log::trace!("sim_runner: tick {} got {} inputs", tick, inputs.len());
     }
-    for (player_id, input) in inputs {
+    for (player_id, input, _input_id) in inputs {
         pending.by_player.insert(player_id, input);
     }
 }
@@ -675,6 +683,7 @@ fn extract_snapshot(
     abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
     tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
     tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
+    applied_input_ids: Vec<u32>,
 ) -> SimWorldSnapshot {
     // omobab re-exports these via `pub use crate::comp::*;` at the
     // crate root, so go through the flat path instead of the
@@ -1057,6 +1066,7 @@ fn extract_snapshot(
         tower_templates: tower_templates_arc,
         tower_upgrades: tower_upgrades_arc,
         explosions,
+        applied_input_ids,
     }
 }
 
