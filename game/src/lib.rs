@@ -2448,14 +2448,14 @@ impl Plugin for Game {
                         display_name
                     };
 
-                    // BUG FIX: 之前用 backend coords (entity.pos_y + 60.0) 直接餵
-                    // world_to_screen_approx，但該函式期待 render units。Backend 座標
-                    // (-1340 之類) 經過後 sy 算出 ±10x window height → label 完全跑出
-                    // 螢幕。改成先做 backend→render 換算（同 render_bridge::world_to_render
-                    // 的 -x flip + WORLD_SCALE=0.01），再加 0.5 render-unit Y offset 讓
-                    // label 浮在 sprite + HP bar 上方。
+                    // BUG FIX (Phase 5.x): 之前用 backend coords 直接餵 world_to_screen_approx。
+                    // 該函式註解寫 "camera 的 -1 X scale 已把原本的翻轉抵消"，意思是它
+                    // 接受 backend X 直接乘 WORLD_SCALE（不需自己翻 -x），然後函式內 +X
+                    // world → +X screen 對應；sprite render 走 fyrox scene graph 經過
+                    // camera -1 X 翻轉後才到螢幕，正好抵消 render_bridge 的 -x flip。
+                    // 先前我多翻一次 → 名字跟 sprite 左右相反。
                     const WORLD_SCALE: f32 = 0.01;
-                    let render_x = -entity.pos_x * WORLD_SCALE;
+                    let render_x = entity.pos_x * WORLD_SCALE;
                     let render_y = entity.pos_y * WORLD_SCALE + 0.5;
                     let screen_pos = world_to_screen_approx(
                         render_x - self.camera_world_pos.x,
