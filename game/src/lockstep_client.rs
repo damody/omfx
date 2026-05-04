@@ -22,6 +22,7 @@
 //!   recv. Phase 2 has no UI sending inputs — Phase 3 will hook keyboard /
 //!   mouse to this channel.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
@@ -71,6 +72,7 @@ pub struct LockstepClientHandle {
     /// to forward player input to the bg client which calls `submit_input`.
     pub input_tx: Sender<LockstepInputMsg>,
     input_id_counter: AtomicU32,
+    latest_tick: Arc<AtomicU32>,
     /// Keep the join handle alive so dropping the Handle takes the bg thread
     /// down too (channels close → bg thread breaks out of its loop).
     _thread: thread::JoinHandle<()>,
@@ -80,12 +82,18 @@ impl LockstepClientHandle {
     pub fn next_input_id(&self) -> u32 {
         self.input_id_counter.fetch_add(1, Ordering::Relaxed)
     }
+
+    pub fn latest_tick(&self) -> u32 {
+        self.latest_tick.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawn the lockstep client background thread.
 pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClientHandle {
     let (events_tx, events_rx) = unbounded();
     let (input_tx, input_rx) = unbounded::<LockstepInputMsg>();
+    let latest_tick = Arc::new(AtomicU32::new(0));
+    let latest_tick_for_thread = latest_tick.clone();
 
     let handle = thread::Builder::new()
         .name("omfx-lockstep-client".into())
@@ -104,7 +112,7 @@ pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClien
                 }
             };
             rt.block_on(async move {
-                run_client(addr, player_name, events_tx, input_rx).await;
+                run_client(addr, player_name, events_tx, input_rx, latest_tick_for_thread).await;
             });
         })
         .expect("spawn omfx-lockstep-client thread");
@@ -113,6 +121,7 @@ pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClien
         events_rx,
         input_tx,
         input_id_counter: AtomicU32::new(1),
+        latest_tick,
         _thread: handle,
     }
 }
@@ -122,6 +131,7 @@ async fn run_client(
     player_name: String,
     events_tx: Sender<LockstepEvent>,
     input_rx: Receiver<LockstepInputMsg>,
+    latest_tick: Arc<AtomicU32>,
 ) {
     info!("lockstep-client connecting to {}", addr);
 
@@ -175,9 +185,11 @@ async fn run_client(
         }
     };
 
-    // Main loop: poll inbound, drain pending outgoing inputs after each recv.
-    // crossbeam_channel::try_recv is non-blocking so this stays cheap.
+    // Main loop: poll inbound and frequently drain pending outgoing inputs.
+    // A long recv timeout adds up to one TickBatch of input latency, enough to
+    // make the intended +3 tick lookahead arrive late on localhost.
     let mut last_hb_log = std::time::Instant::now();
+    let mut last_stall_log = std::time::Instant::now();
     let mut tick_batches_since_log: u32 = 0;
     let mut last_known_tick: u32 = 0;
     // Per-iteration byte deltas — flushed to a NetStats event at the bottom of
@@ -188,19 +200,20 @@ async fn run_client(
         wire_delta = 0;
         logical_delta = 0;
         let recv_result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(2),
             rx.recv(),
         ).await;
         match recv_result {
             Err(_elapsed) => {
-                // No KCP frame in 2s. Either omb broadcaster stalled, KCP
-                // session is dead, or omfx tokio runtime is starved.
-                warn!(
-                    "[lockstep-client] no KCP frame in 2.0s (last_known_tick={}). \
-                     Upstream omb→KCP path is the suspect.",
-                    last_known_tick,
-                );
-                continue;
+                let now = std::time::Instant::now();
+                if now.duration_since(last_stall_log).as_secs() >= 2 {
+                    warn!(
+                        "[lockstep-client] no KCP frame in 2.0s (last_known_tick={}). \
+                         Upstream omb→KCP path is the suspect.",
+                        last_known_tick,
+                    );
+                    last_stall_log = now;
+                }
             }
             Ok(None) => {
                 warn!("lockstep-client stream closed");
@@ -214,7 +227,9 @@ async fn run_client(
                 logical_delta += logical_bytes as u64;
                 tick_batches_since_log += 1;
                 last_known_tick = b.tick;
+                latest_tick.store(b.tick, Ordering::Relaxed);
                 let now = std::time::Instant::now();
+                last_stall_log = now;
                 if now.duration_since(last_hb_log).as_secs() >= 5 {
                     info!(
                         "[lockstep-client] healthy: {} TickBatch frames in last 5s (latest tick={})",

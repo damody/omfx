@@ -73,6 +73,7 @@ fn convert_player_input(
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = 120;
+const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputActionKind {
@@ -699,6 +700,8 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     current_sim_tick: u32,
     #[visit(skip)] #[reflect(hidden)]
+    current_sim_tick_observed_at: Option<Instant>,
+    #[visit(skip)] #[reflect(hidden)]
     pending_inputs: HashMap<u32, PendingInput>,
     #[visit(skip)] #[reflect(hidden)]
     pending_inputs_evict_at: Option<Instant>,
@@ -871,6 +874,8 @@ pub struct Game {
     /// would warn "round already running").
     #[visit(skip)] #[reflect(hidden)]
     auto_start_sent: bool,
+    #[visit(skip)] #[reflect(hidden)]
+    auto_noop_next_at_s: Option<f32>,
 
     // --- UI ---
     #[visit(skip)] #[reflect(hidden)]
@@ -1561,6 +1566,40 @@ impl Plugin for Game {
                 }
             }
         }
+        if let Ok(v) = std::env::var("OMFX_AUTO_NOOP_EVERY_MS") {
+            if let Ok(interval_ms) = v.parse::<f32>() {
+                if interval_ms > 0.0 {
+                    let start_after_s = std::env::var("OMFX_AUTO_NOOP_START_AFTER_SEC")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .or_else(|| {
+                            std::env::var("OMFX_AUTO_START_AFTER_SEC")
+                                .ok()
+                                .and_then(|v| v.parse::<f32>().ok())
+                        })
+                        .unwrap_or(0.0);
+                    let interval_s = interval_ms / 1000.0;
+                    if elapsed_s < start_after_s {
+                        self.auto_noop_next_at_s = Some(start_after_s + interval_s);
+                    } else {
+                        let next_at = self.auto_noop_next_at_s.unwrap_or(start_after_s + interval_s);
+                        if elapsed_s >= next_at {
+                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                                action: Some(
+                                    omoba_core::kcp::game_proto::player_input::Action::NoOp(
+                                        omoba_core::kcp::game_proto::NoOp {},
+                                    ),
+                                ),
+                            };
+                            self.send_lockstep_input(input);
+                            self.auto_noop_next_at_s = Some(next_at + interval_s);
+                        } else {
+                            self.auto_noop_next_at_s = Some(next_at);
+                        }
+                    }
+                }
+            }
+        }
         if let Ok(v) = std::env::var("OMFX_AUTO_EXIT_AFTER_SEC") {
             if let Ok(threshold) = v.parse::<f32>() {
                 if elapsed_s >= threshold {
@@ -1633,6 +1672,7 @@ impl Plugin for Game {
                     lockstep_client::LockstepEvent::TickBatch { tick, inputs, server_events } => {
                         // Phase 4.3: track latest sim tick for input target_tick math.
                         self.current_sim_tick = tick;
+                        self.current_sim_tick_observed_at = Some(now);
                         if tick % 60 == 0 {
                             log::debug!(
                                 "[lockstep] tick={} inputs={} events={}",
@@ -4039,20 +4079,23 @@ impl Game {
 
     fn send_lockstep_input(&mut self, input: omoba_core::kcp::game_proto::PlayerInput) {
         let Some(handle) = self.lockstep_handle.as_ref() else { return };
-        // +3 was the original Phase 4.3 lookahead for localhost zero-latency.
-        // In practice the wire path (input_tx → tokio task → KCP write → server
-        // receive → InputBuffer.submit) takes 1-4 server ticks (~16-66ms at
-        // 60Hz), so server.current_tick has already passed the target. omb logs
-        // "late InputSubmit ... target_tick=N current_tick=N+1..N+4" and drops
-        // every input. Bump to +30 (~500ms @ 60Hz) so even loaded servers /
-        // brief stalls don't reject inputs. Cost: 500ms input lag in pure
-        // singleplayer. Acceptable for now; tune to RTT-based once we have
-        // multi-client telemetry.
-        let target_tick = self.current_sim_tick.wrapping_add(30);
         let input_id = handle.next_input_id();
         let action_kind = InputActionKind::from_player_input(&input);
         let submit_wall_clock_us = wall_clock_us();
         let submit_instant = Instant::now();
+        // Base target_tick on the lockstep bg thread's latest TickBatch, not
+        // the render thread's last drained tick; the latter adds a frame of
+        // latency before the fixed lookahead is even applied.
+        let base_tick = handle.latest_tick();
+        let target_tick = base_tick.wrapping_add(INPUT_LOOKAHEAD_TICKS);
+        log::debug!(
+            "input_submit_target: id={} kind={:?} base_tick={} lookahead={} target_tick={}",
+            input_id,
+            action_kind,
+            base_tick,
+            INPUT_LOOKAHEAD_TICKS,
+            target_tick,
+        );
         if let Err(e) = handle.input_tx.send((target_tick, input, input_id)) {
             log::warn!("[lockstep] input_tx send failed: {e}");
             return;
