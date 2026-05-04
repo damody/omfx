@@ -2394,7 +2394,11 @@ impl Plugin for Game {
                 let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
                 let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
                 for entity in &snapshot.entities {
-                    if matches!(entity.kind, sim_runner::EntityKind::Other) {
+                    // Skip Other (internal ECS rows) and Projectile (子彈不需要標名稱).
+                    if matches!(
+                        entity.kind,
+                        sim_runner::EntityKind::Other | sim_runner::EntityKind::Projectile
+                    ) {
                         continue;
                     }
                     alive.insert(entity.entity_id);
