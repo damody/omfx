@@ -502,6 +502,33 @@ fn run_sim_loop(
             &mut prev_alive,
             abilities_arc.clone(),
         );
+
+        // Diagnostic for the "creep HP bars stay full" regression report
+        // (Phase 4-5 lockstep cleanup). Every 60 ticks (~1s) sample the
+        // first few creeps' HP values. If HP never changes across the
+        // run, the mirror's damage path is broken; if HP decreases, the
+        // mirror is fine and the regression is render-only. Sampled every
+        // 60 ticks to keep log volume low at TD_STRESS scale.
+        if batch.tick % 60 == 0 {
+            let creep_hps: Vec<(u32, i32, i32)> = snapshot
+                .entities
+                .iter()
+                .filter(|e| matches!(e.kind, EntityKind::Creep))
+                .take(5)
+                .map(|e| (e.entity_id, e.hp, e.max_hp))
+                .collect();
+            if !creep_hps.is_empty() {
+                log::info!(
+                    "[mirror-snapshot] tick={} creep_count={} sample_hp={:?}",
+                    batch.tick,
+                    snapshot.entities.iter()
+                        .filter(|e| matches!(e.kind, EntityKind::Creep))
+                        .count(),
+                    creep_hps,
+                );
+            }
+        }
+
         if let Ok(mut s) = state_out.lock() {
             *s = snapshot;
         }

@@ -254,12 +254,15 @@ fn kind_histogram(entities: &[EntityRenderData]) -> [usize; 5] {
 
 /// Per-entity batched-mesh slot ownership. lib.rs holds a HashMap<u32,
 /// SimEntitySlots> and reuses these slot indices each tick. body_slot is
-/// allocated unconditionally; hp_* slots only when max_hp > 0.
+/// allocated unconditionally; hp_* slots only when max_hp > 0; turret_slot
+/// only for kinds that have meaningful facing (Hero / Tower / Creep) — not
+/// projectiles.
 #[derive(Debug, Clone, Copy)]
 pub struct SimEntitySlots {
     pub body_slot: u32,
     pub hp_bg_slot: Option<u32>,
     pub hp_fg_slot: Option<u32>,
+    pub turret_slot: Option<u32>,
 }
 
 /// Style returned to the lib.rs batched-mesh writer. Color comes from a

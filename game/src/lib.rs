@@ -3496,6 +3496,7 @@ impl Game {
                     body_slot,
                     hp_bg_slot: None,
                     hp_fg_slot: None,
+                    turret_slot: None,
                 }
             });
 
@@ -3559,6 +3560,56 @@ impl Game {
                     }
                 }
             }
+
+            // Turret / barrel indicator: a small dark rectangle offset in the
+            // facing direction. Only kinds with meaningful facing (Hero /
+            // Tower / Creep) get a slot; projectiles skip. The legacy
+            // NetworkEntity path uses `entity.facing_slot` + `facing_batch`
+            // for the same effect — sim_runner-backed entities reuse the
+            // same `facing_batch` so the two paths share a single draw call.
+            let wants_turret = matches!(
+                e.kind,
+                sim_runner::EntityKind::Hero
+                    | sim_runner::EntityKind::Tower
+                    | sim_runner::EntityKind::Creep,
+            );
+            if wants_turret {
+                if slots.turret_slot.is_none() {
+                    if let Some(batch) = self.facing_batch.as_mut() {
+                        slots.turret_slot = Some(batch.alloc());
+                    }
+                }
+                if let Some(slot) = slots.turret_slot {
+                    // Mirror the legacy `render_angle` math (see
+                    // NetworkEntity facing render around line ~1946): the
+                    // body sprite uses the `-x` flip in `world_to_render`,
+                    // so the world facing rad needs to be reflected
+                    // through Y to match the rendered orientation.
+                    let render_angle = std::f32::consts::PI - e.facing_rad;
+                    let length = (size * 0.7).max(0.12);
+                    let thickness = (size * 0.22).max(0.05);
+                    let offset_x = (length * 0.5) * render_angle.cos();
+                    let offset_y = (length * 0.5) * render_angle.sin();
+                    let turret_color: [u8; 4] = [
+                        ((color[0] as u16) * 60 / 100) as u8,
+                        ((color[1] as u16) * 60 / 100) as u8,
+                        ((color[2] as u16) * 60 / 100) as u8,
+                        255,
+                    ];
+                    if let Some(batch) = self.facing_batch.as_mut() {
+                        batch.write_quad(
+                            slot,
+                            &sprite_resources::QuadParams {
+                                center: Vector2::new(pos.x + offset_x, pos.y + offset_y),
+                                size: Vector2::new(length, thickness),
+                                color: turret_color,
+                                rotation: render_angle,
+                                z: z + 0.01,
+                            },
+                        );
+                    }
+                }
+            }
         }
 
         // Free slots for entities that disappeared from the snapshot.
@@ -3576,6 +3627,9 @@ impl Game {
                     if let Some(bg) = slots.hp_bg_slot { batch.free(bg); }
                     if let Some(fg) = slots.hp_fg_slot { batch.free(fg); }
                 }
+                if let Some(batch) = self.facing_batch.as_mut() {
+                    if let Some(t) = slots.turret_slot { batch.free(t); }
+                }
             }
         }
         let to_remove: Vec<u32> = self
@@ -3592,6 +3646,9 @@ impl Game {
                 if let Some(batch) = self.hp_batch.as_mut() {
                     if let Some(bg) = slots.hp_bg_slot { batch.free(bg); }
                     if let Some(fg) = slots.hp_fg_slot { batch.free(fg); }
+                }
+                if let Some(batch) = self.facing_batch.as_mut() {
+                    if let Some(t) = slots.turret_slot { batch.free(t); }
                 }
             }
         }
