@@ -1574,13 +1574,14 @@ impl Plugin for Game {
                     && self.sim_last_explosion_tick != Some(snapshot.tick)
                 {
                     for ex in &snapshot.explosions {
-                        // World→render transform: `-x * WORLD_SCALE`
-                        // matches the projectile-impact `pos` used by
-                        // the existing local-spawn (line ~2191) so a
-                        // sim-driven explosion lands at the same place
-                        // the bullet visually exploded before.
+                        // ActiveExplosion stores **un-flipped** render coords
+                        // (backend × WORLD_SCALE). Render path at ~line 2136
+                        // applies the single `-x` flip when feeding Fyrox
+                        // SceneDrawingContext (matches build_line_segment /
+                        // add_circle_lines convention). Pre-flipping here
+                        // would double-flip → mirrored explosion position.
                         let render_pos = Vector2::new(
-                            -ex.pos_x * WORLD_SCALE,
+                            ex.pos_x * WORLD_SCALE,
                             ex.pos_y * WORLD_SCALE,
                         );
                         let max_radius = ex.radius * WORLD_SCALE;
