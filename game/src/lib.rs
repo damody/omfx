@@ -3529,11 +3529,11 @@ impl Game {
                     }
                 }
                 if let (Some(bg), Some(fg)) = (slots.hp_bg_slot, slots.hp_fg_slot) {
-                    // bar 加粗：原 0.06 在 28-world TD camera 下只 ~1.5 px，
-                    // 看不到 HP 變化。0.4 ≈ 10 px，視覺對比明顯，且仍貼緊 sprite。
-                    let bar_w = (size * 1.8).max(0.6);
-                    let bar_h = 0.4_f32;
-                    let bar_y = pos.y + size * 0.7;
+                    // bar 適中：0.06 太細看不到 1px 變化，0.4 又太粗壓畫面。
+                    // 0.15 ≈ 4 px under TD 28-world camera。
+                    let bar_w = (size * 1.6).max(0.5);
+                    let bar_h = 0.15_f32;
+                    let bar_y = pos.y + size * 0.65;
                     let hp_ratio = (e.hp as f32 / e.max_hp as f32).clamp(0.0, 1.0);
                     let bar_color: [u8; 4] = if hp_ratio < 0.30 {
                         [220, 50, 50, 255]
@@ -3594,12 +3594,14 @@ impl Game {
                     // so the world facing rad needs to be reflected
                     // through Y to match the rendered orientation.
                     let render_angle = std::f32::consts::PI - e.facing_rad;
-                    // 砲管做更明顯：長一點、粗一點，並用接近黑的高對比固定色，
-                    // 不再隨 body color 混色（之前 60% body 對紅黃綠 body 都偏淡）。
-                    let length = (size * 1.0).max(0.18);
-                    let thickness = (size * 0.30).max(0.08);
-                    let offset_x = (length * 0.5) * render_angle.cos();
-                    let offset_y = (length * 0.5) * render_angle.sin();
+                    // 砲管完全伸出 body 外：之前 offset = length/2 讓砲管中心剛好在
+                    // body 邊緣，一半被 body 蓋住只看得到尖端一點。改 offset =
+                    // body_radius + length/2 = size/2 + length/2，整根砲管都在 body 外。
+                    let length = (size * 0.7).max(0.15);
+                    let thickness = (size * 0.28).max(0.08);
+                    let attach_dist = size * 0.5 + length * 0.5;
+                    let offset_x = attach_dist * render_angle.cos();
+                    let offset_y = attach_dist * render_angle.sin();
                     let turret_color: [u8; 4] = [25, 25, 25, 255];
                     if let Some(batch) = self.facing_batch.as_mut() {
                         batch.write_quad(
