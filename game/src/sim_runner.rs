@@ -86,6 +86,13 @@ pub struct SimWorldSnapshot {
     /// once on first non-empty snapshot to seed `td_template_order` +
     /// `td_templates` HashMap; subsequent ticks are O(1) Arc clone.
     pub tower_templates: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
+    /// 48 個 tower upgrade defs (4 towers × 3 paths × 4 levels). Sourced
+    /// from `omobab::comp::tower_upgrade_registry::TowerUpgradeRegistry`.
+    /// Used by the omfx Sell/Upgrade panel to (a) compute refund =
+    /// base*0.85 + Σ(upgrades*0.75) and (b) show each upgrade's name in
+    /// the upgrade button text. Same lazy-build Arc pattern as
+    /// `tower_templates`.
+    pub tower_upgrades: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
     /// Phase 4.2: explosion FX events emitted this tick — one entry per
     /// `Outcome::Explosion` processed by `process_outcomes`. Drained from
     /// the sim's `ExplosionFxQueue` resource each tick (`std::mem::take`)
@@ -116,6 +123,17 @@ pub struct AbilityDefSnapshot {
     pub display_name: String,
     pub max_level: u8,
     pub icon_path: String,
+}
+
+/// TowerUpgradeDef projection — only the fields the Sell/Upgrade panel
+/// needs (name for the button label, cost for refund accounting).
+#[derive(Clone, Debug)]
+pub struct TowerUpgradeDefSnapshot {
+    pub tower_kind: String,
+    pub path: u8,
+    pub level: u8,
+    pub name: String,
+    pub cost: i32,
 }
 
 /// TowerTemplate projection for the right-side TD build menu. Mirrors the
@@ -392,6 +410,8 @@ fn run_sim_loop(
     // at game start by each tower script's `tower_metadata()`.
     let mut tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>> =
         std::sync::Arc::new(Vec::new());
+    let mut tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>> =
+        std::sync::Arc::new(Vec::new());
     loop {
         // Use recv_timeout instead of recv() so a wire stall surfaces in the
         // log as "no TickBatch in 1.0s — upstream lockstep client is the
@@ -553,11 +573,40 @@ fn run_sim_loop(
             }
         }
 
+        // TowerUpgradeRegistry — built once at world init (not async like
+        // tower templates), so iter_all is non-empty from tick 1. Lazy guard
+        // mirrors the other registries for symmetry.
+        if tower_upgrades_arc.is_empty() {
+            let reg = world.read_resource::<omobab::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
+            let mut defs: Vec<TowerUpgradeDefSnapshot> = reg.iter_all()
+                .map(|d| TowerUpgradeDefSnapshot {
+                    tower_kind: d.tower_kind.clone(),
+                    path: d.path,
+                    level: d.level,
+                    name: d.name.clone(),
+                    cost: d.cost,
+                })
+                .collect();
+            if !defs.is_empty() {
+                defs.sort_by(|a, b| {
+                    a.tower_kind.cmp(&b.tower_kind)
+                        .then(a.path.cmp(&b.path))
+                        .then(a.level.cmp(&b.level))
+                });
+                tower_upgrades_arc = std::sync::Arc::new(defs);
+                log::info!(
+                    "sim_runner: built TowerUpgradeRegistry snapshot ({} defs)",
+                    tower_upgrades_arc.len()
+                );
+            }
+        }
+
         let snapshot = extract_snapshot(
             &mut world,
             batch.tick,
             abilities_arc.clone(),
             tower_templates_arc.clone(),
+            tower_upgrades_arc.clone(),
         );
 
         // Diagnostic for the "creep HP bars stay full" regression report
@@ -625,6 +674,7 @@ fn extract_snapshot(
     tick: u32,
     abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
     tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
+    tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
 ) -> SimWorldSnapshot {
     // omobab re-exports these via `pub use crate::comp::*;` at the
     // crate root, so go through the flat path instead of the
@@ -1005,6 +1055,7 @@ fn extract_snapshot(
         blocked_regions,
         abilities: abilities_arc,
         tower_templates: tower_templates_arc,
+        tower_upgrades: tower_upgrades_arc,
         explosions,
     }
 }

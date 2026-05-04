@@ -683,6 +683,12 @@ pub struct Game {
     /// Template 的顯示順序（= DLL `units()` 註冊順序），供按鈕排版用
     #[visit(skip)] #[reflect(hidden)]
     td_template_order: Vec<String>,
+    /// Tower upgrade defs cache: (tower_kind, path, level) → (display name, cost).
+    /// Seeded once from `snapshot.tower_upgrades` (Arc lazy-build pattern).
+    /// Used by Sell button to compute refund (base*0.85 + Σ upgrades*0.75)
+    /// and by Upgrade button to show next-level name + cost.
+    #[visit(skip)] #[reflect(hidden)]
+    td_upgrade_defs: HashMap<(String, u8, u8), (String, i32)>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     /// P7 layered prediction：key = projectile id（server `e.id()`）。
@@ -1640,6 +1646,23 @@ impl Plugin for Game {
                     log::info!(
                         "TD build menu seeded: {} towers from snapshot",
                         self.td_template_order.len()
+                    );
+                }
+
+                // Seed `td_upgrade_defs` cache from snapshot.tower_upgrades on
+                // first non-empty receipt. Sell button refund + Upgrade button
+                // text both read from here. Static after first build (registry
+                // is immutable post script DLL load).
+                if self.td_upgrade_defs.is_empty() && !snapshot.tower_upgrades.is_empty() {
+                    for d in snapshot.tower_upgrades.iter() {
+                        self.td_upgrade_defs.insert(
+                            (d.tower_kind.clone(), d.path, d.level),
+                            (d.name.clone(), d.cost),
+                        );
+                    }
+                    log::info!(
+                        "TD upgrade defs seeded: {} entries from snapshot",
+                        self.td_upgrade_defs.len()
                     );
                 }
 
@@ -2785,16 +2808,24 @@ impl Plugin for Game {
                 let y_btn = y_name + name_h + 4.0;
 
                 // Sell 面板從 td_templates 快取讀 label + cost（單一事實來源）
-                // 同時讀 base_cost + upgrade_levels 供升級按鈕顯示
-                let info: Option<(String, i32, i32, [u8; 3])> = self.selected_tower_entity.and_then(|tid| {
+                // 同時讀 base_cost + upgrade_levels + 已升各路 def name 供升級
+                // 按鈕顯示。Refund 鏡 omb sell_tower 算法：base*0.85 + Σ(已升 def.cost*0.75)。
+                let info: Option<(String, i32, i32, [u8; 3], String)> = self.selected_tower_entity.and_then(|tid| {
                     let ent = self.network_entities.get(&tid)?;
-                    let kind_key = ent.tower_kind.as_deref()?;
-                    let tpl = self.td_templates.get(kind_key)?;
-                    let refund = (tpl.cost as f32 * 0.85) as i32;
-                    Some((tpl.label.clone(), refund, tpl.cost, ent.upgrade_levels))
+                    let kind_key = ent.tower_kind.as_deref()?.to_string();
+                    let tpl = self.td_templates.get(&kind_key)?;
+                    let mut refund = (tpl.cost as f32 * 0.85) as i32;
+                    for path in 0..3u8 {
+                        for level in 1..=ent.upgrade_levels[path as usize] {
+                            if let Some((_, cost)) = self.td_upgrade_defs.get(&(kind_key.clone(), path, level)) {
+                                refund += (*cost as f32 * 0.75) as i32;
+                            }
+                        }
+                    }
+                    Some((tpl.label.clone(), refund, tpl.cost, ent.upgrade_levels, kind_key))
                 });
 
-                if let Some((label, refund, base_cost, levels)) = info {
+                if let Some((label, refund, _base_cost, levels, kind_key)) = info {
                     ui.send(self.ui_td_sell_name_text,
                         WidgetMessage::DesiredPosition(Vector2::new(x, y_name)));
                     ui.send(self.ui_td_sell_name_text,
@@ -2806,20 +2837,24 @@ impl Plugin for Game {
                         TextMessage::Text(format!("[SELL] ${}", refund)));
                     self.td_sell_button_rect = (x, y_btn, panel_w, btn_h);
 
-                    // 3 條升級按鈕，往下排（每行 btn_h + 4）
+                    // 3 條升級按鈕。文字格式：`[P{path}] L{cur}->L{next} <name> ${cost}`
+                    // — 升級名直接從 td_upgrade_defs 拿（避免用 ■/□ 等字型可能缺字的
+                    // unicode glyph）。滿級顯示 MAX。
                     let up_btn_h = 38.0f32;
                     for path in 0u8..3 {
                         let level = levels[path as usize];
                         let y_up = y_btn + btn_h + 6.0 + (path as f32) * (up_btn_h + 4.0);
-                        let filled = level.min(4) as usize;
-                        let empty = 4 - filled;
-                        let dots: String = "■".repeat(filled) + &"□".repeat(empty);
                         let text = if level >= 4 {
-                            format!("{}  [P{}] MAX", dots, path + 1)
+                            format!("[P{}] MAX", path + 1)
                         } else {
-                            let next_cost = omoba_core::tower_meta::upgrade_cost(base_cost, level + 1);
-                            format!("{}  [P{}] L{}->L{} ${}",
-                                dots, path + 1, level, level + 1, next_cost)
+                            let next_level = level + 1;
+                            let (next_name, next_cost) = self
+                                .td_upgrade_defs
+                                .get(&(kind_key.clone(), path, next_level))
+                                .map(|(n, c)| (n.as_str(), *c))
+                                .unwrap_or(("?", 0));
+                            format!("[P{}] L{}->L{} {} ${}",
+                                path + 1, level, next_level, next_name, next_cost)
                         };
                         ui.send(self.ui_td_upgrade_buttons[path as usize],
                             WidgetMessage::DesiredPosition(Vector2::new(x, y_up)));
