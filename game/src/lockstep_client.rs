@@ -52,6 +52,9 @@ pub enum LockstepEvent {
     /// Emitted from the bg thread once per inbound frame; the main thread
     /// accumulates into the per-second HUD counters.
     NetStats { wire_delta: u64, logical_delta: u64 },
+    /// RTT measurement from the most recent PingResponse. Pushed once per
+    /// pong (≈1 Hz). The HUD shows the latest value.
+    Latency { rtt_us: u64 },
     Disconnected { reason: String },
 }
 
@@ -237,6 +240,11 @@ async fn run_client(
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
                 warn!("lockstep-client got unexpected GameStart after join — ignoring");
+            }
+            Ok(Some(LockstepInbound::Pong { rtt_us, wire_bytes, logical_bytes })) => {
+                wire_delta += wire_bytes as u64;
+                logical_delta += logical_bytes as u64;
+                let _ = events_tx.send(LockstepEvent::Latency { rtt_us });
             }
             Ok(Some(LockstepInbound::SnapshotResp { msg: resp, wire_bytes, logical_bytes })) => {
                 wire_delta += wire_bytes as u64;
