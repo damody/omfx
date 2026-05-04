@@ -440,6 +440,11 @@ fn run_sim_loop(
         omobab::comp::GameProcessor::drain_pending_item_uses(&mut world);
         world.maintain();
 
+        // MoveTo (右鍵移動): drain `PendingMoveQueue` — writes MoveTarget on
+        // player hero. Mirrors omb's `state::core::tick`.
+        omobab::comp::GameProcessor::drain_pending_moves(&mut world);
+        world.maintain();
+
         // Phase 3 dispatcher only schedules tick systems; it does NOT include
         // GameProcessor::process_outcomes. Without this, `creep_wave` produces
         // `Outcome::Creep { cd }` rows that pile up in `Vec<Outcome>` but no
