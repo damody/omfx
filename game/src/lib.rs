@@ -3533,37 +3533,43 @@ impl Game {
                     }
                 }
                 if let (Some(bg), Some(fg)) = (slots.hp_bg_slot, slots.hp_fg_slot) {
-                    // bar 適中：0.06 太細看不到 1px 變化，0.4 又太粗壓畫面。
-                    // 0.15 ≈ 4 px under TD 28-world camera。
+                    // Red Alert 2 風格：黑色外框 + 鮮豔填充色。bg 全寬、fg 內縮一圈
+                    // 留 2-3 px 黑邊當 outline。HP 從右邊縮（左對齊）— RA2 慣例。
                     let bar_w = (size * 1.6).max(0.5);
-                    let bar_h = 0.15_f32;
-                    let bar_y = pos.y + size * 0.65;
+                    let bar_h = 0.18_f32;
+                    let bar_y = pos.y + size * 0.7;
+                    let pad = 0.04_f32;             // 黑外框視覺寬度
+                    let inner_w = (bar_w - pad * 2.0).max(0.001);
+                    let inner_h = (bar_h - pad * 2.0).max(0.001);
                     let hp_ratio = (e.hp as f32 / e.max_hp as f32).clamp(0.0, 1.0);
+                    // RA2 經典三段配色：鮮綠 / 金黃 / 鮮紅
                     let bar_color: [u8; 4] = if hp_ratio < 0.30 {
-                        [220, 50, 50, 255]
+                        [240, 40, 30, 255]
                     } else if hp_ratio < 0.60 {
-                        [220, 200, 60, 255]
+                        [255, 200, 40, 255]
                     } else {
-                        [40, 220, 60, 255]
+                        [80, 240, 60, 255]
                     };
                     if let Some(batch) = self.hp_batch.as_mut() {
+                        // bg = 全寬黑底（外框）
                         batch.write_quad(
                             bg,
                             &sprite_resources::QuadParams {
                                 center: Vector2::new(pos.x, bar_y),
                                 size: Vector2::new(bar_w, bar_h),
-                                color: [0, 0, 0, 220],
+                                color: [0, 0, 0, 255],
                                 rotation: 0.0,
                                 z: Z_HP_BAR + 0.01,
                             },
                         );
-                        let fg_w = bar_w * hp_ratio;
-                        let fg_offset = (bar_w - fg_w) * 0.5;
+                        // fg = 內縮 pad，依 hp_ratio 縮短，左對齊（HP 從右邊扣）
+                        let fg_w = inner_w * hp_ratio;
+                        let fg_offset = (inner_w - fg_w) * 0.5;
                         batch.write_quad(
                             fg,
                             &sprite_resources::QuadParams {
                                 center: Vector2::new(pos.x - fg_offset, bar_y),
-                                size: Vector2::new(fg_w.max(0.001), bar_h * 0.8),
+                                size: Vector2::new(fg_w.max(0.001), inner_h),
                                 color: bar_color,
                                 rotation: 0.0,
                                 z: Z_HP_BAR,
@@ -3598,12 +3604,14 @@ impl Game {
                     // so the world facing rad needs to be reflected
                     // through Y to match the rendered orientation.
                     let render_angle = std::f32::consts::PI - e.facing_rad;
-                    // 砲管完全伸出 body 外：之前 offset = length/2 讓砲管中心剛好在
-                    // body 邊緣，一半被 body 蓋住只看得到尖端一點。改 offset =
-                    // body_radius + length/2 = size/2 + length/2，整根砲管都在 body 外。
-                    let length = (size * 0.7).max(0.15);
+                    // 砲管 base 在 body 中心，向 facing 方向延伸出去（像坦克砲塔）。
+                    // 中心距 body_center = length/2（quad center 算法），所以末端伸到
+                    // body_center + length。z = body_z - 0.05 確保畫在 body 上方
+                    // (lower z = closer to camera in this scene)；之前 +0.01 反而
+                    // 把砲管推到 body 後面只看到伸出 body 那段一點點。
+                    let length = (size * 1.2).max(0.20);
                     let thickness = (size * 0.28).max(0.08);
-                    let attach_dist = size * 0.5 + length * 0.5;
+                    let attach_dist = length * 0.5;
                     let offset_x = attach_dist * render_angle.cos();
                     let offset_y = attach_dist * render_angle.sin();
                     let turret_color: [u8; 4] = [25, 25, 25, 255];
@@ -3615,7 +3623,7 @@ impl Game {
                                 size: Vector2::new(length, thickness),
                                 color: turret_color,
                                 rotation: render_angle,
-                                z: z + 0.01,
+                                z: z - 0.05,
                             },
                         );
                     }
