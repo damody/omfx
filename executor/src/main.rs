@@ -7,6 +7,83 @@ use simplelog::{
 };
 use std::fs::File;
 
+struct LogSettings {
+    level: LevelFilter,
+    allow_modules: Vec<String>,
+}
+
+fn log_level_rank(level: LevelFilter) -> u8 {
+    match level {
+        LevelFilter::Off => 0,
+        LevelFilter::Error => 1,
+        LevelFilter::Warn => 2,
+        LevelFilter::Info => 3,
+        LevelFilter::Debug => 4,
+        LevelFilter::Trace => 5,
+    }
+}
+
+fn parse_log_level(value: &str) -> Option<LevelFilter> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => Some(LevelFilter::Off),
+        "error" => Some(LevelFilter::Error),
+        "warn" => Some(LevelFilter::Warn),
+        "info" => Some(LevelFilter::Info),
+        "debug" => Some(LevelFilter::Debug),
+        "trace" => Some(LevelFilter::Trace),
+        _ => None,
+    }
+}
+
+fn push_allow_module(allow_modules: &mut Vec<String>, module: &str) {
+    let module = module.trim();
+    if module.is_empty() {
+        return;
+    }
+    let normalized = module.strip_suffix("::lib").unwrap_or(module);
+    for candidate in [module, normalized] {
+        if !allow_modules.iter().any(|existing| existing == candidate) {
+            allow_modules.push(candidate.to_owned());
+        }
+    }
+}
+
+fn configured_log_settings() -> LogSettings {
+    let mut settings = LogSettings {
+        level: LevelFilter::Info,
+        allow_modules: Vec::new(),
+    };
+    let Ok(value) = std::env::var("RUST_LOG") else { return settings };
+
+    let mut has_bare_level = false;
+    // simplelog has no EnvFilter parser. Use the highest requested level and,
+    // when only module directives are present, add module allow filters.
+    for directive in value.split(',') {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        let (candidate, module) = if let Some((module, level)) = directive.split_once('=') {
+            let Some(level) = parse_log_level(level.trim()) else { continue };
+            (level, Some(module))
+        } else {
+            let Some(level) = parse_log_level(directive) else { continue };
+            has_bare_level = true;
+            (level, None)
+        };
+        if log_level_rank(candidate) > log_level_rank(settings.level) {
+            settings.level = candidate;
+        }
+        if let Some(module) = module {
+            push_allow_module(&mut settings.allow_modules, module);
+        }
+    }
+    if has_bare_level {
+        settings.allow_modules.clear();
+    }
+    settings
+}
+
 #[cfg(target_os = "windows")]
 #[link(name = "winmm")]
 extern "system" {
@@ -27,13 +104,17 @@ fn main() {
     // Standard log crate backend：每次啟動 truncate omfx_app.log，同時印到 console。
     // omfx.log 是 fyrox 自己的 log（fyrox::core::log::Log），不走 standard log macros。
     // 我們的 log::info! / warn! 走 simplelog → omfx_app.log + 終端機。
-    let cfg = ConfigBuilder::new()
-        .set_time_format_rfc3339()
-        .build();
+    let log_settings = configured_log_settings();
+    let mut cfg_builder = ConfigBuilder::new();
+    cfg_builder.set_time_format_rfc3339();
+    for module in &log_settings.allow_modules {
+        cfg_builder.add_filter_allow(module.clone());
+    }
+    let cfg = cfg_builder.build();
     let log_file = File::create("omfx_app.log").expect("create omfx_app.log");
     let _ = CombinedLogger::init(vec![
-        TermLogger::new(LevelFilter::Info, cfg.clone(), TerminalMode::Mixed, ColorChoice::Auto),
-        WriteLogger::new(LevelFilter::Info, cfg, log_file),
+        TermLogger::new(log_settings.level, cfg.clone(), TerminalMode::Mixed, ColorChoice::Auto),
+        WriteLogger::new(log_settings.level, cfg, log_file),
     ]);
 
     Log::set_file_name("omfx.log");
