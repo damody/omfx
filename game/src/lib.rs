@@ -722,6 +722,12 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     sim_entity_slots: HashMap<u32, render_bridge::SimEntitySlots>,
 
+    /// 子彈拖尾起點：第一次看到 projectile entity 時記下當前 render pos，
+    /// 之後每 frame 從此點畫一條暖色拖尾到當前 pos。removed_entity_ids 觸發時
+    /// 一起清除。
+    #[visit(skip)] #[reflect(hidden)]
+    projectile_spawn_pos: HashMap<u32, Vector2<f32>>,
+
     /// Wall-clock timestamp of first frame; used by the
     /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` smoke loop
     /// so a single `cargo run` can reproduce a Start-Round-then-die scenario
@@ -3546,7 +3552,42 @@ impl Game {
                 }
             });
 
-            if let Some(batch) = self.body_batch.as_mut() {
+            if matches!(e.kind, sim_runner::EntityKind::Projectile) {
+                // 子彈：從發射點到當前位置畫一條暖色拖尾矩形（不是中央小方塊）。
+                // 第一次看到該 eid 時把 spawn_pos 鎖定為當前 render pos。
+                let spawn_pos = *self
+                    .projectile_spawn_pos
+                    .entry(e.entity_id)
+                    .or_insert(pos);
+                let dx = pos.x - spawn_pos.x;
+                let dy = pos.y - spawn_pos.y;
+                let trail_len = (dx * dx + dy * dy).sqrt();
+                // 拖尾上限：太長視覺糊（高速大絕距離飛行可達 5-10 render units）。
+                // 0.6 大約是 1.5 個塔身寬，視覺剛好能看出方向。
+                let max_trail = 0.6_f32;
+                let len = trail_len.min(max_trail).max(0.05);
+                // 若拖尾被截短，從尾端往前算實際 tail 起點。
+                let dir_x = if trail_len > 0.0001 { dx / trail_len } else { 1.0 };
+                let dir_y = if trail_len > 0.0001 { dy / trail_len } else { 0.0 };
+                let tail_x = pos.x - dir_x * len;
+                let tail_y = pos.y - dir_y * len;
+                let mid = Vector2::new((pos.x + tail_x) * 0.5, (pos.y + tail_y) * 0.5);
+                let rotation = dy.atan2(dx);
+                // 暖色拖尾：偏黃橙，視覺像 tracer round。
+                let trail_color: [u8; 4] = [255, 180, 60, 230];
+                if let Some(batch) = self.body_batch.as_mut() {
+                    batch.write_quad(
+                        slots.body_slot,
+                        &sprite_resources::QuadParams {
+                            center: mid,
+                            size: Vector2::new(len, 0.08),
+                            color: trail_color,
+                            rotation,
+                            z: z - 0.01,
+                        },
+                    );
+                }
+            } else if let Some(batch) = self.body_batch.as_mut() {
                 batch.write_quad(
                     slots.body_slot,
                     &sprite_resources::QuadParams {
@@ -3686,6 +3727,8 @@ impl Game {
                     if let Some(t) = slots.turret_slot { batch.free(t); }
                 }
             }
+            // 子彈消失時清拖尾起點 cache（HashMap 不會自己縮）
+            self.projectile_spawn_pos.remove(&eid);
         }
         let to_remove: Vec<u32> = self
             .sim_entity_slots
@@ -3706,6 +3749,7 @@ impl Game {
                     if let Some(t) = slots.turret_slot { batch.free(t); }
                 }
             }
+            self.projectile_spawn_pos.remove(&id);
         }
     }
 
