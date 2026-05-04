@@ -2448,17 +2448,23 @@ impl Plugin for Game {
                         display_name
                     };
 
-                    // World pos for label = entity center + slight Y offset so
-                    // it sits above the sprite + HP bar (~0.6 world units up).
-                    let label_world_y = entity.pos_y + 60.0;
+                    // BUG FIX: 之前用 backend coords (entity.pos_y + 60.0) 直接餵
+                    // world_to_screen_approx，但該函式期待 render units。Backend 座標
+                    // (-1340 之類) 經過後 sy 算出 ±10x window height → label 完全跑出
+                    // 螢幕。改成先做 backend→render 換算（同 render_bridge::world_to_render
+                    // 的 -x flip + WORLD_SCALE=0.01），再加 0.5 render-unit Y offset 讓
+                    // label 浮在 sprite + HP bar 上方。
+                    const WORLD_SCALE: f32 = 0.01;
+                    let render_x = -entity.pos_x * WORLD_SCALE;
+                    let render_y = entity.pos_y * WORLD_SCALE + 0.5;
                     let screen_pos = world_to_screen_approx(
-                        entity.pos_x - self.camera_world_pos.x,
-                        label_world_y - self.camera_world_pos.y,
+                        render_x - self.camera_world_pos.x,
+                        render_y - self.camera_world_pos.y,
                         win.x,
                         win.y,
                         world_height,
                     );
-                    let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
+                    let pos = Vector2::new(screen_pos.x - 110.0, screen_pos.y - 24.0);
 
                     if let Some(slot) = self.sim_entity_labels.get_mut(&entity.entity_id) {
                         // Update existing — gate to avoid flooding the UI queue.
@@ -2474,15 +2480,14 @@ impl Plugin for Game {
                         }
                     } else {
                         // First-time spawn for this entity.
-                        // 黃色高對比文字（之前用黑色在深色 ground 上看不到）。
                         let handle = TextBuilder::new(
                             WidgetBuilder::new()
                                 .with_desired_position(pos)
                                 .with_width(220.0)
-                                .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 80, 255)).into()),
+                                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
                         )
                         .with_text(text.clone())
-                        .with_font_size(22.0.into())
+                        .with_font_size(20.0.into())
                         .with_horizontal_text_alignment(HorizontalAlignment::Center)
                         .build(&mut ui.build_ctx());
                         self.sim_entity_labels.insert(entity.entity_id, SimEntityLabel {
