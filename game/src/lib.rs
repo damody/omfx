@@ -2474,14 +2474,15 @@ impl Plugin for Game {
                         }
                     } else {
                         // First-time spawn for this entity.
+                        // 黃色高對比文字（之前用黑色在深色 ground 上看不到）。
                         let handle = TextBuilder::new(
                             WidgetBuilder::new()
                                 .with_desired_position(pos)
-                                .with_width(180.0)
-                                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                                .with_width(220.0)
+                                .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 80, 255)).into()),
                         )
                         .with_text(text.clone())
-                        .with_font_size(18.0.into())
+                        .with_font_size(22.0.into())
                         .with_horizontal_text_alignment(HorizontalAlignment::Center)
                         .build(&mut ui.build_ctx());
                         self.sim_entity_labels.insert(entity.entity_id, SimEntityLabel {
@@ -3523,9 +3524,11 @@ impl Game {
                     }
                 }
                 if let (Some(bg), Some(fg)) = (slots.hp_bg_slot, slots.hp_fg_slot) {
-                    let bar_w = (size * 1.6).max(0.4);
-                    let bar_h = 0.06_f32;
-                    let bar_y = pos.y + size * 0.55;
+                    // bar 加粗：原 0.06 在 28-world TD camera 下只 ~1.5 px，
+                    // 看不到 HP 變化。0.4 ≈ 10 px，視覺對比明顯，且仍貼緊 sprite。
+                    let bar_w = (size * 1.8).max(0.6);
+                    let bar_h = 0.4_f32;
+                    let bar_y = pos.y + size * 0.7;
                     let hp_ratio = (e.hp as f32 / e.max_hp as f32).clamp(0.0, 1.0);
                     let bar_color: [u8; 4] = if hp_ratio < 0.30 {
                         [220, 50, 50, 255]
@@ -3586,16 +3589,13 @@ impl Game {
                     // so the world facing rad needs to be reflected
                     // through Y to match the rendered orientation.
                     let render_angle = std::f32::consts::PI - e.facing_rad;
-                    let length = (size * 0.7).max(0.12);
-                    let thickness = (size * 0.22).max(0.05);
+                    // 砲管做更明顯：長一點、粗一點，並用接近黑的高對比固定色，
+                    // 不再隨 body color 混色（之前 60% body 對紅黃綠 body 都偏淡）。
+                    let length = (size * 1.0).max(0.18);
+                    let thickness = (size * 0.30).max(0.08);
                     let offset_x = (length * 0.5) * render_angle.cos();
                     let offset_y = (length * 0.5) * render_angle.sin();
-                    let turret_color: [u8; 4] = [
-                        ((color[0] as u16) * 60 / 100) as u8,
-                        ((color[1] as u16) * 60 / 100) as u8,
-                        ((color[2] as u16) * 60 / 100) as u8,
-                        255,
-                    ];
+                    let turret_color: [u8; 4] = [25, 25, 25, 255];
                     if let Some(batch) = self.facing_batch.as_mut() {
                         batch.write_quad(
                             slot,
