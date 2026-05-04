@@ -147,7 +147,7 @@ const PATH_VISIBLE_SECS: f32 = 5.0;
 /// bars, name labels, projectile collision lookups) compile against an
 /// always-empty HashMap. Phase 5.x removes the orphan loops + this struct
 /// (estimated ~600 lines of update body cleanup).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[allow(dead_code)]
 struct NetworkEntity {
     entity_type: String,
@@ -823,6 +823,10 @@ pub struct Game {
     /// 計時：每滿 1 秒 roll over
     #[visit(skip)] #[reflect(hidden)]
     net_stats_elapsed: f32,
+    /// 最新一次 PingResponse 算出的 RTT (微秒)；None = 尚未收到任何 pong。
+    /// 由 lockstep bg thread 透過 LockstepEvent::Latency 推上來，1 Hz 更新。
+    #[visit(skip)] #[reflect(hidden)]
+    latest_rtt_us: Option<u64>,
     /// FPS 顯示字串（例 "FPS 250 (4.0ms)"），來自 Fyrox renderer 的 frames_per_second
     /// 統計（plugin update 是 fixed 60 Hz tick，自算 frame count 沒意義）。
     #[visit(skip)] #[reflect(hidden)]
@@ -1531,6 +1535,9 @@ impl Plugin for Game {
                         self.net_wire_bytes_current += wire_delta;
                         self.net_bytes_current += logical_delta;
                     }
+                    lockstep_client::LockstepEvent::Latency { rtt_us } => {
+                        self.latest_rtt_us = Some(rtt_us);
+                    }
                     lockstep_client::LockstepEvent::Disconnected { reason } => {
                         log::warn!("[lockstep] disconnected: {}", reason);
                     }
@@ -1634,6 +1641,47 @@ impl Plugin for Game {
                         "TD build menu seeded: {} towers from snapshot",
                         self.td_template_order.len()
                     );
+                }
+
+                // Mirror Tower entities from snapshot into `network_entities`
+                // so the tower-selection / sell / upgrade UI (which reads
+                // `network_entities`) keeps working after the legacy
+                // GameEvent path was cut. Only Tower entries are mirrored —
+                // selection / sell / upgrade UI is the only consumer that
+                // still queries this map.
+                {
+                    use std::collections::HashSet;
+                    let mut alive_towers: HashSet<u32> = HashSet::new();
+                    for e in snapshot.entities.iter() {
+                        if !matches!(e.kind, sim_runner::EntityKind::Tower) {
+                            continue;
+                        }
+                        alive_towers.insert(e.entity_id);
+                        let tower_kind = if e.unit_id.is_empty() {
+                            None
+                        } else {
+                            Some(e.unit_id.clone())
+                        };
+                        let (hit_radius_backend, range_backend) = tower_kind
+                            .as_deref()
+                            .and_then(|uid| self.td_templates.get(uid))
+                            .map(|t| (t.hit_radius_backend, t.range_backend))
+                            .unwrap_or((0.4, 0.0));
+                        let pos = Vector2::new(e.pos_x * WORLD_SCALE, e.pos_y * WORLD_SCALE);
+                        let entry = self
+                            .network_entities
+                            .entry(e.entity_id)
+                            .or_insert_with(NetworkEntity::default);
+                        entry.entity_type = "tower".to_string();
+                        entry.position = pos;
+                        entry.tower_kind = tower_kind;
+                        entry.upgrade_levels = e.upgrade_levels.unwrap_or([0; 3]);
+                        entry.collision_radius_render = hit_radius_backend * WORLD_SCALE;
+                        entry.attack_range_backend = range_backend;
+                    }
+                    self.network_entities.retain(|id, ent| {
+                        ent.entity_type != "tower" || alive_towers.contains(id)
+                    });
                 }
 
                 // Phase 4.5: AbilityRegistry → ability_info_map. Static
@@ -2587,8 +2635,13 @@ impl Plugin for Game {
                 };
                 let wire_str = fmt_bps(self.net_wire_bytes_last_sec);   // 真實 UDP wire (壓縮後)
                 let logical_str = fmt_bps(self.net_bytes_last_sec);      // 解壓後 logical
+                let ping_str = match self.latest_rtt_us {
+                    Some(us) => format!("{:.1} ms", us as f64 / 1000.0),
+                    None => "—".into(),
+                };
                 format!(
-                    "Connected | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
+                    "Connected | Ping: {} | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
+                    ping_str,
                     self.heartbeat.tick,
                     self.heartbeat.game_time,
                     self.heartbeat.entity_count,
