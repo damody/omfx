@@ -150,6 +150,11 @@ impl InputLatencyMeter {
         while self.samples.len() > INPUT_LATENCY_CAPACITY {
             self.samples.pop_front();
         }
+        if self.samples.len() == 1 {
+            self.cached_p50_ms = self.cached_latest_ms;
+            self.cached_p99_ms = self.cached_latest_ms;
+            self.cached_max_ms = self.cached_latest_ms;
+        }
     }
 
     pub fn maybe_recompute(&mut self, now: Instant) {
@@ -4506,6 +4511,16 @@ mod input_latency_tests {
         }
         assert_eq!(meter.samples.len(), INPUT_LATENCY_CAPACITY);
         assert_eq!(meter.samples.front().unwrap().input_id, 80);
+    }
+
+    #[test]
+    fn input_latency_meter_first_sample_populates_hud_cache() {
+        let mut meter = InputLatencyMeter::default();
+        meter.push(sample(1, 123));
+        assert_eq!(meter.cached_p50_ms, 123);
+        assert_eq!(meter.cached_p99_ms, 123);
+        assert_eq!(meter.cached_max_ms, 123);
+        assert_eq!(meter.cached_latest_ms, 123);
     }
 
     #[test]

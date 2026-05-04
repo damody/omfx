@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -33,6 +34,8 @@ pub use omobab::lockstep::PlayerInput;
 /// the explosion was emitted; the render thread uses omfx wall clock
 /// for the actual ring-aging lifecycle (see lib.rs `active_explosions`).
 pub use omobab::comp::ExplosionFx;
+
+const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = 300;
 
 /// Render-thread-readable snapshot of the latest sim tick state.
 #[derive(Default, Clone, Debug)]
@@ -414,6 +417,7 @@ fn run_sim_loop(
         std::sync::Arc::new(Vec::new());
     let mut tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
+    let mut recent_applied_input_ids: VecDeque<(u32, u32)> = VecDeque::new();
     loop {
         // Use recv_timeout instead of recv() so a wire stall surfaces in the
         // log as "no TickBatch in 1.0s — upstream lockstep client is the
@@ -439,10 +443,22 @@ fn run_sim_loop(
             }
         };
 
-        let applied_input_ids = batch
+        for input_id in batch
             .inputs
             .iter()
             .filter_map(|(_, _, input_id)| (*input_id != 0).then_some(*input_id))
+        {
+            recent_applied_input_ids.push_back((batch.tick, input_id));
+        }
+        while recent_applied_input_ids
+            .front()
+            .is_some_and(|(tick, _)| batch.tick.saturating_sub(*tick) > APPLIED_INPUT_ID_RETENTION_TICKS)
+        {
+            recent_applied_input_ids.pop_front();
+        }
+        let applied_input_ids = recent_applied_input_ids
+            .iter()
+            .map(|(_, input_id)| *input_id)
             .collect::<Vec<_>>();
         push_inputs_into_world(&mut world, batch.tick, batch.inputs);
 
