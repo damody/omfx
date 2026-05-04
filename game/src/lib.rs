@@ -2128,7 +2128,8 @@ impl Plugin for Game {
                 let cur_r = ex.max_radius * t;
                 // alpha 隨時間衰減（起始不透明 → 結束透明）
                 let alpha = (255.0 * (1.0 - t)) as u8;
-                let color = Color::from_rgba(230, 70, 40, alpha.max(40));
+                // 橘色爆炸圈 (user-requested)：明亮橘黃，由小到大隨時間擴張、淡出。
+                let color = Color::from_rgba(255, 150, 30, alpha.max(60));
                 if cur_r > 0.02 {
                     let z = Z_REGION - 0.0004;
                     // 起點：θ=0 → (cx + r, cy)；x 翻負與 build_line_segment 對齊
