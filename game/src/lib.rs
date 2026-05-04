@@ -1916,6 +1916,13 @@ impl Plugin for Game {
             m
         };
         for (&entity_id, entity) in self.network_entities.iter_mut() {
+            // Towers don't move — skip lerp/extrap so the snapshot mirror's
+            // `position` (set in the snapshot consumer block) survives.
+            // Without this, lerp_duration=0 → NaN clobbers the position
+            // and click hit-test fails.
+            if entity.entity_type == "tower" {
+                continue;
+            }
             // Expire creep debug path after PATH_VISIBLE_SECS
             if !entity.path_nodes.is_empty() {
                 entity.path_age += dt;
