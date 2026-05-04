@@ -79,6 +79,13 @@ pub struct SimWorldSnapshot {
     /// async). Hero panel uses this to resolve `ability_ids[i]` →
     /// display_name / icon / max_level.
     pub abilities: std::sync::Arc<Vec<AbilityDefSnapshot>>,
+    /// TD tower templates (right-side build-button menu). Sourced from
+    /// `TowerTemplateRegistry` which the script DLL fills via each tower's
+    /// `tower_metadata()` at game start. `Arc` wrapped — same lazy-build
+    /// pattern as abilities (registry is async-populated). lib.rs reads
+    /// once on first non-empty snapshot to seed `td_template_order` +
+    /// `td_templates` HashMap; subsequent ticks are O(1) Arc clone.
+    pub tower_templates: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
     /// Phase 4.2: explosion FX events emitted this tick — one entry per
     /// `Outcome::Explosion` processed by `process_outcomes`. Drained from
     /// the sim's `ExplosionFxQueue` resource each tick (`std::mem::take`)
@@ -109,6 +116,23 @@ pub struct AbilityDefSnapshot {
     pub display_name: String,
     pub max_level: u8,
     pub icon_path: String,
+}
+
+/// TowerTemplate projection for the right-side TD build menu. Mirrors the
+/// fields lib.rs's `TdTemplate` cache needs (label / cost for the button
+/// + footprint / range for the placement preview). Sourced from
+/// `omobab::comp::tower_registry::TowerTemplateRegistry`.
+#[derive(Clone, Debug)]
+pub struct TowerTemplateSnapshot {
+    pub unit_id: String,
+    pub label: String,
+    pub cost: i32,
+    pub footprint: f32,
+    pub range: f32,
+    pub splash_radius: f32,
+    pub hit_radius: f32,
+    pub slow_factor: f32,
+    pub slow_duration: f32,
 }
 
 /// Per-entity render data extracted from the ECS World at the end of
@@ -367,6 +391,10 @@ fn run_sim_loop(
     // the Arc (O(1) refcount bump).
     let mut abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
+    // Same lazy-build pattern for TD tower templates — registry populated
+    // at game start by each tower script's `tower_metadata()`.
+    let mut tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>> =
+        std::sync::Arc::new(Vec::new());
     loop {
         // Use recv_timeout instead of recv() so a wire stall surfaces in the
         // log as "no TickBatch in 1.0s — upstream lockstep client is the
@@ -501,11 +529,39 @@ fn run_sim_loop(
             }
         }
 
+        // TD tower-template registry — same lazy-build pattern. Populated by
+        // each tower script's `tower_metadata()` at script load time.
+        if tower_templates_arc.is_empty() {
+            let reg = world.read_resource::<omobab::comp::tower_registry::TowerTemplateRegistry>();
+            if !reg.is_empty() {
+                tower_templates_arc = std::sync::Arc::new(
+                    reg.iter_ordered()
+                        .map(|t| TowerTemplateSnapshot {
+                            unit_id: t.unit_id.clone(),
+                            label: t.label.clone(),
+                            cost: t.cost,
+                            footprint: t.footprint,
+                            range: t.range,
+                            splash_radius: t.splash_radius,
+                            hit_radius: t.hit_radius,
+                            slow_factor: t.slow_factor,
+                            slow_duration: t.slow_duration,
+                        })
+                        .collect(),
+                );
+                log::info!(
+                    "sim_runner: built TowerTemplateRegistry snapshot ({} templates)",
+                    tower_templates_arc.len()
+                );
+            }
+        }
+
         let snapshot = extract_snapshot(
             &mut world,
             batch.tick,
             &mut prev_alive,
             abilities_arc.clone(),
+            tower_templates_arc.clone(),
         );
 
         // Diagnostic for the "creep HP bars stay full" regression report
@@ -573,6 +629,7 @@ fn extract_snapshot(
     tick: u32,
     prev_alive: &mut std::collections::HashSet<u32>,
     abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
+    tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
 ) -> SimWorldSnapshot {
     // omobab re-exports these via `pub use crate::comp::*;` at the
     // crate root, so go through the flat path instead of the
@@ -951,6 +1008,7 @@ fn extract_snapshot(
         round_is_running,
         blocked_regions,
         abilities: abilities_arc,
+        tower_templates: tower_templates_arc,
         explosions,
     }
 }

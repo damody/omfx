@@ -1521,6 +1521,10 @@ impl Plugin for Game {
                         // Phase 3.4 will compare this against the
                         // sim_runner's locally computed hash.
                     }
+                    lockstep_client::LockstepEvent::NetStats { wire_delta, logical_delta } => {
+                        self.net_wire_bytes_current += wire_delta;
+                        self.net_bytes_current += logical_delta;
+                    }
                     lockstep_client::LockstepEvent::Disconnected { reason } => {
                         log::warn!("[lockstep] disconnected: {}", reason);
                     }
@@ -1594,6 +1598,36 @@ impl Plugin for Game {
                         });
                     }
                     self.sim_last_explosion_tick = Some(snapshot.tick);
+                }
+
+                // TD tower-build menu: seed `td_template_order` + `td_templates`
+                // from snapshot.tower_templates on first non-empty receipt.
+                // Phase 5.1 cut the legacy `tower_templates` GameEvent that used
+                // to populate these via apply_event; the right-side build menu
+                // was stuck at 0 buttons. Static after first build (registry is
+                // immutable post script DLL load), so the !is_empty guard runs
+                // as one-shot.
+                if self.td_template_order.is_empty() && !snapshot.tower_templates.is_empty() {
+                    for t in snapshot.tower_templates.iter() {
+                        self.td_template_order.push(t.unit_id.clone());
+                        self.td_templates.insert(
+                            t.unit_id.clone(),
+                            TdTemplate {
+                                label: t.label.clone(),
+                                cost: t.cost,
+                                footprint_backend: t.footprint,
+                                range_backend: t.range,
+                                splash_radius_backend: t.splash_radius,
+                                hit_radius_backend: t.hit_radius,
+                                slow_factor: t.slow_factor,
+                                slow_duration: t.slow_duration,
+                            },
+                        );
+                    }
+                    log::info!(
+                        "TD build menu seeded: {} towers from snapshot",
+                        self.td_template_order.len()
+                    );
                 }
 
                 // Phase 4.5: AbilityRegistry → ability_info_map. Static

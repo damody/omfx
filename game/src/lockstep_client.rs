@@ -46,6 +46,12 @@ pub enum LockstepEvent {
         server_events: Vec<ServerEvent>,
     },
     StateHash { tick: u32, hash: u64 },
+    /// Network throughput delta since the previous emission. Combined inbound
+    /// (TickBatch / StateHash / SnapshotResp / GameStart) and outbound
+    /// (InputSubmit) bytes — both directions count as "lockstep traffic".
+    /// Emitted from the bg thread once per inbound frame; the main thread
+    /// accumulates into the per-second HUD counters.
+    NetStats { wire_delta: u64, logical_delta: u64 },
     Disconnected { reason: String },
 }
 
@@ -162,7 +168,13 @@ async fn run_client(
     let mut last_hb_log = std::time::Instant::now();
     let mut tick_batches_since_log: u32 = 0;
     let mut last_known_tick: u32 = 0;
+    // Per-iteration byte deltas — flushed to a NetStats event at the bottom of
+    // each loop. Combined in/out so the HUD shows the total lockstep traffic.
+    let mut wire_delta: u64;
+    let mut logical_delta: u64;
     loop {
+        wire_delta = 0;
+        logical_delta = 0;
         let recv_result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             rx.recv(),
@@ -185,7 +197,9 @@ async fn run_client(
                 });
                 break;
             }
-            Ok(Some(LockstepInbound::TickBatch(b))) => {
+            Ok(Some(LockstepInbound::TickBatch { msg: b, wire_bytes, logical_bytes })) => {
+                wire_delta += wire_bytes as u64;
+                logical_delta += logical_bytes as u64;
                 tick_batches_since_log += 1;
                 last_known_tick = b.tick;
                 let now = std::time::Instant::now();
@@ -211,16 +225,22 @@ async fn run_client(
                     server_events,
                 });
             }
-            Ok(Some(LockstepInbound::StateHash(sh))) => {
+            Ok(Some(LockstepInbound::StateHash { msg: sh, wire_bytes, logical_bytes })) => {
+                wire_delta += wire_bytes as u64;
+                logical_delta += logical_bytes as u64;
                 let _ = events_tx.send(LockstepEvent::StateHash {
                     tick: sh.tick,
                     hash: sh.hash,
                 });
             }
-            Ok(Some(LockstepInbound::GameStart(_))) => {
+            Ok(Some(LockstepInbound::GameStart { wire_bytes, logical_bytes, .. })) => {
+                wire_delta += wire_bytes as u64;
+                logical_delta += logical_bytes as u64;
                 warn!("lockstep-client got unexpected GameStart after join — ignoring");
             }
-            Ok(Some(LockstepInbound::SnapshotResp(resp))) => {
+            Ok(Some(LockstepInbound::SnapshotResp { msg: resp, wire_bytes, logical_bytes })) => {
+                wire_delta += wire_bytes as u64;
+                logical_delta += logical_bytes as u64;
                 let (bytes_len, schema) = match &resp.state {
                     Some(s) => (s.world_bytes.len(), s.schema_version),
                     None => (0, 0),
@@ -232,11 +252,23 @@ async fn run_client(
             }
         }
 
-        // Drain any pending input submissions without blocking.
+        // Drain any pending input submissions without blocking. Outbound
+        // InputSubmit bytes count toward the same lockstep-traffic total.
         while let Ok((target_tick, input)) = input_rx.try_recv() {
-            if let Err(e) = client.submit_input(target_tick, input).await {
-                warn!("lockstep-client submit_input failed: {}", e);
+            match client.submit_input(target_tick, input).await {
+                Ok((logical, wire)) => {
+                    wire_delta += wire as u64;
+                    logical_delta += logical as u64;
+                }
+                Err(e) => warn!("lockstep-client submit_input failed: {}", e),
             }
+        }
+
+        if wire_delta > 0 || logical_delta > 0 {
+            let _ = events_tx.send(LockstepEvent::NetStats {
+                wire_delta,
+                logical_delta,
+            });
         }
     }
 }
