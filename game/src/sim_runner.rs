@@ -374,13 +374,10 @@ fn run_sim_loop(
     info!("sim_runner: dispatcher ready, entering tick loop");
 
     let mut last_starvation_log = std::time::Instant::now();
-    // Worker-local set of entity ids alive in the previous snapshot. Diff
-    // against the current snapshot's ids each tick to populate
-    // `SimWorldSnapshot.removed_entity_ids` — the render thread uses this to
-    // free per-eid scene caches (labels, batch slots) instead of relying on
-    // a wire-side `entity.death` event. Replaces the legacy omb
-    // `make_entity_death` emit pair.
-    let mut prev_alive: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Phase 1b: removed_entity_ids 從 RemovedEntitiesQueue resource drain
+    // 取代既有 prev_alive HashSet diff。helper `delete_entity_tracked` 統
+    // 一往 queue 推入；`extract_snapshot` 用 `mem::take` 把整批拉到
+    // snapshot，render 端對該 list 釋放 per-eid scene caches。
 
     // Phase 4.5: AbilityRegistry → AbilityDefSnapshot Arc. Built lazily on
     // the first tick where the registry is non-empty (script DLL load is
@@ -559,7 +556,6 @@ fn run_sim_loop(
         let snapshot = extract_snapshot(
             &mut world,
             batch.tick,
-            &mut prev_alive,
             abilities_arc.clone(),
             tower_templates_arc.clone(),
         );
@@ -627,7 +623,6 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, Player
 fn extract_snapshot(
     world: &mut World,
     tick: u32,
-    prev_alive: &mut std::collections::HashSet<u32>,
     abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
     tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
 ) -> SimWorldSnapshot {
@@ -942,13 +937,14 @@ fn extract_snapshot(
         }
     }
 
-    // Diff vs. previous tick's alive set → the entity ids that just dropped
-    // out. Render thread uses this to free per-eid scene caches.
-    let current_alive: std::collections::HashSet<u32> =
-        out.iter().map(|e| e.entity_id).collect();
-    let removed_entity_ids: Vec<u32> =
-        prev_alive.difference(&current_alive).copied().collect();
-    *prev_alive = current_alive;
+    // Phase 1b: drain `RemovedEntitiesQueue` — `delete_entity_tracked` 推入
+    // (與 entities().delete(e) 同步配對)。同 ExplosionFxQueue 模式 — sim
+    // 不讀此 queue 所以 write 不影響 determinism。取代了原本 prev_alive
+    // HashSet 跨 tick state diff 演算法。
+    let removed_entity_ids: Vec<u32> = {
+        let mut q = world.write_resource::<omobab::comp::RemovedEntitiesQueue>();
+        std::mem::take(&mut q.pending)
+    };
 
     // Phase 4.1: BlockedRegion polygons. Static map data — TD_1 is empty,
     // MVP_1/DEBUG_1 have a handful, so cloning each tick is cheap. The
