@@ -1492,7 +1492,9 @@ impl Plugin for Game {
                             "MVP_1".to_string()
                         });
                     log::info!("sim_runner: scene STORY={} (from game.toml)", story);
-                    PathBuf::from(format!("D:/omoba/omb/Story/{}", story))
+                    let data_root = std::env::var("OMB_STORY_DATA_DIR")
+                        .unwrap_or_else(|_| "D:/omoba/scripts/lua_data".to_string());
+                    PathBuf::from(data_root).join(story)
                 });
             log::info!(
                 "Phase 3.2 sim_runner spawn: dll={:?} scene={:?}",
