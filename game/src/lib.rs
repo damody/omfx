@@ -1,8 +1,8 @@
-//! omfx - 2D Tower Defense Network Renderer (Fyrox 1.0)
+//! omfx - 2D 塔防網路渲染器 (Fyrox 1.0)
 //!
-//! Pure network renderer: all game state driven by omb backend via gRPC.
-//! No local game logic — entities are created/moved/deleted by server events.
-#![allow(warnings)]
+//! 純網路渲染器：所有遊戲狀態均由 omb 後端透過 gRPC 驅動。
+//! 沒有本地遊戲邏輯－實體是由伺服器事件創建/移動/刪除的。
+# ![允許（警告）]
 
 use fyrox::graph::prelude::*;
 use fyrox::{
@@ -47,12 +47,12 @@ mod lockstep_client;
 mod sim_runner;
 mod render_bridge;
 
-/// Bridge between the two distinct `PlayerInput` Rust types: omoba_core's
-/// kcp client uses its own prost-generated copy of `proto/game.proto`,
-/// while omobab (omb-as-lib) generates the same proto into a separate
-/// crate-local module. They're identical wire format, so we round-trip
-/// via prost encode/decode at the boundary instead of hand-mapping every
-/// PlayerInput oneof variant.
+/// 兩種不同的「PlayerInput」 Rust 類型之間的橋樑：omoba_core's
+/// kcp 用戶端使用自己的 prost 產生的 `proto/game.proto` 副本，
+/// 而 omobab (omb-as-lib) 將相同的原型產生為單獨的
+/// 板條箱本地模組。它們的線路格式相同，因此我們可以往返
+/// 透過邊界處的 prost 編碼/解碼，而不是手動映射每個
+/// 玩家輸入其中一個變體。
 fn convert_player_input(
     src: &omoba_core::kcp::game_proto::PlayerInput,
 ) -> Option<sim_runner::PlayerInput> {
@@ -190,13 +190,13 @@ fn wall_clock_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Phase 4.3: Fixed32 raw scaling. Vec2I stores `real_units * 1024` as sint32
-/// (see proto/game.proto: "divide by 1024 to get real units"). Backend logical
-/// coords = render coords / WORLD_SCALE; multiply that by 1024 to get the raw.
+/// 階段 4.3：固定 32 原始縮放。 Vec2I 將 `real_units * 1024` 儲存為 sint32
+/// （參見 proto/game.proto：「除以 1024 以獲得真實單位」）。後端邏輯
+/// 座標 = 渲染座標 / WORLD_SCALE；將其乘以 1024 即可得到原始資料。
 const FIXED32_ONE: f32 = 1024.0;
 
-/// Convert an omfx render-space world position into the backend Fixed32 raw
-/// `Vec2I` used by `PlayerInput::MoveTo` / `CastAbility::target_pos`.
+/// 將 omfx 渲染空間世界位置轉換為後端固定 32 原始位置
+/// `PlayerInput::MoveTo` / `CastAbility::target_pos` 使用的 `Vec2I`。
 fn world_render_to_vec2i(world: Vector2<f32>) -> omoba_core::kcp::game_proto::Vec2I {
     let backend_x = world.x / WORLD_SCALE;
     let backend_y = world.y / WORLD_SCALE;
@@ -216,10 +216,10 @@ const CELL_SIZE: f32 = 1.0;
 const GRID_ORIGIN_X: f32 = -6.0;
 const GRID_ORIGIN_Y: f32 = -4.0;
 
-// Backend → render coordinate scale (backend uses large units like 800)
+// 後端→渲染座標比例（後端使用800等大單位）
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
 
-// Z layers in 3D camera frustum (camera at z=-100 looking +Z, near=0.1 far=1000).
+// 3D 相機視錐體中的 Z 層（相機在 z=-100 看 +Z，近=0.1 遠=1000）。
 // SMALLER Z = closer to camera = drawn on top (industry-standard 3D 慣例)。
 //
 // 為什麼是 +Z 視角不是 -Z：Fyrox 的 `Camera::calculate_matrices` 用
@@ -252,20 +252,20 @@ const REGION_BLOCKER_SEGMENTS: usize = 12;
 const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 
 // ---------------------------------------------------------------------------
-// Network Types
+// 網路類型
 
 
 
-/// Seconds that a newly-spawned creep's debug path stays visible.
+/// 新產生的 Creep 的偵錯路徑保持可見的秒數。
 const PATH_VISIBLE_SECS: f32 = 5.0;
 
-/// Phase 5.1 (pass 3): NetworkEntity is dead — apply_event populated this
-/// per-entity render registry from legacy GameEvent stream which was
-/// deleted in pass 2. The struct + `Game::network_entities` field stay in
-/// source so the orphan render loops in Game::update (interpolation, HP
-/// bars, name labels, projectile collision lookups) compile against an
-/// always-empty HashMap. Phase 5.x removes the orphan loops + this struct
-/// (estimated ~600 lines of update body cleanup).
+/// 階段 5.1（第 3 階段）：NetworkEntity 已死亡 — apply_event 填入了此實體
+/// 來自遺留 GameEvent 串流的每個實體渲染註冊表
+/// 在第 2 遍中刪除。 struct + `Game::network_entities` 欄位保留在
+/// 來源，因此孤立渲染在 Game::update 中循環（插值、HP
+/// 欄、名稱標籤、彈道碰撞查找）針對
+/// 始終為空的 HashMap。階段 5.x 刪除了孤兒循環 + 此結構
+/// （估計約 600 行更新主體清理）。
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 struct NetworkEntity {
@@ -303,9 +303,9 @@ struct NetworkEntity {
     extrap_duration: f32,
 }
 
-/// Per-entity UI label tracking for sim_runner-backed sprites.
-/// `last_*` fields gate UI message sends to avoid flooding the queue at
-/// 60 fps × N entities when nothing visible has changed.
+/// 針對 sim_runner 支援的 sprite 的每個實體 UI 標籤追蹤。
+/// `last_*` 欄位控制 UI 訊息傳送以避免佇列氾濫
+/// 當沒有任何可見變化時，60 fps × N 個實體。
 #[derive(Debug)]
 struct SimEntityLabel {
     handle: Handle<Text>,
@@ -336,16 +336,16 @@ struct ActiveExplosion {
     elapsed: f32,
 }
 
-/// Client-side projectile simulation.
+/// 客戶端射彈模擬。
 ///
-/// Backend only sends a single C event with `target_id` + `flight_time_ms`;
-/// the bullet's position is computed locally each frame as a pursuit lerp
-/// from `start_pos` toward the target entity's CURRENT client-side position.
+/// 後端僅發送帶有 `target_id` + `flight_time_ms` 的單一 C 事件；
+/// 子彈的位置在每幀作為追蹤 lerp 進行本地計算
+/// 從“start_pos”到目標實體的目前客戶端位置。
 /// P7 layered prediction entry (per projectile id). Tracks「server 已經宣告
 /// 但 server 還沒送 hp_snapshot 反映」這段視窗內，client 想本地視覺上扣多少血。
 ///
 /// Lifecycle:
-///   PC arrives        → insert (applied=false)
+/// PC 到達→插入（已套用=假）
 ///   visual t≥1.0 hit  → applied=true（命中時刻才從 display HP 扣下去）
 ///   D event           → remove（projectile 死了：可能命中、可能 timeout/取消）
 ///   heartbeat retain  → 不在 server 的 in_flight_projectiles 集合 → remove
@@ -360,8 +360,8 @@ struct PendingPredDmg {
     applied: bool,
 }
 
-/// This eliminates the per-tick network round-trip lag that made bullets
-/// visually trail the creep.
+/// 這消除了產生子彈的每跳動網路往返延遲
+/// 視覺上追蹤蠕動。
 #[derive(Debug)]
 struct ClientProjectile {
     node: Handle<Node>,
@@ -370,8 +370,8 @@ struct ClientProjectile {
     last_target_pos: Vector2<f32>,
     elapsed: f32,
     flight_time: f32,
-    // Predicted damage applied client-side when the bullet visually hits;
-    // heartbeat HP snapshot reconciles drift every 2s.
+    // 當子彈視覺擊中時，預測傷害應用於客戶端；
+    // 心跳 HP 快照每 2 秒協調一次漂移。
     damage: f32,
     applied: bool,
     /// 方向性子彈（Tack 放射針）：無 target_id，走直線到 `end_pos`
@@ -383,7 +383,7 @@ struct ClientProjectile {
     splash_radius_render: f32,
 }
 
-/// Heartbeat info (for UI display)
+/// 心跳資訊（用於UI顯示）
 #[derive(Default, Debug)]
 struct HeartbeatInfo {
     tick: u64,
@@ -393,7 +393,7 @@ struct HeartbeatInfo {
     creep_count: u64,
 }
 
-/// Connection status
+/// 連線狀態
 #[derive(Default, Clone, PartialEq, Debug)]
 enum ConnectionStatus {
     #[default]
@@ -403,16 +403,16 @@ enum ConnectionStatus {
     Failed(String),
 }
 
-/// Try to spawn the omb backend as a child process.
-/// RAII guard that owns the backend `Child` and (on Windows) a Job Object handle.
+/// 嘗試將 omb 後端作為子進程產生。
+/// 擁有後端「Child」和（在 Windows 上）作業物件句柄的 RAII 防護。
 ///
-/// Kill semantics:
-/// - **Graceful exit** (window close, Ok return, panic unwind): `Drop` runs, calling
-///   `child.kill()` + `child.wait()`.
-/// - **Hard kill** (task manager, log-off, parent crash): Windows closes all our
-///   handles. Because the backend is in a Job Object with
-///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the OS terminates it automatically the
-///   moment our process ends and the job handle is implicitly closed.
+/// 殺死語意：
+/// - **優雅退出**（視窗關閉，Ok 返回，恐慌解除）： `Drop` 運行，調用
+/// `child.kill()` + `child.wait()`。
+/// - **硬殺**（工作管理員、登出、父親崩潰）：Windows 關閉我們所有的
+/// 手柄。因為後端位於 Job 物件中
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，作業系統自動終止它
+/// 當我們的進程結束並且作業句柄隱式關閉時。
 #[derive(Debug)]
 struct BackendGuard {
     child: Option<std::process::Child>,
@@ -430,8 +430,8 @@ impl Drop for BackendGuard {
         #[cfg(windows)]
         {
             if let Some(job) = self.job.take() {
-                // Closing the last handle to the job triggers KILL_ON_JOB_CLOSE,
-                // which kills any still-alive processes inside.
+                // 關閉作業的最後一個句柄會觸發 KILL_ON_JOB_CLOSE，
+                // 這會殺死內部任何仍然活動的進程。
                 use windows::Win32::Foundation::CloseHandle;
                 unsafe { let _ = CloseHandle(job); }
             }
@@ -439,13 +439,13 @@ impl Drop for BackendGuard {
     }
 }
 
-/// Spawn the backend as a child process, tied to the current process's lifetime.
-/// Returns `None` if we can't find the omb directory or the spawn fails.
+/// 將後端產生為子進程，與目前進程的生命週期相關聯。
+/// 如果我們找不到 omb 目錄或生成失敗，則傳回「None」。
 fn spawn_backend() -> Option<BackendGuard> {
     use std::process::{Command, Stdio};
     use std::path::PathBuf;
 
-    // Find the omb directory relative to cwd
+    // 找到相對於cwd的omb目錄
     let candidates = [
         PathBuf::from("omb"),       // cwd = D:\omoba
         PathBuf::from("../omb"),    // cwd = D:\omoba\omfx
@@ -463,7 +463,7 @@ fn spawn_backend() -> Option<BackendGuard> {
 
     log::info!("Auto-starting backend from {:?}...", omb_dir);
 
-    // Try pre-built binary first
+    // 首先嘗試預先建置的二進位文件
     let exe_path = omb_dir.join("target/debug/omobab.exe");
     let result = if exe_path.exists() {
         Command::new(&exe_path)
@@ -506,9 +506,9 @@ fn spawn_backend() -> Option<BackendGuard> {
     }
 }
 
-/// Create a Windows Job Object with KILL_ON_JOB_CLOSE, attach the given child,
-/// and return the job handle. On failure, returns `None` — the `BackendGuard`
-/// falls back to `Drop`-time kill only.
+/// 使用 KILL_ON_JOB_CLOSE 建立一個 Windows 作業對象，附加給定的子對象，
+/// 並傳回作業句柄。失敗時，返回“None”——“BackendGuard”
+/// 僅退回到“Drop”時殺死。
 #[cfg(windows)]
 fn create_job_and_attach(child: &std::process::Child) -> Option<windows::Win32::Foundation::HANDLE> {
     use std::os::windows::io::AsRawHandle;
@@ -555,7 +555,7 @@ fn create_job_and_attach(child: &std::process::Child) -> Option<windows::Win32::
 
 
 // ---------------------------------------------------------------------------
-// Game Plugin
+// 遊戲插件
 // ---------------------------------------------------------------------------
 
 // ---------- Frame profile (omfx 端 per-frame timing 拆解，類比 omb 的 tick_profile) ----------
@@ -578,9 +578,9 @@ struct FrameProfile {
     draw_calls_total: u64,
     triangles_total: u64,
     last_fps: usize,
-    /// Most recent per-frame snapshot (overwritten each call to `record_render_stats`).
-    /// Used by the HUD status text — window averages reset every WINDOW frames so
-    /// the instantaneous sample gives smoother live readout.
+    /// 最近的每幀快照（覆蓋每次呼叫“record_render_stats”）。
+    /// 由 HUD 狀態文字使用 — 視窗平均值會重設每個 WINDOW 幀，以便
+    /// 瞬時樣本提供更流暢的即時讀數。
     last_draw_calls: usize,
     last_triangles: usize,
 }
@@ -651,7 +651,7 @@ impl FrameProfile {
         self.capped_render_ms_total = 0.0;
         self.draw_calls_total = 0;
         self.triangles_total = 0;
-        // last_fps is just-overwritten each frame, no reset needed
+        // last_fps 只是覆蓋每一幀，無需重置
     }
 }
 
@@ -665,8 +665,8 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     window_size: Vector2<f32>,
 
-    /// Shared sprite GPU resources (single quad + 9 materials).
-    /// Lazily initialized on first frame; reused for all entity sprite Meshes.
+    /// 共享 sprite GPU 資源（單一四邊形 + 9 個材質）。
+    /// 在第一幀上延遲初始化；重用於所有實體 sprite 網格體。
     #[visit(skip)] #[reflect(hidden)]
     sprite_resources: Option<sprite_resources::SharedSpriteResources>,
 
@@ -686,17 +686,17 @@ pub struct Game {
     facing_batch: Option<sprite_resources::BatchedSpriteMesh>,
 
 
-    // --- Network ---
-    // Phase 5.1: legacy `network: Option<NetworkBridge>` field removed.
-    /// Lockstep client (KCP tags 0x10-0x16). Drives sim_runner via
-    /// TickBatch / StateHash on a separate background thread.
+    // - - 網路 - -
+    // 階段 5.1：刪除了舊版「network: Option<NetworkBridge>」欄位。
+    /// Lockstep 用戶端（KCP 標籤 0x10-0x16）。透過驅動 sim_runner
+    /// TickBatch / StateHash 在單獨的後台執行緒上。
     #[visit(skip)] #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
-    /// Phase 4.3: most recent `LockstepEvent::TickBatch.tick` observed.
-    /// Used to compute `target_tick = current_sim_tick + 3` for input
-    /// submissions (50 ms input delay at 60 Hz). Initialized to 0 via
-    /// `#[derive(Default)]`; updated each frame in the TickBatch arm of
-    /// `Game::update`.
+    /// 階段 4.3：觀察到最近的「LockstepEvent::TickBatch.tick」。
+    /// 用於計算輸入的“target_tick = current_sim_tick + 3”
+    /// 提交（60 Hz 時輸入延遲 50 毫秒）。透過初始化為 0
+    /// `#[導出（預設）]`;更新了 TickBatch 手臂中的每一幀
+    /// `遊戲::更新`。
     #[visit(skip)] #[reflect(hidden)]
     current_sim_tick: u32,
     #[visit(skip)] #[reflect(hidden)]
@@ -709,27 +709,27 @@ pub struct Game {
     pending_inputs_evicted: u64,
     #[visit(skip)] #[reflect(hidden)]
     input_latency_meter: InputLatencyMeter,
-    /// Phase 3.2 sim_runner worker (full omb ECS dispatcher running off a
-    /// background thread). Dropped on `on_deinit` so the channel
-    /// disconnect lets the worker exit. Phase 3.3 will wire input feed
-    /// from `lockstep_handle`; until then the worker just blocks on
-    /// `master_seed_rx.recv()` and never ticks.
+    /// 階段 3.2 sim_runner 工作執行緒（執行完整的 omb ECS 排程器）
+    /// 後台線程）。落在 `on_deinit` 上，所以頻道
+    /// 斷開連線讓工作人員退出。階段 3.3 將連接輸入饋電
+    /// 來自「lockstep_handle」；直到那時工人就會阻塞
+    /// `master_seed_rx.recv()` 並且從不勾選。
     #[visit(skip)] #[reflect(hidden)]
     sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
-    /// Phase 3.4 render bridge: reads `SimWorldSnapshot` per frame and
-    /// (Phase 4) spawns / updates / despawns Fyrox sprites for each entity.
-    /// Currently a stub that logs entity render data. Always allocated
-    /// (cheap default) so the per-frame check in `update` is just a method
-    /// call, not an `Option` unwrap.
+    /// 階段 3.4 渲染橋：每個畫面讀取 `SimWorldSnapshot` 並
+    /// （第 4 階段）為每個實體產生/更新/消失 Fyrox sprite。
+    /// 目前是記錄實體渲染資料的存根。始終分配
+    /// （便宜的預設值）因此“update”中的每個畫面檢查只是一種方法
+    /// 調用，而不是“Option”解包。
     #[visit(skip)] #[reflect(hidden)]
     render_bridge: render_bridge::RenderBridge,
     #[visit(skip)] #[reflect(hidden)]
     connection_status: ConnectionStatus,
-    // Phase 5.1: `event_buffer: Option<EventBuffer>` field removed.
-    // EventBuffer drove the legacy GameEvent reorder/replay pipeline.
-    // `network_entities` field kept temporarily — orphan render loops in
-    // Game::update still iterate it (always empty since apply_event is
-    // gone); Phase 5.x cleans up the loops + this field.
+    // 階段 5.1：刪除了 `event_buffer: Option<EventBuffer>` 欄位。
+    // EventBuffer 驅動了舊版 GameEvent 重新排序/重播管道。
+    // `network_entities` 欄位暫時保留 - 孤立渲染循環
+    // Game::update 仍然迭代它（總是為空，因為 apply_event 是
+    // 消失了）；階段 5.x 清理了循環 + 該欄位。
     #[visit(skip)] #[reflect(hidden)]
     network_entities: HashMap<u32, NetworkEntity>,
     /// BlockedRegion 線框 scene node（每個 region 一組 polygon outline segments）。
@@ -794,10 +794,10 @@ pub struct Game {
     /// 進行中的爆炸特效（Bomb 塔命中時 spawn）
     #[visit(skip)] #[reflect(hidden)]
     active_explosions: Vec<ActiveExplosion>,
-    /// Phase 4.2: highest sim tick whose `snapshot.explosions` we have
-    /// already drained into `active_explosions`. Render frames can read
-    /// the same snapshot multiple times before the sim publishes the
-    /// next one — without this dedupe we'd spawn duplicate rings.
+    /// 階段 4.2：我們擁有「snapshot.explosions」的最高 sim 刻度
+    /// 已排入「active_explosions」。渲染幀可以讀取
+    /// 在SIM卡發布之前多次使用相同的快照
+    /// 下一個 - 如果沒有這種重複資料刪除，我們就會產生重複的環。
     #[visit(skip)] #[reflect(hidden)]
     sim_last_explosion_tick: Option<u32>,
     /// TD 路徑 check_points（render 座標）— 供 placement 預覽計算是否壓到路
@@ -812,15 +812,15 @@ pub struct Game {
     /// Template 的顯示順序（= DLL `units()` 註冊順序），供按鈕排版用
     #[visit(skip)] #[reflect(hidden)]
     td_template_order: Vec<String>,
-    /// Tower upgrade defs cache: (tower_kind, path, level) → (display name, cost).
-    /// Seeded once from `snapshot.tower_upgrades` (Arc lazy-build pattern).
-    /// Used by Sell button to compute refund (base*0.85 + Σ upgrades*0.75)
-    /// and by Upgrade button to show next-level name + cost.
+    /// Tower 升級定義快取：（tower_kind、路徑、等級）→（顯示名稱、成本）。
+    /// 從「snapshot.tower_upgrades」（Arc 延遲建置模式）播種一次。
+    /// 由「出售」按鈕用來計算退款（基礎*0.85 + Σ 升級*0.75）
+    /// 並透過升級按鈕顯示下一級名稱+成本。
     #[visit(skip)] #[reflect(hidden)]
     td_upgrade_defs: HashMap<(String, u8, u8), (String, i32)>,
     #[visit(skip)] #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
-    /// P7 layered prediction：key = projectile id（server `e.id()`）。
+    /// P7分層預測：key = 彈丸id（伺服器`e.id()`）。
     /// 跟 client_projectiles 同 id；前者是視覺軌跡，這個是傷害預測 ledger。
     /// 視覺命中後 ClientProjectile 移除但 PendingPredDmg 留著，等 heartbeat
     /// 的 in_flight_projectiles 或 D event 真結算才移除。
@@ -833,27 +833,27 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     frame_profile: FrameProfile,
 
-    // --- Backend Process ---
-    /// Drops → kills backend. Held for the whole Game lifetime so that any exit
-    /// path (normal, panic, force-close on Windows via Job Object) brings the
-    /// backend down with us.
+    // --- 後端流程 ---
+    /// 掉落 → 殺死後端。在整個遊戲生命週期內保持，以便任何退出
+    /// 路徑（在 Windows 上透過作業對象正常、緊急、強制關閉）帶來
+    /// 後端與我們一起關閉。
     #[visit(skip)] #[reflect(hidden)]
     backend_guard: Option<BackendGuard>,
 
     #[visit(skip)] #[reflect(hidden)]
     pending_label_deletions: Vec<Handle<Text>>,
 
-    /// UI Text labels for entities surfaced by `render_bridge` (sim_runner-backed).
-    /// Keyed by `entity_id`. Created on first render of an entity, updated each
-    /// frame, removed when the entity drops out of the sim snapshot.
+    /// 由「render_bridge」（sim_runner 支援）呈現的實體的 UI 文字標籤。
+    /// 由“entity_id”鍵入。在實體的第一次渲染時創建，每次更新
+    /// 框架，當實體從 sim 快照中退出時刪除。
     #[visit(skip)] #[reflect(hidden)]
     sim_entity_labels: HashMap<u32, SimEntityLabel>,
 
-    /// Batched-mesh slot ownership for sim_runner-backed entities, keyed by
-    /// `entity_id`. body_batch + hp_batch slots are allocated on first
-    /// sighting and freed when the entity drops from the snapshot. This is
-    /// the draw-call-saving path: 1000 creeps + 1000 towers ≈ 2 draws total
-    /// (one per batch), vs. one node-per-entity which is one draw per quad.
+    /// sim_runner 支援的實體的批次網格槽所有權，由
+    /// `實體_id`。 body_batch + hp_batch 插槽首先分配
+    /// 當實體從快照中掉落時看到並釋放。這是
+    /// 節省繪製呼叫的路徑：1000 個小兵 + 1000 個塔 ≈ 總共 2 個繪製
+    /// （每批一個），與每個實體一個節點，即每個四邊形一次繪製。
     #[visit(skip)] #[reflect(hidden)]
     sim_entity_slots: HashMap<u32, render_bridge::SimEntitySlots>,
 
@@ -863,15 +863,15 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     projectile_spawn_pos: HashMap<u32, Vector2<f32>>,
 
-    /// Wall-clock timestamp of first frame; used by the
-    /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` smoke loop
-    /// so a single `cargo run` can reproduce a Start-Round-then-die scenario
-    /// without manual clicks. None until first update() tick.
+    /// 第一幀的掛鐘時間戳；所使用的
+    /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` 煙霧循環
+    /// 因此，單一「cargo run」可以重現「開始-回合-然後-死亡」的場景
+    /// 無需手動點擊。直到第一次 update() 勾選為止。
     #[visit(skip)] #[reflect(hidden)]
     auto_clock_start: Option<std::time::Instant>,
-    /// Latched once the auto Start-Round input has been emitted, so the
-    /// dispatcher only sees one StartRound (subsequent host-side reads
-    /// would warn "round already running").
+    /// 一旦發出自動開始回合輸入就鎖定，因此
+    /// 調度程式只看到一個 StartRound（後續主機端讀取
+    /// 會警告“回合已在運行”）。
     #[visit(skip)] #[reflect(hidden)]
     auto_start_sent: bool,
     #[visit(skip)] #[reflect(hidden)]
@@ -921,7 +921,7 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     ui_end_text: Handle<Text>,
 
-    // --- LoL MVP: Local Hero state cached from hero.* events ---
+    // --- LoL MVP：从英雄缓存本地英雄状态。 *事件 ---
     #[visit(skip)] #[reflect(hidden)]
     hero_state: LocalHeroState,
     #[visit(skip)] #[reflect(hidden)]
@@ -1059,10 +1059,10 @@ impl Plugin for Game {
 
         let mut scene = Scene::new();
 
-        // Remove the default built-in skybox (shows as a blue/white gradient behind 2D content)
+        // 刪除預設的內建天空盒（在 2D 內容後面顯示為藍色/白色漸層）
         scene.set_skybox(None);
 
-        // 2D rendering options
+        // 2D 渲染選項
         use fyrox::scene::SceneRenderingOptions;
         scene.rendering_options.set_value_and_mark_modified(SceneRenderingOptions {
             clear_color: Some(Color::from_rgba(30, 80, 30, 255)),
@@ -1091,7 +1091,7 @@ impl Plugin for Game {
         .build(&mut scene.graph)
         .transmute();
 
-        // Point light covering entire map
+        // 覆蓋整個地圖的點光源
         PointLightBuilder::new(
             BaseLightBuilder::new(
                 BaseBuilder::new().with_local_transform(
@@ -1105,7 +1105,7 @@ impl Plugin for Game {
         .with_radius(40.0)
         .build(&mut scene.graph);
 
-        // Background (dark green)
+        // 背景（深綠色）
         RectangleBuilder::new(
             BaseBuilder::new().with_local_transform(
                 TransformBuilder::new()
@@ -1119,13 +1119,13 @@ impl Plugin for Game {
 
         self.scene = context.scenes.add(scene);
 
-        // UI: status text
+        // UI：狀態文字
         context
             .user_interfaces
             .add(UserInterface::new(Default::default()));
         let ui = context.user_interfaces.first_mut();
 
-        // Load CJK font (Microsoft JhengHei) for Chinese text rendering
+        // 載入CJK字體（Microsoft JhengHei）進行中文文字渲染
         if let Ok(font_data) = std::fs::read("C:/Windows/Fonts/msjh.ttc") {
             use fyrox::gui::font::{Font, FontResource, FontStyles};
             use fyrox::asset::untyped::ResourceKind;
@@ -1142,7 +1142,7 @@ impl Plugin for Game {
 
         // 載入孫市四技能圖示（hero1_1..4）
         // 用 Fyrox UI 內建 check.png / add.png 等的同套 pattern：
-        //   TextureResource::load_from_memory + CompressionOptions::NoCompression
+        // TextureResource::load_from_memory + CompressionOptions::No Compression
         // 壓縮 texture 會造成 UI renderer 拿不到可顯示的 GPU 格式 → 空白。
         // 實際位置在 update() 依當前 window_size 置底中央。
         {
@@ -1414,24 +1414,24 @@ impl Plugin for Game {
         // Inventory 初始 6 格
         self.hero_state.inventory = vec![None; 6];
 
-        // Auto-start backend (tied to our lifetime via BackendGuard + Job Object)
+        // 自動啟動後端（透過 BackendGuard + Job 物件與我們的生命週期綁定）
         self.backend_guard = spawn_backend();
 
-        // Network init
+        // 網路初始化
         let server_addr = std::env::var("OMB_KCP_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:50061".to_string());
         let player_name = std::env::var("OMB_PLAYER_NAME")
             .unwrap_or_else(|_| "omfx_player".to_string());
 
-        // Phase 5.1: NetworkBridge consumer cut. Phase 4.5 flipped omb's
-        // `legacy_broadcast` default OFF so the 0x02 GameEvent stream is
-        // silent. Lockstep (KCP tags 0x10–0x16) is now the sole input/state
-        // wire — driven by `lockstep_handle` below + sim_runner + render_bridge.
+        // 階段 5.1：NetworkBridge 消費者削減。階段 4.5 翻轉 omb
+        // `legacy_broadcast` 預設關閉，因此 0x02 GameEvent 串流是
+        // 沉默的。鎖步（KCP 標籤 0x10–0x16）現在是唯一的輸入/狀態
+        // 線 — 由下面的 `lockstep_handle` + sim_runner + render_bridge 驅動。
         self.connection_status = ConnectionStatus::Connected;
 
-        // Lockstep wire-up. Runs as a background thread on its own KCP
-        // connection. TickBatch / StateHash drive the local sim_runner
-        // (Phase 3.x) which renders via render_bridge (Phase 4.2).
+        // 鎖步接線。作為後台線程在其自己的 KCP 上運行
+        // 聯繫。 TickBatch / StateHash驅動本地sim_runner
+        // （階段 3.x）透過 render_bridge 渲染（階段 4.2）。
         let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME")
             .unwrap_or_else(|_| format!("{}_lockstep", player_name));
         self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
@@ -1439,32 +1439,32 @@ impl Plugin for Game {
             lockstep_player_name,
         ));
 
-        // Phase 3.2: spawn the local sim_runner worker. It blocks on the
-        // master_seed channel — Phase 3.3 will wire LockstepClient's
-        // GameStart handler to send via `sim_runner_handle.master_seed_tx`.
-        // For Phase 3.2 the worker simply parks until shutdown, which
-        // verifies the worker thread spawn + symbol resolution.
+        // 階段 3.2：產生本地 sim_runner 工作執行緒。它阻止
+        // master_seed 頻道 — 第 3.3 階段將連接 LockstepClient
+        // 透過「sim_runner_handle.master_seed_tx」傳送的 GameStart 處理程序。
+        // 對於第 3.2 階段，工人只需停車直至關閉，這
+        // 驗證工作執行緒產生+符號解析。
         {
             use std::path::PathBuf;
-            // Default to omb/scripts/ where run.bat copies the freshly-built DLL
-            // (debug or release — whichever profile run.bat used). load_scripts_dir
-            // takes the parent dir and scans for .dll, so this works for both.
+            // 預設為 omb/scripts/，其中 run.bat 複製新建的 DLL
+            // （調試或發布 - 無論 run.bat 使用哪個設定檔）。載入腳本目錄
+            // 取得父目錄並掃描 .dll，因此這對兩者都適用。
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     PathBuf::from("D:/omoba/omb/scripts/base_content.dll")
                 });
-            // omobab::ServerSetting::default reads "game.toml" by relative path
-            // (works for omobab.exe with cwd=omb). omfx process cwd is elsewhere,
-            // so point the lazy_static at an absolute path.
+            // omobab::ServerSetting::default 透過相對路徑讀取“game.toml”
+            // （適用於帶有 cwd=omb 的 omobab.exe）。 omfx 進程 cwd 在其他地方，
+            // 所以將lazy_static指向絕對路徑。
             if std::env::var("OMB_GAME_TOML").is_err() {
                 std::env::set_var("OMB_GAME_TOML", "D:/omoba/omb/game.toml");
             }
-            // Sync sim_runner's scene with omb's by parsing STORY from the same
-            // game.toml. Otherwise sim_runner loads MVP_1 while omb loads TD_1
-            // (per game.toml STORY) and the two ECS worlds diverge — sim_runner
-            // ends up with MVP_1's training enemies / blockers (~410 ghost
-            // entities) while creep paths / waves don't match omb's.
+            // 透過解析同一場景中的 STORY 將 sim_runner 的場景與 omb 的場景同步
+            // 遊戲.toml。否則 sim_runner 載入 MVP_1，而 omb 載入 TD_1
+            // （根據 game.toml STORY）以及兩個 ECS 世界的分歧 — sim_runner
+            // 最終以 MVP_1 的訓練敵人/阻擋者結束（~410 個幽靈
+            // 實體），而蠕變路徑/波與 omb 不符。
             let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
@@ -1504,26 +1504,26 @@ impl Plugin for Game {
             self.sim_runner_handle = Some(sim_runner::spawn_sim_runner(dll_path, scene_path));
         }
 
-        // Phase 5.1: legacy NetworkBridge / EventBuffer / network_entities /
-        // client_projectiles state no longer initialized — the consumer is gone.
-        // (Field declarations remain to be removed in the same Phase 5.1 cut.)
+        // 階段 5.1：遺留 NetworkBridge/EventBuffer/network_entities/
+        // client_projectiles 狀態不再初始化－消費者消失了。
+        // （現場聲明仍需在同一階段 5.1 剪輯中刪除。）
 
         Ok(())
     }
 
     fn on_deinit(&mut self, _context: PluginContext) -> GameResult {
-        // Phase 5.1: NetworkBridge no longer owned; nothing to drop here.
-        // Drop lockstep client (input_tx drop + events_rx drop → bg thread
-        // exits on next iteration when its select sees disconnected channels).
+        // 階段5.1：不再擁有NetworkBridge；這裡沒有什麼好掉的。
+        // 刪除鎖步客戶端（input_tx drop + events_rx drop → bg thread
+        // 當其選擇看到斷開連接的通道時，將在下一次迭代中退出）。
         self.lockstep_handle = None;
-        // Drop sim_runner. Channel disconnect signals the worker to
-        // exit (whether it's still blocked on master_seed_rx.recv() or
-        // looping on tick_input_rx.recv()).
+        // 刪除 sim_runner.通道斷開向工作人員發出訊號
+        // 退出（是否仍被 master_seed_rx.recv() 或
+        // 在 tick_input_rx.recv() 上循環。
         self.sim_runner_handle = None;
 
-        // Drop the backend guard — its Drop impl kills the child and closes the Job Object.
-        // (If Drop doesn't run, e.g. on hard kill, the OS still terminates the backend
-        // thanks to JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.)
+        // 刪除後端防護 — 它的 Drop impl 會殺死子程序並關閉作業物件。
+        // （如果 Drop 不運行，例如在硬終止時，作業系統仍會終止後端
+        // 感謝 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE。 ）
         self.backend_guard = None;
 
         Ok(())
@@ -1536,10 +1536,10 @@ impl Plugin for Game {
         scene.drawing_context.clear_lines();
         let frame_t0 = std::time::Instant::now();
 
-        // Smoke-loop hooks (read once on first update). Both env vars are
-        // independent; either or both may be set. Used by automated test
-        // runs so a single `run.bat` can launch → press Start Round →
-        // exit, without a human clicking buttons.
+        // 煙環鉤子（第一次更新時讀取一次）。兩個環境變數都是
+        // 獨立的;可以設定其中之一或兩者。供自動化測試使用
+        // 執行，以便可以啟動單一「run.bat」→按開始回合→
+        // 退出，無需人工點擊按鈕。
         let now = std::time::Instant::now();
         if self.auto_clock_start.is_none() {
             self.auto_clock_start = Some(now);
@@ -1614,7 +1614,7 @@ impl Plugin for Game {
             }
         }
 
-        // Lazy init shared sprite resources on first frame.
+        // 延遲初始化在第一幀上共享 sprite 資源。
         if self.sprite_resources.is_none() {
             self.sprite_resources = Some(sprite_resources::SharedSpriteResources::new());
         }
@@ -1628,7 +1628,7 @@ impl Plugin for Game {
         }
         if self.hp_batch.is_none() {
             let material = self.sprite_resources.as_ref().unwrap().material.clone();
-            // 8192 = 4096 entity × 2 (bg + fg)
+            // 8192 = 4096 個實體 × 2 (背景 + 背景)
             self.hp_batch = Some(sprite_resources::BatchedSpriteMesh::new(
                 scene, 8192, material,
             ));
@@ -1640,22 +1640,22 @@ impl Plugin for Game {
             ));
         }
 
-        // Phase 5.1: connection status / initial viewport drain removed
-        // (tracked the legacy NetworkBridge handshake which no longer exists).
-        // Lockstep `Connected` event below is now the canonical "we're up" signal.
+        // 階段 5.1：連線狀態/初始視窗排出已移除
+        // （追蹤不再存在的舊版 NetworkBridge 握手）。
+        // 下面的同步「已連線」事件現在是規範的「我們已經啟動」訊號。
 
-        // Phase 3.3: drain lockstep events and forward to sim_runner.
-        // - Connected → push master_seed (unblocks worker's blocking recv)
-        // - TickBatch → convert inputs (omoba_core proto type → omobab proto
-        //   type) and push as TickBatchPayload so the worker advances its
-        //   ECS dispatcher one tick. Both crates generate the same
-        //   `proto/game.proto` independently, so we round-trip via prost
-        //   encode/decode at the boundary instead of hand-mapping every
-        //   PlayerInput variant.
-        // - StateHash → log only (Phase 3.4 will compare against the
-        //   sim_runner's local hash for desync detection).
-        // - Disconnected → log.
-        // TickBatch is sampled every 60 ticks (~1s @ 60Hz) to avoid log spam.
+        // 階段 3.3：排出鎖定事件並轉送至 sim_runner。
+        // - 連線→推送master_seed（解鎖worker的阻塞recv）
+        // - TickBatch → 轉換輸入（omoba_core 原型類型 → omobab 原型
+        // 類型）並作為 TickBatchPayload 推送，以便工作人員推進其
+        // ECS 調度程序一記。兩個板條箱產生相同的
+        // `proto/game.proto` 獨立，所以我們透過 prost 往返
+        // 在邊界處進行編碼/解碼，而不是手動映射每個
+        // 玩家輸入變體。
+        // - StateHash → 僅記錄（階段 3.4 將與
+        // sim_runner 用於非同步偵測的本地雜湊）。
+        // - 斷開連接 → 記錄。
+        // TickBatch 每 60 個刻度 (~1s @ 60Hz) 採樣一次，以避免日誌垃圾郵件。
         if let (Some(ref lh), Some(ref sim)) = (
             self.lockstep_handle.as_ref(),
             self.sim_runner_handle.as_ref(),
@@ -1672,7 +1672,7 @@ impl Plugin for Game {
                         }
                     }
                     lockstep_client::LockstepEvent::TickBatch { tick, inputs, server_events } => {
-                        // Phase 4.3: track latest sim tick for input target_tick math.
+                        // 階段 4.3：追蹤輸入 target_tick 數學的最新 sim 刻度。
                         self.current_sim_tick = tick;
                         self.current_sim_tick_observed_at = Some(now);
                         if tick % 60 == 0 {
@@ -1681,9 +1681,9 @@ impl Plugin for Game {
                                 tick, inputs.len(), server_events.len()
                             );
                         }
-                        // Bridge omoba_core's PlayerInput type → omobab's
-                        // PlayerInput type via prost re-encode. They are
-                        // identical wire format but distinct Rust types.
+                        // 橋接 omoba_core 的 PlayerInput 類型 → omobab 的
+                        // 透過 prost 重新編碼的 PlayerInput 類型。他們是
+                        // 相同的電線格式但不同的 Rust 類型。
                         let converted: Vec<(u32, sim_runner::PlayerInput, u32)> = inputs
                             .into_iter()
                             .filter_map(|(pid, inp, input_id)| {
@@ -1697,13 +1697,13 @@ impl Plugin for Game {
                         if let Err(e) = sim.tick_input_tx.send(payload) {
                             log::error!("[lockstep] failed to forward tick batch: {}", e);
                         }
-                        // server_events: Phase 3.3 ignored; Phase 5+ will
-                        // route them into the sim's event sink.
+                        // server_events：忽略第 3.3 階段； 5+階段將
+                        // 將它們路由到 sim 的事件接收器。
                     }
                     lockstep_client::LockstepEvent::StateHash { tick, hash } => {
                         log::info!("[lockstep] state_hash@{}=0x{:016x}", tick, hash);
-                        // Phase 3.4 will compare this against the
-                        // sim_runner's locally computed hash.
+                        // 第 3.4 階段將將此與
+                        // sim_runner 的本地計算雜湊。
                     }
                     lockstep_client::LockstepEvent::NetStats { wire_delta, logical_delta } => {
                         self.net_wire_bytes_current += wire_delta;
@@ -1719,25 +1719,25 @@ impl Plugin for Game {
             }
         }
 
-        // Phase 3.4: read latest sim snapshot and (stub) update render
-        // bridge. Acquired with `try_lock` so a slow render frame doesn't
-        // block the sim worker — if the lock is contended we just skip
-        // this frame and pick up the next snapshot. Phase 4 will replace
-        // the stub `update` body with real Fyrox sprite spawn / update /
-        // despawn, retiring the NetworkBridge GameEvent → sprite pipeline
-        // below for the entities the sim authoritatively owns.
+        // 階段 3.4：讀取最新的 sim 快照並（存根）更新渲染
+        // 橋。透過“try_lock”獲取，因此不會出現緩慢的渲染幀
+        // 阻止 sim 工作線程——如果鎖被爭用，我們就跳過
+        // 此幀並拾取下一個快照。第 4 階段將取代
+        // 帶有真實 Fyrox sprite 生成 / 更新 / 的存根「更新」主體
+        // despawn，退休 NetworkBridge GameEvent → sprite pipeline
+        // 下面是 SIM 權威擁有的實體。
         let mut applied_input_ids_to_pair: Option<Vec<u32>> = None;
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
                 self.render_bridge.update(&*snapshot, scene);
                 applied_input_ids_to_pair = Some(snapshot.applied_input_ids.clone());
 
-                // Phase 5.x: HUD heartbeat sourced from sim snapshot
-                // (NetworkBridge GameEvent stream was cut in Phase 5.1; this
-                // restores tick / entity / hero / creep counts on the top-line
-                // status text and hp / max_hp on the hero panel).
+                // 階段 5.x：HUD 心跳源自 sim 快照
+                // （NetworkBridge GameEvent 串流在第 5.1 階段被刪除；這
+                // 恢復頂線上的蜱/實體/英雄/小兵計數
+                // 英雄面板上的狀態文字和 hp / max_hp）。
                 self.heartbeat.tick = snapshot.tick as u64;
-                // sim_runner runs at the lockstep tick rate (60 Hz pacer).
+                // sim_runner 以鎖定步滴答率（60 Hz 心律調節器）運作。
                 self.heartbeat.game_time = (snapshot.tick as f64) / 60.0;
                 self.heartbeat.entity_count = snapshot.entities.len() as u64;
                 self.heartbeat.hero_count = snapshot.entities.iter()
@@ -1747,32 +1747,32 @@ impl Plugin for Game {
                     .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
                     .count() as u64;
 
-                // Phase 3.2: TD HUD state from sim snapshot. Replaces the
-                // legacy NetworkBridge `apply_event` writes that were cut in
-                // Phase 5.1, leaving these fields stuck at default. The Start
-                // Round button text + the LIVES top-line both read these.
+                // 階段 3.2：來自 sim 快照的 TD HUD 狀態。取代了
+                // 遺留的 NetworkBridge `apply_event` 寫入被切入
+                // 階段 5.1，使這些欄位保持預設狀態。開始
+                // 圓形按鈕文字 + LIVES 頂行都顯示這些內容。
                 self.current_round = snapshot.round;
                 self.total_rounds = snapshot.total_rounds;
                 self.round_is_running = snapshot.round_is_running;
                 self.hero_state.lives = snapshot.lives;
 
-                // Phase 4.2: drain sim explosions into the local
-                // `active_explosions` ring buffer. Dedupe by tick so a
-                // render frame that re-reads the same snapshot doesn't
-                // spawn duplicate rings. Ring lifecycle is driven by
-                // omfx wall clock (`elapsed += dt`) so the explosion
-                // animation runs at render rate independent of the sim
-                // tick rate.
+                // 階段 4.2：將模擬爆炸排入本地
+                // `active_explosions` 環形緩衝區。按刻度進行重複資料刪除
+                // 重新讀取相同快照的渲染幀不會
+                // 產生重複的環。環生命週期由下列因素驅動
+                // omfx 掛鐘（`elapsed += dt`）所以爆炸
+                // 動畫以獨立於 sim 的渲染速率運行
+                // 滴答率。
                 if !snapshot.explosions.is_empty()
                     && self.sim_last_explosion_tick != Some(snapshot.tick)
                 {
                     for ex in &snapshot.explosions {
-                        // ActiveExplosion stores **un-flipped** render coords
-                        // (backend × WORLD_SCALE). Render path at ~line 2136
-                        // applies the single `-x` flip when feeding Fyrox
-                        // SceneDrawingContext (matches build_line_segment /
-                        // add_circle_lines convention). Pre-flipping here
-                        // would double-flip → mirrored explosion position.
+                        // ActiveExplosion 儲存**未翻轉**渲染座標
+                        // （後端 × WORLD_SCALE）。渲染路徑位於~第 2136 行
+                        // 在餵食 Fyrox 時應用單一「-x」翻轉
+                        // SceneDrawingContext（匹配 build_line_segment /
+                        // add_circle_lines 約定）。此處預翻
+                        // 會雙翻轉→鏡像爆炸位置。
                         let render_pos = Vector2::new(
                             ex.pos_x * WORLD_SCALE,
                             ex.pos_y * WORLD_SCALE,
@@ -1789,13 +1789,13 @@ impl Plugin for Game {
                     self.sim_last_explosion_tick = Some(snapshot.tick);
                 }
 
-                // TD tower-build menu: seed `td_template_order` + `td_templates`
-                // from snapshot.tower_templates on first non-empty receipt.
-                // Phase 5.1 cut the legacy `tower_templates` GameEvent that used
-                // to populate these via apply_event; the right-side build menu
-                // was stuck at 0 buttons. Static after first build (registry is
-                // immutable post script DLL load), so the !is_empty guard runs
-                // as one-shot.
+                // TD 塔建立選單：種子 `td_template_order` + `td_templates`
+                // 來自第一個非空收據上的 snapshot.tower_templates。
+                // 階段 5.1 刪除了使用的遺留「tower_templates」遊戲事件
+                // 透過 apply_event 填充這些；右側建置選單
+                // 卡在 0 個按鈕上。首次建置後靜態（註冊表為
+                // 不可變的後腳本 DLL 載入），因此 !is_empty 防護運行
+                // 作為一擊。
                 if self.td_template_order.is_empty() && !snapshot.tower_templates.is_empty() {
                     for t in snapshot.tower_templates.iter() {
                         self.td_template_order.push(t.unit_id.clone());
@@ -1819,10 +1819,10 @@ impl Plugin for Game {
                     );
                 }
 
-                // Seed `td_upgrade_defs` cache from snapshot.tower_upgrades on
-                // first non-empty receipt. Sell button refund + Upgrade button
-                // text both read from here. Static after first build (registry
-                // is immutable post script DLL load).
+                // 從 snapshot.tower_upgrades 上種子 `td_upgrade_defs` 緩存
+                // 第一張非空收據。銷售按鈕退款+升級按鈕
+                // 文字均從此處讀取。首次建置後靜態（登錄
+                // 是不可變的後腳本 DLL 載入）。
                 if self.td_upgrade_defs.is_empty() && !snapshot.tower_upgrades.is_empty() {
                     for d in snapshot.tower_upgrades.iter() {
                         self.td_upgrade_defs.insert(
@@ -1836,12 +1836,12 @@ impl Plugin for Game {
                     );
                 }
 
-                // Mirror Tower entities from snapshot into `network_entities`
-                // so the tower-selection / sell / upgrade UI (which reads
-                // `network_entities`) keeps working after the legacy
-                // GameEvent path was cut. Only Tower entries are mirrored —
-                // selection / sell / upgrade UI is the only consumer that
-                // still queries this map.
+                // 將 Mirror Tower 實體從快照轉換為“network_entities”
+                // 所以塔選擇/出售/升級用戶界面（上面寫著
+                // `network_entities`) 在遺留後繼續工作
+                // GameEvent 路径被切断。僅鏡像塔條目 —
+                // 選擇/出售/升級UI是唯一的消費者
+                // 仍然查詢這張地圖。
                 {
                     use std::collections::HashSet;
                     let mut alive_towers: HashSet<u32> = HashSet::new();
@@ -1877,13 +1877,13 @@ impl Plugin for Game {
                     });
                 }
 
-                // Phase 4.5: AbilityRegistry → ability_info_map. Static
-                // after first non-empty Arc; only seed missing entries
-                // so any backend-pushed AbilityInfo (cooldown / mana_cost
-                // arrays not in registry def) isn't clobbered. The
-                // display_name / max_level / icon path covers the basic
-                // tooltip path; cooldown lookup falls back to 0 when no
-                // entry is present (existing UI handles that gracefully).
+                // 階段 4.5：AbilityRegistry→ability_info_map。靜止的
+                // 在第一個非空弧之後；僅種子缺失條目
+                // 所以任何後端推送的AbilityInfo (cooldown / mana_cost
+                // 不在登錄中的陣列）不會被破壞。這
+                // display_name/max_level/icon路徑涵蓋了基本
+                // 工具提示路徑；沒有時冷卻查找回落到 0
+                // 存在條目（現有 UI 可以優雅地處理該條目）。
                 if !snapshot.abilities.is_empty() {
                     for def in snapshot.abilities.iter() {
                         let entry = self
@@ -1902,10 +1902,10 @@ impl Plugin for Game {
                     }
                 }
 
-                // Phase 4.1: BlockedRegion polygons in render coords for
-                // placement validation (`circle_hits_polygon` checks below).
-                // Static after world init, but cheap (~handful of regions max);
-                // overwrite each tick rather than dirty-flag tracking.
+                // 階段 4.1：渲染座標中的 BlockedRegion 多邊形
+                // 放置驗證（下面檢查“circle_hits_polygon”）。
+                // 世界初始化後靜態，但便宜（〜少數區域最大）；
+                // 覆蓋每個刻度而不是髒標誌追蹤。
                 if !snapshot.blocked_regions.is_empty()
                     && self.td_regions_render.len() != snapshot.blocked_regions.len()
                 {
@@ -1920,9 +1920,9 @@ impl Plugin for Game {
                         })
                         .collect();
                 }
-                // Phase 3.x: TD path checkpoints in render coords for
-                // `point_segment_dist_sq` placement check. Same one-shot
-                // population pattern as regions.
+                // 階段 3.x：渲染座標中的 TD 路徑檢查點
+                // `point_segment_dist_sq` 放置檢查。同樣的一擊
+                // 作為區域的人口格局。
                 if !snapshot.paths.is_empty()
                     && self.td_paths_render.len() != snapshot.paths.len()
                 {
@@ -1937,10 +1937,10 @@ impl Plugin for Game {
                         .collect();
                 }
 
-                // First Hero entity drives the hero panel. EntityRenderData now
-                // carries hero metadata (name / title / level / xp / gold /
-                // strength / agility / intelligence / primary_attribute) so the
-                // panel can render the same way the legacy NetworkBridge path did.
+                // 第一個英雄實體驅動英雄面板。現在實體渲染數據
+                // 攜帶英雄元資料（名稱/頭銜/等級/經驗值/金幣/
+                // 力量/敏捷/智力/主要屬性）所以
+                // 面板可以以與舊版 NetworkBridge 路徑相同的方式呈現。
                 if let Some(hero) = snapshot.entities.iter()
                     .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
                 {
@@ -1959,10 +1959,10 @@ impl Plugin for Game {
                     self.hero_state.gold = hero.gold;
                     self.hero_state.entity_id = Some(hero.entity_id);
 
-                    // Phase 3.3: derived hero stats sourced from sim
-                    // aggregation (HeroStatsExt) — replaces the legacy
-                    // omb `hero.stats` 0.3s broadcast that Phase 5.1
-                    // cut. Mirror omb `build_hero_stats_payload` 1:1.
+                    // 階段 3.3：源自 sim 的派生英雄統計數據
+                    // 聚合 (HeroStatsExt) — 取代舊版
+                    // omb `hero.stats` 0.3s 廣播階段 5.1
+                    // 切。鏡像 omb `build_hero_stats_payload` 1:1。
                     if let Some(ext) = hero.hero_ext.as_deref() {
                         self.hero_state.armor = ext.armor;
                         self.hero_state.magic_resist = ext.magic_resist;
@@ -1972,11 +1972,11 @@ impl Plugin for Game {
                         self.hero_state.attack_range = ext.attack_range;
                         self.hero_state.bullet_speed = ext.bullet_speed;
 
-                        // Buff snapshot reset to authoritative values
-                        // each tick. Render-side per-frame countdown
-                        // (handled by the existing buff timer ticker
-                        // below) keeps the displayed seconds smooth
-                        // between snapshots.
+                        // BUFF快照重設為權威值
+                        // 每個刻度。渲染端每幀倒數計時
+                        // （由現有的 buff 計時器代碼處理
+                        // 如下）使顯示的秒數保持平滑
+                        // 快照之間。
                         self.hero_state.buffs = ext
                             .buffs
                             .iter()
@@ -1988,16 +1988,16 @@ impl Plugin for Game {
                             })
                             .collect();
 
-                        // Phase 4.4: hero inventory from snapshot. Each
-                        // slot becomes `Some((item_id, cd))` — cd starts
-                        // at 0 since the snapshot doesn't carry per-item
-                        // cooldown today (Inventory.ItemInstance has it
-                        // but we only project item_id; the local CD
-                        // ticker that decrements `(_, cd)` each frame
-                        // remains harmless when cd=0). Empty slots map
-                        // to `None`, matching the legacy UI contract.
-                        // Resize to 6 in case the hero state was
-                        // initialised with a smaller Vec earlier.
+                        // 階段 4.4：快照中的英雄清單。每個
+                        // slot 變成 `Some((item_id, cd))` — cd 開始
+                        // 為 0，因為快照不包含每個項目
+                        // 今天冷卻（Inventory.ItemInstance 有它
+                        // 但我們只投影item_id；本地 CD
+                        // 每幀遞減 `(_, cd)` 的程式碼
+                        // 當 cd=0 時保持無害）。空槽位圖
+                        // 為“None”，匹配舊版 UI 合約。
+                        // 調整大小為 6，以防英雄狀態為
+                        // 早些時候用較小的 Vec 初始化。
                         if self.hero_state.inventory.len() < 6 {
                             self.hero_state.inventory.resize(6, None);
                         }
@@ -2008,9 +2008,9 @@ impl Plugin for Game {
                                 .get(i)
                                 .and_then(|s| s.as_ref())
                                 .map(|(prev_id, cd)| {
-                                    // Preserve CD only if the same item
-                                    // is still in the slot (otherwise
-                                    // the slot was swapped — reset CD).
+                                    // 僅在相同項目時保留 CD
+                                    // 仍在插槽中（否則
+                                    // 插槽已交換 — 重設 CD）。
                                     if Some(prev_id.as_str()) == slot.as_deref() {
                                         *cd
                                     } else {
@@ -2022,13 +2022,13 @@ impl Plugin for Game {
                                 slot.as_ref().map(|id| (id.clone(), prev_cd));
                         }
 
-                        // Phase 4.5: ability ids + levels from snapshot.
-                        // `Hero.abilities` (Vec<String>) drives the
-                        // Q/W/E/R order; `ability_levels[i]` mirrors the
-                        // omb HashMap projection. Local `ability_cd` is
-                        // ticked down per-frame; we only seed it to 0
-                        // for newly-discovered ability ids so an
-                        // in-flight CD isn't reset on every snapshot.
+                        // 階段 4.5：能力 ID + 快照等級。
+                        // `Hero.bility` (Vec<String>) 驅動
+                        // Q/W/E/R 訂單； `ability_levels[i]` 反映了
+                        // omb HashMap 投影。本地 `ability_cd` 是
+                        // 每個畫面都打勾；我們只播種到 0
+                        // 對於新發現的能力 ID，
+                        // 飛行中的 CD 不會在每個快照上重置。
                         let new_abilities: Vec<String> = ext
                             .ability_ids
                             .iter()
@@ -2051,10 +2051,10 @@ impl Plugin for Game {
                             }
                         }
                     } else {
-                        // Hero entity exists but aggregation missing
-                        // (shouldn't happen — UnitStats path always
-                        // runs for the Hero arm). Zero out to avoid
-                        // stale legacy values.
+                        // 英雄實體存在但聚合缺失
+                        // （不應該發生 - UnitStats 路徑始終
+                        // 為英雄手臂奔跑）。歸零以避免
+                        // 陳舊的遺留價值。
                         self.hero_state.armor = 0.0;
                         self.hero_state.magic_resist = 0.0;
                         self.hero_state.move_speed = 0.0;
@@ -2093,14 +2093,14 @@ impl Plugin for Game {
             self.fps_display = format!("FPS {} ({:.1}ms)", render_fps, frame_ms);
         }
 
-        // Phase 5.1: NetworkBridge event drain + EventBuffer + heartbeat hp/pos
-        // reconciliation removed. Lockstep TickBatch (above) is the sole tick
-        // source; render_bridge owns sprite spawn/update/despawn from sim state.
+        // 階段5.1：NetworkBridge事件消耗+EventBuffer+心跳hp/pos
+        // 協調已刪除。 Lockstep TickBatch（上圖）是唯一的刻度
+        // 來源; render_bridge 擁有來自 sim 狀態的 sprite 生成/更新/消失。
         let t_events = std::time::Instant::now();
         let events_drained_local: u64 = 0;
         let events_ns = t_events.elapsed().as_nanos();
 
-        // 4. Interpolate entity positions (client-side lerp)
+        // 4. 插入實體位置（客戶端 lerp）
         let t_interp = std::time::Instant::now();
         let dt = context.dt;
         // P7 layered: 預先 sum 每個 target 的 applied 預測扣血，HP bar 渲染時減去。
@@ -2115,14 +2115,14 @@ impl Plugin for Game {
             m
         };
         for (&entity_id, entity) in self.network_entities.iter_mut() {
-            // Towers don't move — skip lerp/extrap so the snapshot mirror's
-            // `position` (set in the snapshot consumer block) survives.
-            // Without this, lerp_duration=0 → NaN clobbers the position
-            // and click hit-test fails.
+            // 塔不會移動——跳過 lerp/extrap 所以快照鏡像的
+            // 「position」（在快照消費者區塊中設定）保留下來。
+            // 如果沒有這個， lerp_duration=0 → NaN 會破壞位置
+            // 然後點擊命中測試失敗。
             if entity.entity_type == "tower" {
                 continue;
             }
-            // Expire creep debug path after PATH_VISIBLE_SECS
+            // 在 PATH_VISIBLE_SECS 之後使蠕動調試路徑過期
             if !entity.path_nodes.is_empty() {
                 entity.path_age += dt;
                 if entity.path_age >= PATH_VISIBLE_SECS {
@@ -2133,11 +2133,11 @@ impl Plugin for Game {
             }
 
             entity.lerp_elapsed += dt;
-            // P4: velocity extrapolation takes priority over lerp for creeps
-            // with an active segment. After `extrap_duration` elapses we lock
-            // at `target_position` until the next creep.M arrives; that's how
-            // we render idle at a waypoint when the server hasn't decided on
-            // the next one yet (e.g. TD path end, blocked by collision).
+            // P4：對於蠕變，速度外推優先於 lerp
+            // 具有活動段。在“extrap_duration”過去後，我們鎖定
+            // 在`target_position`直到下一個creep.M到達；就是這樣
+            // 當伺服器尚未決定時，我們在某個路徑點渲染空閒
+            // 下一個尚未完成（例如 TD 路徑末端，因碰撞而阻塞）。
             let pos = if entity.extrap_velocity > 1.0 && entity.extrap_duration > 0.0 {
                 entity.extrap_elapsed += dt;
                 if entity.extrap_elapsed >= entity.extrap_duration {
@@ -2294,11 +2294,11 @@ impl Plugin for Game {
             }
         }
 
-        // Phase 5.x: write sim_runner-backed entities into body_batch + hp_batch
-        // BEFORE flushing. Replaces the per-entity RectangleBuilder spawn from
-        // earlier 4.2 render_bridge — each entity used to be a separate scene
-        // node = separate draw call (1000 entities → 3000+ draws). Now the
-        // entire entity set goes through 2-3 batched meshes = 2-3 draws total.
+        // 階段 5.x：將 sim_runner 支援的實體寫入 body_batch + hp_batch
+        // 沖洗前。替換每個實體的 RectangleBuilder 生成
+        // 早期的 4.2 render_bridge — 每個實體曾經是單獨的場景
+        // 節點 = 單獨的繪製呼叫（1000 個實體→ 3000+ 繪製）。現在的
+        // 整個實體集經歷 2-3 個批次網格 = 總共 2-3 個繪製。
         self.update_sim_batches();
 
         // Batched mesh flush：interp loop 寫進各 batch 的 cpu_mirror，這裡一次性
@@ -2313,10 +2313,10 @@ impl Plugin for Game {
             batch.flush(scene);
         }
 
-        // Fyrox 1.0.1 doesn't auto-update hierarchical data per-frame (docs at
-        // fyrox-impl-1.0.1/src/scene/graph/mod.rs:565). Without this call, our
-        // 3D Mesh nodes have stale global_transform = identity → all sprites
-        // render at world origin (0,0,0). Force-update once per frame.
+        // Fyrox 1.0.1 不會自動更新每幀的分層資料（文件位於
+        // fyrox-impl-1.0.1/src/scene/graph/mod.rs:565)。如果沒有這個電話，我們的
+        // 3D 網格節點具有過時的 global_transform = 身分 → 所有 sprite
+        // 在世界原點 (0,0,0) 處渲染。每幀強制更新一次。
         scene.graph.update_hierarchical_data();
 
         let interp_ns = t_interp.elapsed().as_nanos();
@@ -2474,8 +2474,8 @@ impl Plugin for Game {
 
         let visual_ns = t_visual.elapsed().as_nanos();
 
-        // 4b. Advance client-simulated projectiles (pursuit lerp toward target's
-        //     current interpolated position; t forced to 1 at flight_time).
+        // 4b.推進客戶模擬的彈體（追擊目標
+        // 目前插值位置； t 在 Flight_time 處強制為 1）。
         //     後端改為 100ms batch 發送，client flight_time 與 backend projectile time 已對齊
         //     (game_processor.rs 裡用 initial_dist / bullet_speed 設 safety_time_left 的 1/3)，
         //     所以彈落時 optimistic 扣血與 100ms 內到達的 backend "H" 事件幾乎 sync，不會 bouncing。
@@ -2566,7 +2566,7 @@ impl Plugin for Game {
                         vertical_size: 14.0, // 28 render 高 = 2800 backend，可裝下 ±1200 Y
                     }));
                 }
-                // Camera at z=-100 looking +Z (default) — preserve that on re-center.
+                // 相機在 z=-100 處看著 +Z（預設）——在重新居中時保留它。
                 scene.graph[self.camera]
                     .local_transform_mut()
                     .set_position(Vector3::new(0.0, 0.0, -100.0));
@@ -2574,9 +2574,9 @@ impl Plugin for Game {
                 self.td_camera_configured = true;
                 log::info!("🎥 TD 相機已鎖定：center=(0,0), vertical_size=14");
 
-                // Phase 5.1: viewport push to legacy NetworkBridge removed.
-                // Lockstep state is broadcast in full to all clients regardless
-                // of viewport, so this hint is no longer needed.
+                // 階段 5.1：刪除了向舊版 NetworkBridge 的視窗推送。
+                // 無論如何，鎖步狀態都會向所有客戶端完整廣播
+                // 視口，因此不再需要此提示。
             }
         } else {
             // MOBA 模式：相機不再跟隨英雄移動。保留 camera 在 scene.rgs 載入時的初始位置，
@@ -2584,17 +2584,17 @@ impl Plugin for Game {
             // 確保 name label 螢幕投影仍正確。
             let cam_pos = scene.graph[self.camera].local_transform().position();
             self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
-            // Phase 5.1: periodic viewport sync to NetworkBridge removed.
+            // 階段 5.1：刪除了與 NetworkBridge 的定期視窗同步。
         }
 
         let cam_ns = t_cam.elapsed().as_nanos();
 
-        // 5. Update name labels (UI layer)
+        // 5.更新姓名標籤（UI層）
         let t_ui = std::time::Instant::now();
         let ui = context.user_interfaces.first_mut();
         let win = self.window_size;
 
-        // Delete labels for removed entities
+        // 刪除已刪除實體的標籤
         for label in self.pending_label_deletions.drain(..) {
             ui.send(label, WidgetMessage::Remove);
         }
@@ -2616,7 +2616,7 @@ impl Plugin for Game {
             }
         }
 
-        // Create missing labels & update positions
+        // 建立缺失標籤並更新位置
         for (&entity_id, entity) in self.network_entities.iter_mut() {
             if entity.health.is_none() {
                 continue; // only show names for entities with HP bars
@@ -2625,7 +2625,7 @@ impl Plugin for Game {
                 continue; // 太多 entity 且沒按 Alt，不渲染 name label，省 N 個 UI draw call
             }
 
-            // Lazily create label
+            // 懶惰地創建標籤
             if entity.name_label.is_none() {
                 let label = TextBuilder::new(
                     WidgetBuilder::new()
@@ -2681,10 +2681,10 @@ impl Plugin for Game {
             }
         }
 
-        // sim_runner-backed name labels: Phase 5.x replaces the legacy
-        // network_entities-driven loop above. Reads the same snapshot the
-        // render_bridge consumes; one Text widget per visible entity, kept
-        // in sync via `sim_entity_labels`.
+        // sim_runner 支援的名稱標籤：階段 5.x 取代了舊版本
+        // 上面的network_entities驅動的循環。讀取相同的快照
+        // render_bridge 消耗；每個可見實體一個文字小工具，保留
+        // 透過“sim_entity_labels”同步。
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
                 let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
@@ -2699,8 +2699,8 @@ impl Plugin for Game {
                     }
                     alive.insert(entity.entity_id);
 
-                    // Display name: prefer hero_name (heroes), else unit_id sans
-                    // template prefix, else fallback to "#<id>".
+                    // 顯示名稱：更喜歡hero_name（英雄），否則unit_id sans
+                    // 模板前綴，否則回退到“#<id>”。
                     let display_name = if !entity.hero_name.is_empty() {
                         entity.hero_name.clone()
                     } else if !entity.unit_id.is_empty() {
@@ -2718,10 +2718,10 @@ impl Plugin for Game {
                     // 任何文字（也不顯示 HP — 塔不需要 HP 資訊）。Hero/Creep 走
                     // 既有 "name HP/MaxHP" 格式。
                     let is_tower = matches!(entity.kind, sim_runner::EntityKind::Tower);
-                    // Skip drawing a label widget for towers with no upgrades.
-                    // Mark NOT-alive so the post-loop retain step removes any
-                    // stale widget that lingered from a previous frame
-                    // (eg. tower just sold or never upgraded).
+                    // 跳過為沒有升級的塔繪製標籤小工具。
+                    // 標記為不活動，以便循環後保留步驟刪除任何
+                    // 從前一幀中徘徊的陳舊小部件
+                    // （例如，塔剛剛出售或從未升級）。
                     if is_tower && entity.upgrade_levels.map_or(true, |lv| lv.iter().all(|&n| n == 0)) {
                         alive.remove(&entity.entity_id);
                         continue;
@@ -2763,7 +2763,7 @@ impl Plugin for Game {
                     let pos = Vector2::new(screen_pos.x - 110.0, screen_pos.y - 24.0);
 
                     if let Some(slot) = self.sim_entity_labels.get_mut(&entity.entity_id) {
-                        // Update existing — gate to avoid flooding the UI queue.
+                        // 更新現有的 — gateway 以避免淹沒 UI 隊列。
                         let pos_changed = (pos.x - slot.last_pos.x).abs() >= 1.0
                             || (pos.y - slot.last_pos.y).abs() >= 1.0;
                         if pos_changed {
@@ -2775,7 +2775,7 @@ impl Plugin for Game {
                             slot.last_text = text;
                         }
                     } else {
-                        // First-time spawn for this entity.
+                        // 該實體首次產生。
                         let handle = TextBuilder::new(
                             WidgetBuilder::new()
                                 .with_desired_position(pos)
@@ -2794,14 +2794,14 @@ impl Plugin for Game {
                     }
                 }
 
-                // Despawn labels for entities no longer in snapshot.
-                // Phase 1.6: snapshot now carries explicit `removed_entity_ids`
-                // (diff computed worker-locally in sim_runner), replacing the
-                // legacy omb `entity.death` GameEvent. We still keep the
-                // `alive`-set sweep below as a belt-and-suspenders defense
-                // against any cache rows whose eid never appeared in
-                // `removed_entity_ids` (e.g. labels created before the very
-                // first prev_alive snapshot was populated).
+                // 不再出現在快照中的實體的消失標籤。
+                // 階段 1.6：快照現在有明確的 `removed_entity_ids`
+                // （在 sim_runner 中本地計算工人），替換
+                // 遺留 omb `entity.death` 遊戲事件。我們仍然保留著
+                // 「活著」-設置掃掠下方作為腰帶和吊帶防禦
+                // 針對其 eid 從未出現過的任何快取行
+                // `removed_entity_ids`（例如，在先前建立的標籤）
+                // 第一個 prev_alive 快照已填入）。
                 for &eid in &snapshot.removed_entity_ids {
                     if let Some(slot) = self.sim_entity_labels.remove(&eid) {
                         ui.send(slot.handle, WidgetMessage::Remove);
@@ -2821,7 +2821,7 @@ impl Plugin for Game {
             }
         }
 
-        // 6. Update status text
+        // 6.更新狀態文本
         let connection_part = match &self.connection_status {
             ConnectionStatus::Disconnected => "Disconnected".to_string(),
             ConnectionStatus::Connecting => "Connecting...".to_string(),
@@ -2865,8 +2865,8 @@ impl Plugin for Game {
             }
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
         };
-        // Render stats from prior frame (record_render_stats() runs at end of update,
-        // so values here are 1 frame behind — fine for a live readout).
+        // 前一幀的渲染統計資訊（record_render_stats() 在更新結束時運行，
+        // 所以這裡的值落後 1 幀 — 對於實時讀數來說很好）。
         let render_stats_part = format!(
             "fps: {} | draws: {} | tris: {}",
             self.frame_profile.last_fps,
@@ -2980,8 +2980,8 @@ impl Plugin for Game {
             // ===== TD 模式：選中塔 Sell 面板（右側，4 塔按鈕下方） =====
             {
                 // Wider panel so the upgrade button text (含 next-level
-                // upgrade name) doesn't get visually clipped by the
-                // window edge.
+                // 升級名稱）不會在視覺上被
+                // 窗戶邊緣。
                 let panel_w = 360.0f32;
                 let name_h = 28.0f32;
                 let btn_h = 42.0f32;
@@ -3315,7 +3315,7 @@ impl Plugin for Game {
         self.frame_profile.events_drained += events_drained_local;
         self.frame_profile.creeps_seen += self.network_entities.len() as u64;
         self.frame_profile.projectiles_seen += self.client_projectiles.len() as u64;
-        // Fyrox renderer stats (real frame time including render submit + GPU + vsync wait)
+        // Fyrox 渲染器統計資料（即時幀時間，包括渲染提交 + GPU + 垂直同步等待）
         if let fyrox::engine::GraphicsContext::Initialized(ref gc) = context.graphics_context {
             self.frame_profile.record_render_stats(&gc.renderer.get_statistics());
         }
@@ -3425,13 +3425,13 @@ impl Plugin for Game {
                         && screen.y >= by && screen.y <= by + bh
                     {
                         if let Some(tid) = self.selected_tower_entity {
-                            // Phase 2.2: TowerSell lockstep input. tid is the
-                            // tower entity id (specs `Entity::id()` u32);
-                            // omb's drain handler resolves Entity, validates
-                            // Player faction, refunds 85% base + 75% upgrades,
-                            // and deletes the entity (snapshot diff cleans
-                            // render). selected_tower_entity is cleared
-                            // unconditionally because the entity is going away.
+                            // 階段 2.2：TowerSell 鎖步輸入。 tid 是
+                            // 塔實體 id（規範 `Entity::id()` u32）；
+                            // omb 的排水處理程序解析實體，驗證
+                            // 玩家陣營，退款85%基礎+75%升級，
+                            // 並刪除實體（快照差異清理
+                            // 使成為）。 selected_tower_entity 已清除
+                            // 無條件地因為該實體正在消失。
                             let input = omoba_core::kcp::game_proto::PlayerInput {
                                 action: Some(
                                     omoba_core::kcp::game_proto::player_input::Action::TowerSell(
@@ -3458,17 +3458,17 @@ impl Plugin for Game {
                             && screen.y >= by && screen.y < by + bh
                         {
                             if let Some(tid) = self.selected_tower_entity {
-                                // Phase 2.3: TowerUpgrade lockstep input. tid is
-                                // the tower entity id; `path` is 0/1/2; `level`
-                                // is the post-upgrade level (current_level + 1)
-                                // sourced from the cached
-                                // `network_entities[tid].upgrade_levels` that
-                                // the Sell/Upgrade panel already reads above.
-                                // omb's drain handler treats `level` as a hint
-                                // and recomputes the actual target from the
-                                // entity's own `upgrade_levels[path] + 1`,
-                                // so a stale snapshot here still produces the
-                                // correct upgrade.
+                                // 階段 2.3：TowerUpgrade 鎖步輸入。 tid 是
+                                // 塔實體 ID； `路徑`是0/1/2； `等級`
+                                // 是升級後的等級（current_level + 1）
+                                // 來自快取的
+                                // `network_entities[tid].upgrade_levels` 表示
+                                // 銷售/升級面板已在上面顯示。
+                                // omb 的排水處理程序將「level」視為提示
+                                // 並重新計算實際目標
+                                // 實體自己的`upgrade_levels[path] + 1`，
+                                // 所以這裡的過時快照仍然會產生
+                                // 正確升級。
                                 let current_level = self
                                     .network_entities
                                     .get(&tid)
@@ -3502,9 +3502,9 @@ impl Plugin for Game {
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
-                        // Phase 2.1: TowerPlace lockstep input. selected_tower_kind
-                        // is the unit_id string (e.g. "tower_dart") — convert to
-                        // proto u32 kind_id via omoba_template_ids::tower_by_name.
+                        // 階段 2.1：TowerPlace 鎖步輸入。選定的塔類型
+                        // 是unit_id字串（例如“tower_dart”）－轉換為
+                        // 原型 u32 kind_id 通過 omoba_template_ids::tower_by_name。
                         match omoba_template_ids::tower_by_name(&kind) {
                             Some(tid) => {
                                 let pos = world_render_to_vec2i(world_pos);
@@ -3581,8 +3581,8 @@ impl Plugin for Game {
                     self.selected_tower_entity = None;
                     log::info!("RMB 取消選中塔");
                 } else {
-                    // Phase 5.1: legacy NetCommand::HeroMove removed; lockstep
-                    // PlayerInput::MoveTo (below) is the sole authoritative path.
+                    // 階段 5.1：刪除舊版 NetCommand::HeroMove；步調一致
+                    // PlayerInput::MoveTo（如下）是唯一的權威路徑。
                     let world_pos = self.mouse_world_pos;
                     let target = world_render_to_vec2i(world_pos);
                     let move_to = omoba_core::kcp::game_proto::MoveTo {
@@ -3628,17 +3628,17 @@ impl Plugin for Game {
                 if !pressed { return Ok(()); }
 
                 let world = self.mouse_world_pos;
-                // Phase 5.1: legacy `tx` / `send` closure (NetworkBridge cmd_tx)
-                // removed. UpgradeSkill / BuyItem / SellItem / UseItem are now
-                // logged-only stubs pending a Phase 5.x lockstep PlayerInput
-                // extension; W/E/R/T cast already routes through lockstep below.
+                // 階段 5.1：遺留 `tx` / `send` 閉包（NetworkBridge cmd_tx）
+                // 已刪除。 UpgradeSkill / BuyItem / SellItem / UseItem 現在
+                // 僅記錄存根等待 Phase 5.x 鎖步 PlayerInput
+                // 擴大; W/E/R/T 演員陣容已經通過下面的鎖步路線。
                 let send_stub = |label: &str, args: &str| {
                     log::info!("[phase5.1] legacy {} send removed (args={})", label, args);
                 };
 
-                // Q/W/E/R press → lockstep PlayerInput::CastAbility (ability_index
-                // 0/1/2/3). Mouse world pos becomes the optional `target_pos`.
-                // Modifier-held cases (Shift = upgrade, not cast) are excluded.
+                // 按 Q/W/E/R → 步調一致 PlayerInput::CastAbility (ability_index
+                // 0/1/2/3）。滑鼠世界 pos 成為可選的「target_pos」。
+                // 修飾符持有的情況（Shift = 升級，而不是施放）被排除在外。
                 if !self.shift_held {
                     let ability_index_opt = match key {
                         KeyCode::KeyQ => Some(0u32),
@@ -3675,13 +3675,13 @@ impl Plugin for Game {
                             _ => unreachable!(),
                         }.to_string();
                         if self.shift_held {
-                            // Phase 5.1: legacy UpgradeSkill removed; lockstep
-                            // doesn't yet wire ability upgrade — pending Phase 5.x.
+                            // 階段 5.1：刪除舊版 UpgradeSkill；步調一致
+                            // 尚未連線能力升級 - 等待第 5.x 階段。
                             send_stub("UpgradeSkill", &slot);
                         } else {
-                            // Cast already sent via lockstep above; nothing to do here.
-                            // (Optimistic local cooldown bookkeeping was driven by
-                            // legacy hero_state cache that is going away with apply_event.)
+                            // 演員表已通過上面的 lockstep 發送；在這裡沒什麼可做的。
+                            // （樂觀的本地冷卻簿記是由
+                            // 遺留的 Hero_state 快取將隨 apply_event 一起消失。 ）
                             let _ = (slot, world);
                         }
                     }
@@ -3730,15 +3730,15 @@ impl Plugin for Game {
                             KeyCode::Digit8 => 8, KeyCode::Digit9 => 9,
                             _ => unreachable!(),
                         };
-                        // Phase 5.1: legacy BuyItem / SellItem removed (item
-                        // shop not yet on lockstep wire). Phase 2.4: UseItem
-                        // wired through lockstep PlayerInput — Digit1..=6
-                        // (shop closed) maps to slot 0..=5; hotbar UI not yet
-                        // implemented (Phase 4.4 will add inventory icons in
-                        // SimWorldSnapshot.HeroStatsExt + render), so the
-                        // keyboard binding is the only entry point right
-                        // now. Shift+Digit kept on the legacy stub since
-                        // SellItem isn't on the lockstep proto yet.
+                        // 階段 5.1：刪除舊的 BuyItem / SellItem（項目
+                        // 尚未在鎖步線上購物）。階段 2.4：使用項目
+                        // 透過鎖步 PlayerInput 連接 — Digit1..=6
+                        // （商店關閉）映射到插槽 0..=5；熱欄 UI 尚未
+                        // 已實施（第 4.4 階段將在
+                        // SimWorldSnapshot.HeroStatsExt + 渲染），所以
+                        // 鍵盤綁定是正確的唯一入口點
+                        // 現在。 Shift+Digit 保留在遺留存根上，因為
+                        // SellItem 尚未進入同步原型。
                         if self.shop_visible {
                             if let Some((id, _, _)) = SHOP_ITEMS.get(idx) {
                                 send_stub("BuyItem", id);
@@ -3783,25 +3783,25 @@ impl Plugin for Game {
 }
 
 // ---------------------------------------------------------------------------
-// Event Processing
+// 事件處理
 // ---------------------------------------------------------------------------
 
 impl Game {
-    /// Phase 4.3: send a `PlayerInput` to the lockstep wire (omb's lockstep
-    /// scheduler). No-op if `lockstep_handle` is None (e.g. legacy-only mode).
-    /// Target tick = current_sim_tick + 3 (50 ms input delay at 60 Hz). The
-    /// underlying `GameClient` (in `omoba_core::kcp::client`) tags the
-    /// `InputSubmit` frame with the cached `player_id` from `GameStart`, so
-    /// callers don't need to know self-id.
+    /// 階段 4.3：將 `PlayerInput` 傳送到鎖步線（omb 的鎖定步
+    /// 調度程序）。如果“lockstep_handle”為“無”，則無操作（例如僅遺留模式）。
+    /// 目標刻度 = current_sim_tick + 3（60 Hz 時輸入延遲 50 毫秒）。這
+    /// 底層的`GameClient`（在`omoba_core::kcp::client`中）標記了
+    /// `InputSubmit` 框架帶有來自 `GameStart` 的快取的 `player_id`，所以
+    /// 呼叫者不需要知道自己的身分。
     ///
-    /// Runs in **parallel** with the legacy `NetworkBridge::cmd_tx` path —
-    /// Phase 4.5 cuts the legacy side. Until then a single click may produce
-    /// two server-side messages; omb-side is responsible for de-duping or
-    /// (post-Phase-4.5) ignoring the legacy command.
-    /// Phase 5.x: each tick, mirror sim_runner snapshot entities into the
-    /// shared body_batch + hp_batch CPU mirrors. Allocates a slot per entity
-    /// on first sighting; frees slots on dropout. EntityKind::Other is
-    /// skipped (internal ECS rows like RegionBlocker should not render).
+    /// 與舊版「NetworkBridge::cmd_tx」路徑**並行**運行 —
+    /// 4.5 階段削減了遺留部分。在此之前，請點擊一下即可產生
+    /// 兩個伺服器端訊息； omb-side 負責重複資料刪除或
+    /// （Phase-4.5 後）忽略舊指令。
+    /// 階段 5.x：每個tick，將 sim_runner 快照實體鏡像到
+    /// 共享 body_batch + hp_batch CPU 映像。為每個實體分配一個插槽
+    /// 第一次見到時；釋放輟學時的插槽。 EntityKind::其他是
+    /// 已跳過（不應呈現 RegionBlocker 等內部 ECS 行）。
     fn update_sim_batches(&mut self) {
         let Some(ref sim) = self.sim_runner_handle else { return };
         let Ok(snapshot) = sim.state.try_lock() else { return };
@@ -3816,7 +3816,7 @@ impl Game {
             let pos = render_bridge::world_to_render(e);
             let (color, size, z) = render_bridge::style_for_entity(e);
 
-            // Body slot: alloc on first sighting, then write_quad each tick.
+            // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
             let slots_entry = self.sim_entity_slots.entry(e.entity_id);
             let slots = slots_entry.or_insert_with(|| {
                 let body_slot = self
@@ -3880,8 +3880,8 @@ impl Game {
                 );
             }
 
-            // HP bar (bg + fg). Alloc lazily — projectiles + entities w/o hp
-            // skip allocating to keep capacity for actual units.
+            // HP 條（背景 + 目標）。惰性分配 — 彈體 + 不含馬力的實體
+            // 跳過分配以保留實際單元的容量。
             if e.max_hp > 0 {
                 if slots.hp_bg_slot.is_none() {
                     if let Some(batch) = self.hp_batch.as_mut() {
@@ -3936,12 +3936,12 @@ impl Game {
                 }
             }
 
-            // Turret / barrel indicator: a small dark rectangle offset in the
-            // facing direction. Only kinds with meaningful facing (Hero /
-            // Tower / Creep) get a slot; projectiles skip. The legacy
-            // NetworkEntity path uses `entity.facing_slot` + `facing_batch`
-            // for the same effect — sim_runner-backed entities reuse the
-            // same `facing_batch` so the two paths share a single draw call.
+            // 砲塔/砲管指示器：一個小的黑色矩形偏移在
+            // 面向方向。僅有意義的面孔的種類（英雄/
+            // 塔樓/小兵）獲得一個槽位；彈頭會跳過。遺產
+            // NetworkEntity 路徑使用 `entity.faceing_slot` + `faceing_batch`
+            // 為了達到相同的效果 - sim_runner 支援的實體重用
+            // 相同的“face_batch”，因此兩條路徑共用一個繪製呼叫。
             let wants_turret = matches!(
                 e.kind,
                 sim_runner::EntityKind::Hero
@@ -3955,11 +3955,11 @@ impl Game {
                     }
                 }
                 if let Some(slot) = slots.turret_slot {
-                    // Mirror the legacy `render_angle` math (see
-                    // NetworkEntity facing render around line ~1946): the
-                    // body sprite uses the `-x` flip in `world_to_render`,
-                    // so the world facing rad needs to be reflected
-                    // through Y to match the rendered orientation.
+                    // 鏡像傳統的“render_angle”數學（參見
+                    // NetworkEntity 面向渲染線 ~1946)：
+                    // 身體 sprite 在“world_to_render”中使用“-x”翻轉，
+                    // 所以面對rad的世界需要反映出來
+                    // 透過 Y 來匹配渲染的方向。
                     let render_angle = std::f32::consts::PI - e.facing_rad;
                     // 砲管 base 在 body 中心，向 facing 方向延伸出去（像坦克砲塔）。
                     // 中心距 body_center = length/2（quad center 算法），所以末端伸到
@@ -3988,12 +3988,12 @@ impl Game {
             }
         }
 
-        // Free slots for entities that disappeared from the snapshot.
-        // Phase 1.6: prefer the explicit `removed_entity_ids` diff produced
-        // worker-side in sim_runner over the `alive`-set sweep — it's a
-        // tighter signal (only those who died this tick) and replaces the
-        // legacy wire-side `entity.death` event. The sweep below stays as
-        // defense for early-frame eids that pre-date the first prev_alive set.
+        // 用於從快照中消失的實體的空閒插槽。
+        // 階段 1.6：偏好產生明確的 `removed_entity_ids` diff
+        // sim_runner 中的工作端在「alive」集掃描上 - 這是一個
+        // 更嚴格的信號（僅那些在這個時間點死亡的人）並取代
+        // 遺留的線路端「entity.death」事件。下面的掃描保持為
+        // 對早於第一個 prev_alive 集的早期幀 eids 的防禦。
         for &eid in &snapshot.removed_entity_ids {
             if let Some(slots) = self.sim_entity_slots.remove(&eid) {
                 if let Some(batch) = self.body_batch.as_mut() {
@@ -4085,9 +4085,9 @@ impl Game {
         let action_kind = InputActionKind::from_player_input(&input);
         let submit_wall_clock_us = wall_clock_us();
         let submit_instant = Instant::now();
-        // Base target_tick on the lockstep bg thread's latest TickBatch, not
-        // the render thread's last drained tick; the latter adds a frame of
-        // latency before the fixed lookahead is even applied.
+        // 將 target_tick 基於 lockstep bg 線程的最新 TickBatch，而不是
+        // 渲染線程的最後一個耗盡的tick；後者添加了一個框架
+        // 甚至應用固定前瞻之前的延遲。
         let base_tick = handle.latest_tick();
         let target_tick = base_tick.wrapping_add(INPUT_LOOKAHEAD_TICKS);
         log::debug!(
@@ -4110,20 +4110,20 @@ impl Game {
         });
     }
 
-    // Phase 5.1 (pass 2): apply_event + 30+ legacy GameEvent handler
-    // methods removed (entity_create / entity_move / entity_hp_update /
-    // entity_delete / entity_facing_update / entity_speed_update /
-    // entity_stall / projectile_create / projectile_delete / hero_stats_update /
-    // hero_inventory_update / hero_abilities_info_update / map_paths_update /
+    // 階段 5.1（第 2 階段）：apply_event + 30+ 舊版 GameEvent 處理程序
+    // 刪除方法（entity_create /entity_move/entity_hp_update/
+    // 實體_刪除/實體_面向_更新/實體_速度_更新/
+    // entity_stall/projectile_create/projectile_delete/hero_stats_update/
+    // 英雄庫存更新/英雄能力資訊更新/地圖路徑更新/
     // map_regions_update / map_region_blockers_update / td_round_update /
     // td_lives_update / td_tower_templates_update / td_explosion_spawn /
-    // tower_upgrade_apply / game_end). The legacy 0x02 GameEvent stream is
-    // gone (Phase 4.5 server side, Phase 5.1 pass 1 client side); render_bridge
-    // owns sprite rendering from sim state. Field cleanup deferred to pass 3.
+    // tower_upgrade_apply / game_end）。舊版 0x02 GameEvent 串流是
+    // 消失（第 4.5 階段伺服器端，第 5.1 階段透過 1 用戶端）；渲染橋
+    // 擁有來自 sim 狀態的 sprite 渲染。現場清理延後到通過 3。
 }
 
-/// Build a thin rotated rectangle representing a line segment from `from` to `to`.
-/// Returns `None` if the segment has zero length.
+/// 建立一個細長的旋轉矩形，表示從“from”到“to”的線段。
+/// 如果段長度為零，則傳回「無」。
 /// 為單位建立一個指向面向方向的箭頭（偏離中心一半 length，讓箭頭伸出單位外）
 /// `pos_x/pos_y` 是 backend world 座標（未翻轉），內部會套 `-x` 配合渲染鏡像。
 /// 組 tooltip 文字：LoL 風格分區
@@ -4453,7 +4453,7 @@ fn add_circle_lines(
 }
 
 // ---------------------------------------------------------------------------
-// Helper functions
+// 輔助函數
 // ---------------------------------------------------------------------------
 
 fn parse_heartbeat(data: &serde_json::Value) -> HeartbeatInfo {

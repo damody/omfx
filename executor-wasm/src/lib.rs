@@ -1,4 +1,4 @@
-//! Executor with your game connected to it as a plugin.
+//! 使用 plugin 模式啟動的網頁執行器。
 #![cfg(target_arch = "wasm32")]
 
 use fyrox::engine::executor::Executor;

@@ -1,4 +1,4 @@
-//! Executor with your game connected to it as a plugin.
+//! 使用 plugin 模式啟動的遊戲執行器。
 use fyrox::engine::executor::Executor;
 use fyrox::event_loop::EventLoop;
 use fyrox::core::log::Log;
@@ -56,8 +56,8 @@ fn configured_log_settings() -> LogSettings {
     let Ok(value) = std::env::var("RUST_LOG") else { return settings };
 
     let mut has_bare_level = false;
-    // simplelog has no EnvFilter parser. Use the highest requested level and,
-    // when only module directives are present, add module allow filters.
+    // simplelog 沒有 EnvFilter parser。沿用最高等級需求，
+    // 若只有模組指示，則補上 allow filter。
     for directive in value.split(',') {
         let directive = directive.trim();
         if directive.is_empty() {
@@ -101,9 +101,9 @@ fn main() {
     unsafe {
         timeBeginPeriod(1);
     }
-    // Standard log crate backend：每次啟動 truncate omfx_app.log，同時印到 console。
-    // omfx.log 是 fyrox 自己的 log（fyrox::core::log::Log），不走 standard log macros。
-    // 我們的 log::info! / warn! 走 simplelog → omfx_app.log + 終端機。
+    // 傳統 log crate 後端：每次啟動都會重建 omfx_app.log，並同時輸出到終端機。
+    // omfx.log 是 fyrox 自有的 log（fyrox::core::log::Log），不走 standard log macros。
+    // 我們的 log::info! / warn! 走 simplelog → 同時寫入 omfx_app.log 與終端機。
     let log_settings = configured_log_settings();
     let mut cfg_builder = ConfigBuilder::new();
     cfg_builder.set_time_format_rfc3339();
@@ -132,7 +132,7 @@ fn main() {
         },
     );
 
-    // Dynamic linking with hot reloading.
+    // 動態連結並啟用熱重載。
     #[cfg(feature = "dylib")]
     {
         #[cfg(target_os = "windows")]
@@ -144,7 +144,7 @@ fn main() {
         executor.add_dynamic_plugin(file_name, true, true).unwrap();
     }
 
-    // Static linking.
+    // 靜態連結。
     #[cfg(not(feature = "dylib"))]
     {
         use omfx::Game;

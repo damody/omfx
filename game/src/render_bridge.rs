@@ -1,13 +1,13 @@
-//! Phase 4.2: bridge from sim World snapshot → Fyrox scene.
+//! 階段 4.2：從 sim World snapshot 到 Fyrox scene 的橋接模組。
 //!
-//! Phase 5.x: per-entity sprites + HP bars are now driven by Game-side
-//! batched meshes (`body_batch` / `hp_batch`) so 1000+ entities collapse
-//! into a handful of draw calls instead of one node per entity. This
-//! module retains responsibility for **path** rendering only — checkpoint
-//! dots + segment lines are static after the first non-empty snapshot,
-//! so individual `RectangleBuilder` nodes there are fine.
+//! 階段 5.x：每個實體的 sprite 與 HP bar 現在由 Game 端驅動
+//! 批次化 mesh（`body_batch` / `hp_batch`）可將 1000+ 實體
+//! 合併成少量 draw call，而不是每個實體一個節點。這個模組
+//! 僅保留 **path** 渲染責任——checkpoint
+//! 點位與路段線在第一個非空快照後即為靜態，
+//! 所以保留逐一 `RectangleBuilder` 節點即可。
 //!
-//! Entities with `EntityKind::Other` are never rendered.
+//! `EntityKind::Other` 的實體永不繪製。
 
 use fyrox::core::algebra::{Vector2, Vector3};
 use fyrox::core::color::Color;
@@ -22,30 +22,30 @@ use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
 
 const WORLD_SCALE: f32 = 0.01;
 const Z_RB_PATH: f32 = 4.4;
-/// Phase 4.1: Z layer for BlockedRegion outlines. Drawn slightly above
-/// the path layer so the red outline is visible if a region overlaps a
-/// path (legacy reference: same Z as the old map.regions debug overlay).
+/// 階段 4.1：BlockedRegion 外框的 Z 層。繪製時略高於
+/// 路徑圖層，避免區域重疊時紅色外框被遮，確保仍可見
+/// （沿用舊版參考：同舊 map.regions debug overlay 的 Z）。
 const Z_RB_REGION: f32 = 4.5;
-/// Phase 4.1: Region outline thickness (render units). Half the path
-/// thickness so the red border doesn't dominate over the cream path.
+/// 階段 4.1：區域外框厚度（render 單位）。取路徑厚度的一半，
+/// 以避免紅色邊線比奶油色路徑更醒目。
 const REGION_LINE_THICKNESS: f32 = PATH_LINE_THICKNESS * 0.5;
-/// Phase 4.1: Region outline color — red (matches the legacy
-/// "blocked region" overlay convention; the alternative orange is
-/// reserved for `circle` blockers when they exist).
+/// 階段 4.1：區域外框顏色用紅色（對齊舊版慣例），
+/// "blocked region" overlay 規範；橘色預留給（未來）圓形阻擋物。
+///（當 `circle` 阻擋物存在時）。
 const REGION_OUTLINE_COLOR: (u8, u8, u8, u8) = (255, 80, 80, 255);
-/// Phase 4.1: Optional circle blocker color — orange. Currently unused
-/// (omb `BlockedRegion` has no radius), but plumbed for forward-compat.
+/// 階段 4.1：可選圓形阻擋色彩為橘色。
+/// （目前 omb 的 `BlockedRegion` 無半徑值），但為未來向前相容已預留。
 const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = (255, 165, 0, 255);
 
-/// Path zigzag line thickness in render units. Computed `64.0 *
-/// WORLD_SCALE * 2.0 = 1.28`. Matches the legacy MVP "thick cream
-/// zigzag" reference (image 6) — the prior `0.12` value was the tail
-/// end of an earlier per-segment marker design. The thicker line
-/// covers the corner waypoints cleanly, so individual checkpoint
-/// dots are no longer needed.
+/// 路徑鋸齒線寬（render 單位）。按 `64.0 *
+/// WORLD_SCALE * 2.0 = 1.28` 計算。對齊舊版 MVP 的「粗奶油
+/// 鋸齒線」參考值（image 6）；先前 `0.12` 是前一版
+/// 每段標記設計的尾段。加粗後可更完整覆蓋轉角標記點，
+/// 因此不再需要單獨 checkpoint dots。
+/// （上句接續上一行）
 const PATH_LINE_THICKNESS: f32 = 64.0 * WORLD_SCALE * 2.0;
-/// Pale tan / cream path color (RGBA). Replaces the earlier
-/// `(255, 200, 60)` yellow.
+/// 淡黃褐（奶油色）路徑顏色（RGBA），替換先前使用的
+/// ` (255, 200, 60)` 黃色。
 const PATH_COLOR: (u8, u8, u8, u8) = (170, 140, 90, 255);
 
 #[derive(Default, Debug)]
@@ -53,9 +53,9 @@ pub struct RenderBridge {
     last_applied_tick: Option<u32>,
     path_nodes: Vec<Handle<Node>>,
     paths_drawn: bool,
-    /// Phase 4.1: BlockedRegion outline scene nodes (one segment per
-    /// polygon edge). Static after first draw — `regions_drawn` gates
-    /// re-creation just like `paths_drawn`.
+    /// 階段 4.1：BlockedRegion 外框 scene 節點（每條邊一段）。
+    /// 首次繪製後改為靜態；`regions_drawn` 控制是否重建。
+    /// 行為與 `paths_drawn` 相同。
     region_nodes: Vec<Handle<Node>>,
     regions_drawn: bool,
 }
@@ -65,8 +65,8 @@ impl RenderBridge {
         Self::default()
     }
 
-    /// Per-tick path-init + diagnostic log. Entity sprites + HP bars are
-    /// now drawn by `Game::update_sim_batches` via batched meshes.
+    /// 每個 tick 的 path 初始化與診斷 log。實體 sprite 與 HP bar 現在由
+    /// `Game::update_sim_batches` 的批次 mesh 渲染。
     pub fn update(&mut self, snapshot: &SimWorldSnapshot, scene: &mut Scene) {
         if self.last_applied_tick == Some(snapshot.tick) {
             return;
@@ -88,14 +88,14 @@ impl RenderBridge {
         }
     }
 
-    /// Phase 4.1: draw red polygon outlines for each BlockedRegion plus
-    /// optional orange filled circle markers (forward-compat — no source
-    /// data has a radius today). One-shot like `ensure_paths_drawn` —
-    /// regions are static after `state::initialization`. Called every
-    /// tick but only does work the first time `blocked_regions` is
-    /// non-empty (matches the lazy paths-init pattern, since the omb
-    /// scene loader populates the resource before the first dispatch
-    /// but TD_1 has zero regions and won't trigger the draw at all).
+    /// 階段 4.1：為每個 BlockedRegion 繪製紅色多邊形外框，並可同時繪製
+    /// 可選的橘色實心圓（向前相容；目前來源資料無該欄位），
+    /// 僅在首次需要時繪製一次，行為與 `ensure_paths_drawn` 相同。
+    /// 區域在 `state::initialization` 後固定不變。每 tick 會呼叫此函式，
+    /// 但僅在 `blocked_regions` 首次非空時進行實際工作。
+    /// 與 lazy paths-init 一致，因為 omb 會在第一次 dispatch 前填充資料，
+    /// scene loader 會先行載入此資源，但 TD_1 會是空集合，
+    /// TD_1 本身沒有任何區域，不會真的觸發此段繪製。
     fn ensure_blocked_regions_drawn(
         &mut self,
         regions: &[crate::sim_runner::BlockedRegionSnapshot],
@@ -108,7 +108,7 @@ impl RenderBridge {
         let mut circles: usize = 0;
         for region in regions {
             if region.points.len() >= 2 {
-                // Polygon outline = N edges; close the loop with last→first.
+                // 多邊形外框有 N 條邊，使用最後一點到第一點作為封閉邊。
                 let n = region.points.len();
                 for i in 0..n {
                     let (x1, y1) = region.points[i];
@@ -153,17 +153,17 @@ impl RenderBridge {
                     polygon_segments += 1;
                 }
             }
-            // Optional circle marker — currently never set since omb
-            // BlockedRegion has no radius field. Plumbed so future
-            // circular blockers (e.g. tower footprint) can land here
-            // without touching render code.
+            // 可選圓形標記目前不會啟用，因為 omb
+            // `BlockedRegion` 目前沒有 radius 欄位，這段先保留供未來使用。
+            // （例如 tower footprint）等未來圓形阻擋物可直接接到這裡。
+            // 不需改到渲染邏輯。
             if let Some(((cx, cy), r)) = region.circle {
                 let rx = -cx * WORLD_SCALE;
                 let ry = cy * WORLD_SCALE;
                 let rr = r * WORLD_SCALE;
-                // Approximate circle with a square sprite — cheap and
-                // good enough for a debug overlay; renderer can swap to
-                // a proper circle texture later.
+                // 以正方形 sprite 近似圓形；
+                // 作為 debug overlay 足夠，渲染器日後可換成正規圓形紋理；
+                //
                 let node: Handle<Node> = RectangleBuilder::new(
                     BaseBuilder::new().with_local_transform(
                         TransformBuilder::new()
@@ -198,8 +198,8 @@ impl RenderBridge {
             return;
         }
         for path in paths {
-            // Phase 3.1: per-checkpoint marker dots removed — the thicker
-            // PATH_LINE_THICKNESS line covers corners cleanly.
+            // 階段 3.1：移除每個 checkpoint 的 marker 點位，改以較粗線條代替。
+            // `PATH_LINE_THICKNESS` 線條可完整覆蓋轉角。
             for window in path.windows(2) {
                 let (x1, y1) = window[0];
                 let (x2, y2) = window[1];
@@ -252,11 +252,11 @@ fn kind_histogram(entities: &[EntityRenderData]) -> [usize; 5] {
     h
 }
 
-/// Per-entity batched-mesh slot ownership. lib.rs holds a HashMap<u32,
-/// SimEntitySlots> and reuses these slot indices each tick. body_slot is
-/// allocated unconditionally; hp_* slots only when max_hp > 0; turret_slot
-/// only for kinds that have meaningful facing (Hero / Tower / Creep) — not
-/// projectiles.
+/// 每個實體在 batched-mesh 的 slot 所有權。lib.rs 會持有
+/// `HashMap<u32, SimEntitySlots>`，並每 tick 重複使用同一索引；`body_slot` 一律
+/// 無條件分配；hp_* slot 僅在 `max_hp > 0` 時建立，`turret_slot`
+/// 僅適用有朝向意義的類型（Hero / Tower / Creep），子彈不需要。
+/// 專門針對 projectile。
 #[derive(Debug, Clone, Copy)]
 pub struct SimEntitySlots {
     pub body_slot: u32,
@@ -265,9 +265,9 @@ pub struct SimEntitySlots {
     pub turret_slot: Option<u32>,
 }
 
-/// Style returned to the lib.rs batched-mesh writer. Color comes from a
-/// kind-driven baseline + unit_id hash perturbation so dart / bomb / ice
-/// towers (etc.) are visually distinct without needing real textures yet.
+/// 回傳給 lib.rs batched-mesh 寫入器的樣式。顏色採
+    /// 依實體種類基礎色，並以 unit_id hash 做微幅偏移，讓 dart / bomb / ice
+/// 等塔類在未導入真材質前仍能視覺區分。
 pub fn style_for_entity(entity: &EntityRenderData) -> ([u8; 4], f32, f32) {
     let (base_rgb, size, z) = match entity.kind {
         EntityKind::Hero => ((0u8, 255u8, 200u8), 0.30, 1.9),
@@ -281,8 +281,8 @@ pub fn style_for_entity(entity: &EntityRenderData) -> ([u8; 4], f32, f32) {
     ([r, g, b, 255], size, z)
 }
 
-/// World→render coord. Same `-x` flip + WORLD_SCALE the legacy entity_create
-/// + body_batch path used; matches the camera's look_at_rh side vector.
+/// 世界座標轉渲染座標。沿用 `entity_create` 舊流程的 `-x` 翻轉 + WORLD_SCALE
+/// + body_batch 路徑；與 camera 的 look_at_rh 右手邊向向量一致。
 pub fn world_to_render(entity: &EntityRenderData) -> Vector2<f32> {
     Vector2::new(-entity.pos_x * WORLD_SCALE, entity.pos_y * WORLD_SCALE)
 }

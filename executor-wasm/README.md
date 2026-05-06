@@ -1,10 +1,10 @@
-## Build instructions
+# # 建構指令
 
 1. Make sure you have `wasm32-unknown-unknown` target installed in rustup (if not, do: `rustup target add wasm32-unknown-unknown`)
 2. Make sure you have `wasm-pack` installed (if not, do: `cargo install wasm-pack`)
 3. To build the executor, do: `wasm-pack build --target web --release`
 
-## How to run the game on localhost
+# # 如何在本機上運行遊戲
 
 1. Make sure you have `basic-http-server` installed (if not, do: `cargo install basic-http-server`). 
 2. Clone assets to the `executor-wasm` directory. Alternatively, clone everything except `Cargo.toml` and `src` directory

@@ -1,26 +1,26 @@
-//! Phase 2 minimal LockstepClient for omfx.
+//! 階段 2 的簡化版 `LockstepClient`，供 omfx 使用。
 //!
-//! Connects to omb's lockstep wire (KCP tags 0x10–0x16), joins as a Player,
-//! and receives TickBatch / StateHash frames.
+//! 連線到 omb 的 lockstep 通道（KCP tag 0x10–0x16），以 Player 身分加入，
+//! 並接收 `TickBatch` / `StateHash` 資料。
 //!
-//! Phase 2 scope = **logging only**. Events are forwarded over a crossbeam
-//! channel into the Fyrox main thread, where they are logged at info / debug
-//! level (debug for tick batches, sampled every 60 ticks to avoid spam).
+//! 階段 2 僅做「紀錄」用途。事件會透過 crossbeam 通道
+//! 傳到 Fyrox 主執行緒，以 info/debug 等級輸出；
+//! `TickBatch` 採用 debug，且每 60 幀取樣一次以避免訊息刷屏。
 //!
-//! Phase 3 will replace the legacy GameEvent stream consumer with a real
-//! omoba_sim ECS that consumes TickBatch input and drives rendering. For
-//! now the legacy NetworkBridge runs unchanged in parallel.
+//! 階段 3 預計以真正的 omoba_sim ECS 替代舊有 `GameEvent` 流式消費器，
+//! 並由 TickBatch 輸入驅動渲染；目前階段先保留舊的 `NetworkBridge` 與其
+//! 平行運作。
 //!
-//! Design notes:
-//! - Spawns its own background thread + tokio current-thread runtime, mirroring
-//!   `NetworkBridge::spawn`. No shared runtime — keeps the two paths isolated
-//!   so a hang/crash in one doesn't take down the other.
-//! - Uses `omoba_core::KcpClient::join_lockstep` (which sends JoinRequest 0x13
-//!   and awaits GameStart 0x14) followed by `subscribe_lockstep` (claims the
-//!   already-running lockstep mpsc receiver fed by the kcp reader task).
-//! - Outgoing inputs (`input_tx`) are drained non-blocking after each inbound
-//!   recv. Phase 2 has no UI sending inputs — Phase 3 will hook keyboard /
-//!   mouse to this channel.
+//! 設計重點：
+//! - 會額外啟動自己的背景執行緒與 tokio current-thread runtime，做法上
+//!   對齊 `NetworkBridge::spawn`。兩條路徑不共用 runtime，
+//!   其中任一發生卡死/崩潰不會拖垮另一條。
+//! - 先呼叫 `omoba_core::KcpClient::join_lockstep`（送出 JoinRequest 0x13，
+//!   等待 GameStart 0x14），再呼叫 `subscribe_lockstep` 取得已啟用
+//!   的 lockstep mpsc receiver（由 KCP reader task 推資料）。
+//! - 每次收到入站後，將 `input_tx` 的輸入非阻塞清空。階段 2
+//!   尚未接上 UI 輸入；階段 3 將接鍵盤／滑鼠輸入。
+//!
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -33,48 +33,49 @@ use omoba_core::kcp::client::LockstepInbound;
 use omoba_core::kcp::game_proto::{PlayerInput, ServerEvent};
 use omoba_core::KcpClient;
 
-/// Diagnostics events forwarded from the lockstep background thread to the
-/// Fyrox main thread. Phase 2 only logs these; Phase 3+ will route them into
-/// the local sim consumer.
+/// 從 lockstep 背景執行緒轉到 Fyrox 主執行緒的診斷事件。
+/// 階段 2 僅做紀錄；階段 3 後續會轉交本地模擬消費端。
+
 #[derive(Debug, Clone)]
 pub enum LockstepEvent {
     Connected { master_seed: u64, player_id: u32 },
-    /// Phase 3.3: carry the full TickBatch payload (inputs + server events)
-    /// rather than just counts, so the sim_runner can drive its ECS
-    /// dispatcher with the actual player inputs.
+    /// 階段 3.3：改為攜帶完整 TickBatch 內容（inputs + server events），
+    /// 而非只傳筆數；讓 sim_runner 可用實際玩家輸入驅動 ECS dispatcher。
+
     TickBatch {
         tick: u32,
         inputs: Vec<(u32 /* player_id */, PlayerInput, u32 /* input_id */)>,
         server_events: Vec<ServerEvent>,
     },
     StateHash { tick: u32, hash: u64 },
-    /// Network throughput delta since the previous emission. Combined inbound
-    /// (TickBatch / StateHash / SnapshotResp / GameStart) and outbound
-    /// (InputSubmit) bytes — both directions count as "lockstep traffic".
-    /// Emitted from the bg thread once per inbound frame; the main thread
-    /// accumulates into the per-second HUD counters.
+    /// 自上次上報以來的網路吞吐位元組增量，含入站
+    /// （`TickBatch` / `StateHash` / `SnapshotResp` / `GameStart`）與
+    /// 出站（`InputSubmit`）兩方向；兩邊都算「lockstep 流量」。
+    /// 背景執行緒每次收完一個 frame 會輸出一筆，主執行緒再彙總到
+    /// 每秒 HUD 計數。
     NetStats { wire_delta: u64, logical_delta: u64 },
-    /// RTT measurement from the most recent PingResponse. Pushed once per
-    /// pong (≈1 Hz). The HUD shows the latest value.
+    /// 從最近一次 `PingResponse` 取得 RTT，`pong` 每秒約 1 次更新一次；
+    /// HUD 顯示最後一筆結果。
     Latency { rtt_us: u64 },
     Disconnected { reason: String },
 }
 
-/// Outgoing input message: target tick + the prost PlayerInput payload + omfx metric id.
+/// 傳給 omfx 的輸入訊息：目標 tick + prost 的 PlayerInput payload +
+/// omfx 用來做統計的輸入 id。
 pub type LockstepInputMsg = (u32, PlayerInput, u32);
 
-/// Handle to the background lockstep client. Drop kills the channels and
-/// causes the bg thread to exit on its next loop iteration.
+/// 背景 lockstep client 的操作句柄。
+/// 丟棄時會關閉通道，下一輪迴圈使背景執行緒自然結束。
 #[derive(Debug)]
 pub struct LockstepClientHandle {
     pub events_rx: Receiver<LockstepEvent>,
-    /// Phase 2 stub — UI does not generate inputs yet. Phase 3 will use this
-    /// to forward player input to the bg client which calls `submit_input`.
+    /// 階段 2 暫存區 — UI 還不會產生輸入；階段 3 會透過這裡
+    /// 將玩家輸入轉交背景 client，並由背景端呼叫 `submit_input`。
     pub input_tx: Sender<LockstepInputMsg>,
     input_id_counter: AtomicU32,
     latest_tick: Arc<AtomicU32>,
-    /// Keep the join handle alive so dropping the Handle takes the bg thread
-    /// down too (channels close → bg thread breaks out of its loop).
+    /// 保留 join handle，讓 Handle 被釋放時也能關閉背景執行緒；
+    /// 通道關閉後背景執行緒會跳出迴圈。
     _thread: thread::JoinHandle<()>,
 }
 
@@ -88,7 +89,7 @@ impl LockstepClientHandle {
     }
 }
 
-/// Spawn the lockstep client background thread.
+/// 啟動 lockstep 客戶端背景執行緒。
 pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClientHandle {
     let (events_tx, events_rx) = unbounded();
     let (input_tx, input_rx) = unbounded::<LockstepInputMsg>();
@@ -135,9 +136,9 @@ async fn run_client(
 ) {
     info!("lockstep-client connecting to {}", addr);
 
-    // Use a fresh KcpClient — the legacy NetworkBridge has its own. KcpClient
-    // sends a SubscribeRequest as part of `connect`; that's fine for Phase 2
-    // (server tolerates it; lockstep tags arrive on the same socket anyway).
+    // 用新的 KcpClient，舊的 NetworkBridge 會有自己的。`connect`
+    // 會附帶送出 SubscribeRequest；階段 2 在行為上可接受，
+    // 伺服器可容忍，且 lockstep tag 仍走同一 socket。
     let mut client = match KcpClient::connect(&addr, player_name.clone()).await {
         Ok(c) => c,
         Err(e) => {
@@ -149,8 +150,8 @@ async fn run_client(
         }
     };
 
-    // Send JoinRequest 0x13 and await GameStart 0x14. Returns master_seed.
-    // Phase 2 always joins as Player (observer = false).
+    // 送出 JoinRequest 0x13 並等待 GameStart 0x14，回傳
+    // `master_seed`。階段 2 固定以 Player 身分加入（observer = false）。
     let master_seed = match client.join_lockstep(player_name.clone(), false).await {
         Ok(seed) => seed,
         Err(e) => {
@@ -171,9 +172,9 @@ async fn run_client(
         player_id,
     });
 
-    // Claim the lockstep inbound stream. After join_lockstep already drained
-    // the GameStart frame, this rx yields TickBatch / StateHash / SnapshotResp
-    // (and any further GameStart, which Phase 2 doesn't expect).
+    // 接管 lockstep 入站串流。`join_lockstep` 已經耗掉第一筆
+    // `GameStart`，之後這個 rx 會回傳 `TickBatch` / `StateHash` /
+    // `SnapshotResp`，若又收到額外 `GameStart`（階段 2 不預期）也一併接收。
     let mut rx = match client.subscribe_lockstep() {
         Ok(r) => r,
         Err(e) => {
@@ -185,15 +186,15 @@ async fn run_client(
         }
     };
 
-    // Main loop: poll inbound and frequently drain pending outgoing inputs.
-    // A long recv timeout adds up to one TickBatch of input latency, enough to
-    // make the intended +3 tick lookahead arrive late on localhost.
+    // 主迴圈：輪詢入站並頻繁清空待送輸入。
+    // 接收逾時若拉長，會累積到約一個 TickBatch 的輸入延遲，
+    // 會讓預期的 +3 tick 前瞻在 localhost 上變晚。
     let mut last_hb_log = std::time::Instant::now();
     let mut last_stall_log = std::time::Instant::now();
     let mut tick_batches_since_log: u32 = 0;
     let mut last_known_tick: u32 = 0;
-    // Per-iteration byte deltas — flushed to a NetStats event at the bottom of
-    // each loop. Combined in/out so the HUD shows the total lockstep traffic.
+    // 每次迴圈的位元組增量，會在尾段輸出到 NetStats。
+    // 入站與出站同時計入，讓 HUD 顯示總 lockstep 流量。
     let mut wire_delta: u64;
     let mut logical_delta: u64;
     loop {
@@ -238,8 +239,8 @@ async fn run_client(
                     last_hb_log = now;
                     tick_batches_since_log = 0;
                 }
-                // Phase 3.3: extract `Vec<(player_id, PlayerInput)>` from the
-                // generated `InputForPlayer` rows.
+                // 階段 3.3：從 `InputForPlayer` 的各列抽出
+                // `Vec<(player_id, PlayerInput)>`。
                 let inputs: Vec<(u32, PlayerInput, u32)> = b
                     .inputs
                     .into_iter()
@@ -284,8 +285,8 @@ async fn run_client(
             }
         }
 
-        // Drain any pending input submissions without blocking. Outbound
-        // InputSubmit bytes count toward the same lockstep-traffic total.
+        // 非阻塞清空待送輸入。`InputSubmit` 的位元組也會納入同一個
+        // lockstep 流量總數。
         while let Ok((target_tick, input, input_id)) = input_rx.try_recv() {
             match client.submit_input(target_tick, input, input_id).await {
                 Ok((logical, wire)) => {

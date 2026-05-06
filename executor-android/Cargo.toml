@@ -5,8 +5,8 @@ version = "0.1.0"
 edition = "2021"
 
 [package.metadata.android]
-# This folder is used as a temporary storage for assets. Project exporter will clone everything
-# from data folder to this folder and cargo-apk will create the apk with these assets.
+# 該資料夾用作資產的臨時存儲。項目導出器將克隆所有內容
+# 從 data 資料夾到此資料夾，cargo-apk 將使用這些資源建立 apk。
 assets = "assets"
 strip = "strip"
 

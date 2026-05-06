@@ -1,4 +1,4 @@
-//! Editor with your game connected to it as a plugin.
+//! 使用 plugin 模式啟動的編輯器。
 use fyroxed_base::{fyrox::event_loop::EventLoop, Editor, StartupData, fyrox::core::log::Log};
 
 fn main() {
@@ -13,7 +13,7 @@ fn main() {
         }),
     );
 
-     // Dynamic linking with hot reloading.
+    // 動態連結並啟用熱重載。
     #[cfg(feature = "dylib")]
     {
         #[cfg(target_os = "windows")]
@@ -25,7 +25,7 @@ fn main() {
         editor.add_dynamic_plugin(file_name, true, true).unwrap();
     }
 
-    // Static linking.
+    // 靜態連結。
     #[cfg(not(feature = "dylib"))]
     {
         use omfx::Game;

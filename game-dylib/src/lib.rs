@@ -1,4 +1,4 @@
-//! Wrapper for hot-reloadable plugin.
+//! 可熱重載插件的包裝。
 use omfx::{fyrox::plugin::Plugin, Game};
 
 #[no_mangle]

@@ -14,20 +14,20 @@ serde_json = "1.0"
 log = "0.4"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 
-# Phase 3 lockstep simulator deps:
-# omfx imports omb-as-lib to run the full ECS dispatcher in a worker thread.
-# specs uses the forked path (matches omb) so Entity Serialize impls and
-# component types are unified across the FFI boundary.
+# 第 3 階段鎖步模擬器相依性：
+# omfx 導入 omb-as-lib 以在工作執行緒中執行完整的 ECS 調度程式。
+# 規範使用分叉路徑（匹配 omb），因此 Entity Serialize impls 和
+# 組件類型在 FFI 邊界上是統一的。
 omobab = { path = "../../omb", default-features = false, features = ["kcp"] }
 specs = { path = "../../specs", features = ["derive", "serde"] }
 omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }
-# Phase 2.1: TowerPlace UI handler converts the selected tower kind name
-# (`td_template_order` entries like "tower_dart") to the proto `tower_kind_id`
-# u32 via `omoba_template_ids::tower_by_name`.
+# 階段 2.1：TowerPlace UI 處理程序轉換選定的塔類型名稱
+# （“td_template_order”條目如“tower_dart”）到原型“tower_kind_id”
+# u32 通過 `omoba_template_ids::tower_by_name`。
 omoba-template-ids = { path = "../../omoba-template-ids" }
 failure = "0.1.8"
-# Phase 3.3: needed for re-encoding PlayerInput across the omoba_core /
-# omobab proto-type boundary at the lockstep → sim_runner bridge.
+# 階段 3.3：需透過 omoba_core / 重新編碼 PlayerInput
+# omobab 原型邊界位於鎖步 → sim_runner 橋。
 prost = "0.13"
 
 [target.'cfg(windows)'.dependencies]
