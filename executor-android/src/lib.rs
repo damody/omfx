@@ -1,4 +1,4 @@
-//! Android executor with your game connected to it as a plugin.
+//! Android 執行器，您的遊戲作為插件連接到它。
 #![cfg(target_os = "android")]
 use fyrox::{
     core::io, engine::executor::Executor, event_loop::EventLoopBuilder,
