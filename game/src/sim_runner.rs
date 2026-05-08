@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use log::{error, info};
@@ -30,6 +31,36 @@ use specs::{Join, World, WorldExt};
 // 具體類型。 omobab 從 prost 產生的模組重新匯出它
 // 在“lockstep::PlayerInput”下。
 pub use omobab::lockstep::PlayerInput;
+
+fn wall_clock_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Debug)]
+pub struct TickBatchInput {
+    pub player_id: u32,
+    pub input: PlayerInput,
+    pub input_id: u32,
+    pub server_receive_tick: u32,
+    pub server_drain_tick: u32,
+    pub server_queue_us: u64,
+    pub client_receive_us: u64,
+    pub game_forward_us: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AppliedInputMeta {
+    pub input_id: u32,
+    pub server_receive_tick: u32,
+    pub server_drain_tick: u32,
+    pub server_queue_us: u64,
+    pub client_receive_us: u64,
+    pub game_forward_us: u64,
+    pub sim_publish_us: u64,
+}
 
 /// 階段 4.2：僅渲染爆炸 FX 條目，鏡像自
 /// `omobab::comp::結果::ExplosionFx`。再出口通過
@@ -118,6 +149,8 @@ pub struct SimWorldSnapshot {
     pub explosions: Vec<ExplosionFx>,
     /// 用於輸入到渲染延遲配對的僅限 omfx 元資料； sim ECS 不讀取它。
     pub applied_input_ids: Vec<u32>,
+    /// Per-input phase metadata mirrored from wire-edge state; sim ECS does not read it.
+    pub applied_input_meta: Vec<AppliedInputMeta>,
 }
 
 /// 階段 4.1：一個多邊形區域快照。
@@ -288,7 +321,7 @@ pub enum EntityKind {
 #[derive(Clone, Debug)]
 pub struct TickBatchPayload {
     pub tick: u32,
-    pub inputs: Vec<(u32 /* player_id */, PlayerInput, u32 /* input_id */)>,
+    pub inputs: Vec<TickBatchInput>,
 }
 
 /// 返回 omfx 遊戲的句柄，以便渲染線程可以讀取快照
@@ -430,7 +463,7 @@ fn run_sim_loop(
         std::sync::Arc::new(Vec::new());
     let mut tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
-    let mut recent_applied_input_ids: VecDeque<(u32, u32)> = VecDeque::new();
+    let mut recent_applied_inputs: VecDeque<(u32, AppliedInputMeta)> = VecDeque::new();
     loop {
         // 使用recv_timeout而不是recv()，因此線路停頓會出現在
         // 記錄為「1.0 秒內沒有 TickBatch — 上游鎖步用戶端是
@@ -456,22 +489,37 @@ fn run_sim_loop(
             }
         };
 
-        for input_id in batch
+        for input in batch
             .inputs
             .iter()
-            .filter_map(|(_, _, input_id)| (*input_id != 0).then_some(*input_id))
+            .filter(|input| input.input_id != 0)
         {
-            recent_applied_input_ids.push_back((batch.tick, input_id));
+            recent_applied_inputs.push_back((
+                batch.tick,
+                AppliedInputMeta {
+                    input_id: input.input_id,
+                    server_receive_tick: input.server_receive_tick,
+                    server_drain_tick: input.server_drain_tick,
+                    server_queue_us: input.server_queue_us,
+                    client_receive_us: input.client_receive_us,
+                    game_forward_us: input.game_forward_us,
+                    sim_publish_us: 0,
+                },
+            ));
         }
-        while recent_applied_input_ids
+        while recent_applied_inputs
             .front()
             .is_some_and(|(tick, _)| batch.tick.saturating_sub(*tick) > APPLIED_INPUT_ID_RETENTION_TICKS)
         {
-            recent_applied_input_ids.pop_front();
+            recent_applied_inputs.pop_front();
         }
-        let applied_input_ids = recent_applied_input_ids
+        let applied_input_meta = recent_applied_inputs
             .iter()
-            .map(|(_, input_id)| *input_id)
+            .map(|(_, meta)| meta.clone())
+            .collect::<Vec<_>>();
+        let applied_input_ids = applied_input_meta
+            .iter()
+            .map(|meta| meta.input_id)
             .collect::<Vec<_>>();
         push_inputs_into_world(&mut world, batch.tick, batch.inputs);
 
@@ -647,14 +695,19 @@ fn run_sim_loop(
             }
         }
 
-        let snapshot = extract_snapshot(
+        let mut snapshot = extract_snapshot(
             &mut world,
             batch.tick,
             abilities_arc.clone(),
             tower_templates_arc.clone(),
             tower_upgrades_arc.clone(),
             applied_input_ids,
+            applied_input_meta,
         );
+        let sim_publish_us = wall_clock_us();
+        for meta in &mut snapshot.applied_input_meta {
+            meta.sim_publish_us = sim_publish_us;
+        }
 
         // 「蠕變 HP 條保持滿」回歸報告的診斷
         // （第 4-5 階段鎖步清理）。每秒採樣一次
@@ -696,7 +749,7 @@ fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Err
     Ok(world)
 }
 
-fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, PlayerInput, u32)>) {
+fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<TickBatchInput>) {
     // 階段 3.4：將鎖步 TickBatch 輸入寫入主機的
     // `PendingPlayerInputs` 資源，所以 omb 的 `tick::player_input_tick::Sys`
     // 可以在調度程序運行開始時耗盡它們。
@@ -711,8 +764,8 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<(u32, Player
     if !inputs.is_empty() {
         log::trace!("sim_runner: tick {} got {} inputs", tick, inputs.len());
     }
-    for (player_id, input, _input_id) in inputs {
-        pending.by_player.insert(player_id, input);
+    for input in inputs {
+        pending.by_player.insert(input.player_id, input.input);
     }
 }
 
@@ -723,6 +776,7 @@ fn extract_snapshot(
     tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
     tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
     applied_input_ids: Vec<u32>,
+    applied_input_meta: Vec<AppliedInputMeta>,
 ) -> SimWorldSnapshot {
     // omobab 通過 `pub use crate::comp::*;` 在
     // 板條箱根部，因此請穿過平坦的路徑而不是
@@ -1097,6 +1151,7 @@ fn extract_snapshot(
         tower_upgrades: tower_upgrades_arc,
         explosions,
         applied_input_ids,
+        applied_input_meta,
     }
 }
 

@@ -116,6 +116,29 @@ struct PendingInput {
     submit_instant: Instant,
     target_tick: u32,
     action_kind: InputActionKind,
+    origin_kind: lockstep_client::InputOriginKind,
+    origin_us: u64,
+    send_lockstep_input_us: u64,
+    submit_start_us: Option<u64>,
+    submit_done_us: Option<u64>,
+    client_receive_tickbatch_us: Option<u64>,
+    game_forward_to_sim_us: Option<u64>,
+    sim_publish_snapshot_us: Option<u64>,
+    server_receive_tick: Option<u32>,
+    server_drain_tick: Option<u32>,
+    server_queue_us: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LatencyPhaseDurations {
+    pub origin_to_send_us: u64,
+    pub send_to_submit_start_us: u64,
+    pub submit_io_us: u64,
+    pub submit_to_client_receive_us: u64,
+    pub server_queue_us: u64,
+    pub client_receive_to_forward_us: u64,
+    pub forward_to_publish_us: u64,
+    pub publish_to_pair_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +147,11 @@ pub struct LatencySample {
     pub action_kind: InputActionKind,
     pub total_ms: u32,
     pub submitted_at: Instant,
+    pub origin_kind: lockstep_client::InputOriginKind,
+    pub target_tick: u32,
+    pub server_receive_tick: Option<u32>,
+    pub server_drain_tick: Option<u32>,
+    pub phases: LatencyPhaseDurations,
 }
 
 #[derive(Debug)]
@@ -1593,7 +1621,12 @@ impl Plugin for Game {
                                 ),
                             ),
                         };
-                        self.send_lockstep_input(input);
+                        let origin_us = wall_clock_us();
+                        self.send_lockstep_input_from(
+                            input,
+                            lockstep_client::InputOriginKind::Auto,
+                            origin_us,
+                        );
                         log::info!(
                             "[auto-smoke] Start Round sent at t={:.2}s (OMFX_AUTO_START_AFTER_SEC={})",
                             elapsed_s, v
@@ -1628,7 +1661,12 @@ impl Plugin for Game {
                                     ),
                                 ),
                             };
-                            self.send_lockstep_input(input);
+                            let origin_us = wall_clock_us();
+                            self.send_lockstep_input_from(
+                                input,
+                                lockstep_client::InputOriginKind::Auto,
+                                origin_us,
+                            );
                             self.auto_noop_next_at_s = Some(next_at + interval_s);
                         } else {
                             self.auto_noop_next_at_s = Some(next_at);
@@ -1716,13 +1754,33 @@ impl Plugin for Game {
                                 tick, inputs.len(), server_events.len()
                             );
                         }
+                        let game_forward_us = wall_clock_us();
+                        for input in &inputs {
+                            if input.input_id == 0 { continue; }
+                            if let Some(pending) = self.pending_inputs.get_mut(&input.input_id) {
+                                pending.client_receive_tickbatch_us = Some(input.client_receive_us);
+                                pending.game_forward_to_sim_us = Some(game_forward_us);
+                                pending.server_receive_tick = Some(input.server_receive_tick);
+                                pending.server_drain_tick = Some(input.server_drain_tick);
+                                pending.server_queue_us = Some(input.server_queue_us);
+                            }
+                        }
                         // 橋接 omoba_core 的 PlayerInput 類型 → omobab 的
                         // 透過 prost 重新編碼的 PlayerInput 類型。他們是
                         // 相同的電線格式但不同的 Rust 類型。
-                        let converted: Vec<(u32, sim_runner::PlayerInput, u32)> = inputs
+                        let converted: Vec<sim_runner::TickBatchInput> = inputs
                             .into_iter()
-                            .filter_map(|(pid, inp, input_id)| {
-                                convert_player_input(&inp).map(|out| (pid, out, input_id))
+                            .filter_map(|input| {
+                                convert_player_input(&input.input).map(|out| sim_runner::TickBatchInput {
+                                    player_id: input.player_id,
+                                    input: out,
+                                    input_id: input.input_id,
+                                    server_receive_tick: input.server_receive_tick,
+                                    server_drain_tick: input.server_drain_tick,
+                                    server_queue_us: input.server_queue_us,
+                                    client_receive_us: input.client_receive_us,
+                                    game_forward_us,
+                                })
                             })
                             .collect();
                         let payload = sim_runner::TickBatchPayload {
@@ -1744,6 +1802,16 @@ impl Plugin for Game {
                         self.net_wire_bytes_current += wire_delta;
                         self.net_bytes_current += logical_delta;
                     }
+                    lockstep_client::LockstepEvent::InputSubmitted {
+                        input_id,
+                        submit_start_us,
+                        submit_done_us,
+                    } => {
+                        if let Some(pending) = self.pending_inputs.get_mut(&input_id) {
+                            pending.submit_start_us = Some(submit_start_us);
+                            pending.submit_done_us = Some(submit_done_us);
+                        }
+                    }
                     lockstep_client::LockstepEvent::Latency { rtt_us } => {
                         self.latest_rtt_us = Some(rtt_us);
                     }
@@ -1761,11 +1829,11 @@ impl Plugin for Game {
         // 帶有真實 Fyrox sprite 生成 / 更新 / 的存根「更新」主體
         // despawn，退休 NetworkBridge GameEvent → sprite pipeline
         // 下面是 SIM 權威擁有的實體。
-        let mut applied_input_ids_to_pair: Option<Vec<u32>> = None;
+        let mut applied_inputs_to_pair: Option<Vec<sim_runner::AppliedInputMeta>> = None;
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
                 self.render_bridge.update(&*snapshot, scene);
-                applied_input_ids_to_pair = Some(snapshot.applied_input_ids.clone());
+                applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
 
                 // 階段 5.x：HUD 心跳源自 sim 快照
                 // （NetworkBridge GameEvent 串流在第 5.1 階段被刪除；這
@@ -2102,8 +2170,8 @@ impl Plugin for Game {
                 }
             }
         }
-        if let Some(ids) = applied_input_ids_to_pair.as_deref() {
-            self.pair_applied_inputs(ids);
+        if let Some(inputs) = applied_inputs_to_pair.as_deref() {
+            self.pair_applied_inputs(inputs);
         } else {
             self.evict_stale_pending_inputs();
         }
@@ -3376,6 +3444,7 @@ impl Plugin for Game {
     }
 
     fn on_os_event(&mut self, event: &Event<()>, mut context: PluginContext) -> GameResult {
+        let event_us = wall_clock_us();
         match event {
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
@@ -3431,7 +3500,11 @@ impl Plugin for Game {
                         && screen.x >= bx && screen.x <= bx + bw
                         && screen.y >= by && screen.y <= by + bh
                     {
-                        self.send_upgrade_ability_input(i as u32);
+                        self.send_upgrade_ability_input_from(
+                            i as u32,
+                            lockstep_client::InputOriginKind::OsEvent,
+                            event_us,
+                        );
                         hit_ui = true;
                         break;
                     }
@@ -3444,7 +3517,12 @@ impl Plugin for Game {
                         if screen.x >= bx && screen.x <= bx + bw
                             && screen.y >= by && screen.y <= by + bh
                         {
-                            self.send_cast_ability_input(i as u32, Some(self.mouse_world_pos));
+                            self.send_cast_ability_input_from(
+                                i as u32,
+                                Some(self.mouse_world_pos),
+                                lockstep_client::InputOriginKind::OsEvent,
+                                event_us,
+                            );
                             hit_ui = true;
                             break;
                         }
@@ -3466,7 +3544,11 @@ impl Plugin for Game {
                                 ),
                             ),
                         };
-                        self.send_lockstep_input(input);
+                        self.send_lockstep_input_from(
+                            input,
+                            lockstep_client::InputOriginKind::OsEvent,
+                            event_us,
+                        );
                         log::info!("Start Round → lockstep PlayerInput::StartRound sent");
                         hit_ui = true;
                     }
@@ -3518,7 +3600,11 @@ impl Plugin for Game {
                                     ),
                                 ),
                             };
-                            self.send_lockstep_input(input);
+                            self.send_lockstep_input_from(
+                                input,
+                                lockstep_client::InputOriginKind::OsEvent,
+                                event_us,
+                            );
                             log::info!("Tower sell lockstep input submitted: eid={}", tid);
                             self.selected_tower_entity = None;
                         }
@@ -3563,7 +3649,11 @@ impl Plugin for Game {
                                         ),
                                     ),
                                 };
-                                self.send_lockstep_input(input);
+                                self.send_lockstep_input_from(
+                                    input,
+                                    lockstep_client::InputOriginKind::OsEvent,
+                                    event_us,
+                                );
                                 log::info!(
                                     "Tower upgrade lockstep input submitted: eid={} path={} level={}",
                                     tid, path, target_level
@@ -3595,7 +3685,11 @@ impl Plugin for Game {
                                         ),
                                     ),
                                 };
-                                self.send_lockstep_input(input);
+                                self.send_lockstep_input_from(
+                                    input,
+                                    lockstep_client::InputOriginKind::OsEvent,
+                                    event_us,
+                                );
                                 log::info!(
                                     "Tower place lockstep input submitted: kind='{}' kind_id={} pos=({}, {})",
                                     kind, tid.0, pos.x, pos.y
@@ -3670,7 +3764,11 @@ impl Plugin for Game {
                             omoba_core::kcp::game_proto::player_input::Action::MoveTo(move_to),
                         ),
                     };
-                    self.send_lockstep_input(input);
+                    self.send_lockstep_input_from(
+                        input,
+                        lockstep_client::InputOriginKind::OsEvent,
+                        event_us,
+                    );
                 }
             }
             // LoL MVP 鍵盤輸入
@@ -3717,7 +3815,12 @@ impl Plugin for Game {
                 // Modifier 按住的情境（Shift = 升級，不是施法）會排除。
                 if !self.shift_held {
                     if let Some(ability_index) = ability_key_index(key) {
-                        self.send_cast_ability_input(ability_index, Some(world));
+                        self.send_cast_ability_input_from(
+                            ability_index,
+                            Some(world),
+                            lockstep_client::InputOriginKind::OsEvent,
+                            event_us,
+                        );
                         return Ok(());
                     }
                 }
@@ -3733,7 +3836,11 @@ impl Plugin for Game {
                         }.to_string();
                         if self.shift_held {
                             if let Some(ability_index) = ability_key_index(key) {
-                                self.send_upgrade_ability_input(ability_index);
+                                self.send_upgrade_ability_input_from(
+                                    ability_index,
+                                    lockstep_client::InputOriginKind::OsEvent,
+                                    event_us,
+                                );
                             }
                         } else {
                             // 演員表已通過上面的 lockstep 發送；在這裡沒什麼可做的。
@@ -3816,7 +3923,11 @@ impl Plugin for Game {
                                         ),
                                     ),
                                 };
-                                self.send_lockstep_input(input);
+                                self.send_lockstep_input_from(
+                                    input,
+                                    lockstep_client::InputOriginKind::OsEvent,
+                                    event_us,
+                                );
                                 log::info!("Item use lockstep input submitted: slot={}", slot_idx);
                             }
                         }
@@ -4090,23 +4201,44 @@ impl Game {
         }
     }
 
-    fn pair_applied_inputs(&mut self, applied_input_ids: &[u32]) {
-        if applied_input_ids.is_empty() {
+    fn pair_applied_inputs(&mut self, applied_inputs: &[sim_runner::AppliedInputMeta]) {
+        if applied_inputs.is_empty() {
             self.evict_stale_pending_inputs();
             return;
         }
         let render_us = wall_clock_us();
-        for &input_id in applied_input_ids {
+        for meta in applied_inputs {
+            let input_id = meta.input_id;
             let Some(pending) = self.pending_inputs.remove(&input_id) else { continue };
+            let submit_start_us = pending.submit_start_us.unwrap_or(pending.send_lockstep_input_us);
+            let submit_done_us = pending.submit_done_us.unwrap_or(submit_start_us);
+            let client_receive_us = pending.client_receive_tickbatch_us.unwrap_or(meta.client_receive_us);
+            let game_forward_us = pending.game_forward_to_sim_us.unwrap_or(meta.game_forward_us);
+            let sim_publish_us = pending.sim_publish_snapshot_us.unwrap_or(meta.sim_publish_us);
             let total_ms = render_us
                 .saturating_sub(pending.submit_wall_clock_us)
                 .saturating_div(1_000)
                 .min(u64::from(u32::MAX)) as u32;
+            let phases = LatencyPhaseDurations {
+                origin_to_send_us: pending.send_lockstep_input_us.saturating_sub(pending.origin_us),
+                send_to_submit_start_us: submit_start_us.saturating_sub(pending.send_lockstep_input_us),
+                submit_io_us: submit_done_us.saturating_sub(submit_start_us),
+                submit_to_client_receive_us: client_receive_us.saturating_sub(submit_done_us),
+                server_queue_us: pending.server_queue_us.unwrap_or(meta.server_queue_us),
+                client_receive_to_forward_us: game_forward_us.saturating_sub(client_receive_us),
+                forward_to_publish_us: sim_publish_us.saturating_sub(game_forward_us),
+                publish_to_pair_us: render_us.saturating_sub(sim_publish_us),
+            };
             self.input_latency_meter.push(LatencySample {
                 input_id,
                 action_kind: pending.action_kind,
                 total_ms,
                 submitted_at: pending.submit_instant,
+                origin_kind: pending.origin_kind,
+                target_tick: pending.target_tick,
+                server_receive_tick: pending.server_receive_tick.or(Some(meta.server_receive_tick)),
+                server_drain_tick: pending.server_drain_tick.or(Some(meta.server_drain_tick)),
+                phases: phases.clone(),
             });
             log::debug!(
                 "input_render_latency: id={} kind={:?} target_tick={} submit_us={} render_us={} total_ms={}",
@@ -4116,6 +4248,21 @@ impl Game {
                 pending.submit_wall_clock_us,
                 render_us,
                 total_ms,
+            );
+            log::debug!(
+                "input_latency_phase: id={} origin={:?} origin_to_send_us={} send_to_submit_start_us={} submit_io_us={} submit_to_client_receive_us={} server_queue_us={} client_receive_to_forward_us={} forward_to_publish_us={} publish_to_pair_us={} server_receive_tick={:?} server_drain_tick={:?}",
+                input_id,
+                pending.origin_kind,
+                phases.origin_to_send_us,
+                phases.send_to_submit_start_us,
+                phases.submit_io_us,
+                phases.submit_to_client_receive_us,
+                phases.server_queue_us,
+                phases.client_receive_to_forward_us,
+                phases.forward_to_publish_us,
+                phases.publish_to_pair_us,
+                pending.server_receive_tick.or(Some(meta.server_receive_tick)),
+                pending.server_drain_tick.or(Some(meta.server_drain_tick)),
             );
         }
         self.evict_stale_pending_inputs();
@@ -4137,6 +4284,16 @@ impl Game {
     }
 
     fn send_lockstep_input(&mut self, input: omoba_core::kcp::game_proto::PlayerInput) {
+        let now_us = wall_clock_us();
+        self.send_lockstep_input_from(input, lockstep_client::InputOriginKind::Direct, now_us);
+    }
+
+    fn send_lockstep_input_from(
+        &mut self,
+        input: omoba_core::kcp::game_proto::PlayerInput,
+        origin_kind: lockstep_client::InputOriginKind,
+        origin_us: u64,
+    ) {
         let Some(handle) = self.lockstep_handle.as_ref() else { return };
         let input_id = handle.next_input_id();
         let action_kind = InputActionKind::from_player_input(&input);
@@ -4155,7 +4312,14 @@ impl Game {
             INPUT_LOOKAHEAD_TICKS,
             target_tick,
         );
-        if let Err(e) = handle.input_tx.send((target_tick, input, input_id)) {
+        if let Err(e) = handle.input_tx.send(lockstep_client::LockstepInputMsg {
+            target_tick,
+            input,
+            input_id,
+            origin_kind,
+            origin_us,
+            send_lockstep_input_us: submit_wall_clock_us,
+        }) {
             log::warn!("[lockstep] input_tx send failed: {e}");
             return;
         }
@@ -4164,10 +4328,31 @@ impl Game {
             submit_instant,
             target_tick,
             action_kind,
+            origin_kind,
+            origin_us,
+            send_lockstep_input_us: submit_wall_clock_us,
+            submit_start_us: None,
+            submit_done_us: None,
+            client_receive_tickbatch_us: None,
+            game_forward_to_sim_us: None,
+            sim_publish_snapshot_us: None,
+            server_receive_tick: None,
+            server_drain_tick: None,
+            server_queue_us: None,
         });
     }
 
     fn send_upgrade_ability_input(&mut self, ability_index: u32) {
+        let now_us = wall_clock_us();
+        self.send_upgrade_ability_input_from(ability_index, lockstep_client::InputOriginKind::Direct, now_us);
+    }
+
+    fn send_upgrade_ability_input_from(
+        &mut self,
+        ability_index: u32,
+        origin_kind: lockstep_client::InputOriginKind,
+        origin_us: u64,
+    ) {
         let input = omoba_core::kcp::game_proto::PlayerInput {
             action: Some(
                 omoba_core::kcp::game_proto::player_input::Action::UpgradeAbility(
@@ -4175,11 +4360,27 @@ impl Game {
                 ),
             ),
         };
-        self.send_lockstep_input(input);
+        self.send_lockstep_input_from(input, origin_kind, origin_us);
         log::info!("Ability upgrade lockstep input submitted: index={}", ability_index);
     }
 
     fn send_cast_ability_input(&mut self, ability_index: u32, target_world: Option<Vector2<f32>>) {
+        let now_us = wall_clock_us();
+        self.send_cast_ability_input_from(
+            ability_index,
+            target_world,
+            lockstep_client::InputOriginKind::Direct,
+            now_us,
+        );
+    }
+
+    fn send_cast_ability_input_from(
+        &mut self,
+        ability_index: u32,
+        target_world: Option<Vector2<f32>>,
+        origin_kind: lockstep_client::InputOriginKind,
+        origin_us: u64,
+    ) {
         let input = omoba_core::kcp::game_proto::PlayerInput {
             action: Some(
                 omoba_core::kcp::game_proto::player_input::Action::CastAbility(
@@ -4191,7 +4392,7 @@ impl Game {
                 ),
             ),
         };
-        self.send_lockstep_input(input);
+        self.send_lockstep_input_from(input, origin_kind, origin_us);
         log::info!("Ability cast lockstep input submitted: index={}", ability_index);
     }
 
@@ -4638,6 +4839,11 @@ mod input_latency_tests {
             action_kind: InputActionKind::NoOp,
             total_ms,
             submitted_at: Instant::now(),
+            origin_kind: lockstep_client::InputOriginKind::Direct,
+            target_tick: input_id,
+            server_receive_tick: None,
+            server_drain_tick: None,
+            phases: LatencyPhaseDurations::default(),
         }
     }
 

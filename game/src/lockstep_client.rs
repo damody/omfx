@@ -25,6 +25,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use log::{error, info, warn};
@@ -32,6 +33,41 @@ use log::{error, info, warn};
 use omoba_core::kcp::client::LockstepInbound;
 use omoba_core::kcp::game_proto::{PlayerInput, ServerEvent};
 use omoba_core::KcpClient;
+
+fn wall_clock_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOriginKind {
+    OsEvent,
+    Auto,
+    Direct,
+}
+
+#[derive(Debug, Clone)]
+pub struct LockstepInputMsg {
+    pub target_tick: u32,
+    pub input: PlayerInput,
+    pub input_id: u32,
+    pub origin_kind: InputOriginKind,
+    pub origin_us: u64,
+    pub send_lockstep_input_us: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LockstepTickInput {
+    pub player_id: u32,
+    pub input: PlayerInput,
+    pub input_id: u32,
+    pub server_receive_tick: u32,
+    pub server_drain_tick: u32,
+    pub server_queue_us: u64,
+    pub client_receive_us: u64,
+}
 
 /// 從 lockstep 背景執行緒轉到 Fyrox 主執行緒的診斷事件。
 /// 階段 2 僅做紀錄；階段 3 後續會轉交本地模擬消費端。
@@ -44,8 +80,13 @@ pub enum LockstepEvent {
 
     TickBatch {
         tick: u32,
-        inputs: Vec<(u32 /* player_id */, PlayerInput, u32 /* input_id */)>,
+        inputs: Vec<LockstepTickInput>,
         server_events: Vec<ServerEvent>,
+    },
+    InputSubmitted {
+        input_id: u32,
+        submit_start_us: u64,
+        submit_done_us: u64,
     },
     StateHash { tick: u32, hash: u64 },
     /// 自上次上報以來的網路吞吐位元組增量，含入站
@@ -59,10 +100,6 @@ pub enum LockstepEvent {
     Latency { rtt_us: u64 },
     Disconnected { reason: String },
 }
-
-/// 傳給 omfx 的輸入訊息：目標 tick + prost 的 PlayerInput payload +
-/// omfx 用來做統計的輸入 id。
-pub type LockstepInputMsg = (u32, PlayerInput, u32);
 
 /// 背景 lockstep client 的操作句柄。
 /// 丟棄時會關閉通道，下一輪迴圈使背景執行緒自然結束。
@@ -224,6 +261,7 @@ async fn run_client(
                 break;
             }
             Ok(Some(LockstepInbound::TickBatch { msg: b, wire_bytes, logical_bytes })) => {
+                let client_receive_us = wall_clock_us();
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
                 tick_batches_since_log += 1;
@@ -239,12 +277,21 @@ async fn run_client(
                     last_hb_log = now;
                     tick_batches_since_log = 0;
                 }
-                // 階段 3.3：從 `InputForPlayer` 的各列抽出
-                // `Vec<(player_id, PlayerInput)>`。
-                let inputs: Vec<(u32, PlayerInput, u32)> = b
+                // 階段 3.3：從 `InputForPlayer` 的各列抽出輸入與 edge metadata。
+                let inputs: Vec<LockstepTickInput> = b
                     .inputs
                     .into_iter()
-                    .filter_map(|ifp| ifp.input.map(|inp| (ifp.player_id, inp, ifp.input_id)))
+                    .filter_map(|ifp| {
+                        ifp.input.map(|inp| LockstepTickInput {
+                            player_id: ifp.player_id,
+                            input: inp,
+                            input_id: ifp.input_id,
+                            server_receive_tick: ifp.server_receive_tick,
+                            server_drain_tick: ifp.server_drain_tick,
+                            server_queue_us: ifp.server_queue_us,
+                            client_receive_us,
+                        })
+                    })
                     .collect();
                 let server_events = b.server_events;
                 let _ = events_tx.send(LockstepEvent::TickBatch {
@@ -287,11 +334,18 @@ async fn run_client(
 
         // 非阻塞清空待送輸入。`InputSubmit` 的位元組也會納入同一個
         // lockstep 流量總數。
-        while let Ok((target_tick, input, input_id)) = input_rx.try_recv() {
-            match client.submit_input(target_tick, input, input_id).await {
+        while let Ok(msg) = input_rx.try_recv() {
+            let submit_start_us = wall_clock_us();
+            match client.submit_input(msg.target_tick, msg.input, msg.input_id).await {
                 Ok((logical, wire)) => {
+                    let submit_done_us = wall_clock_us();
                     wire_delta += wire as u64;
                     logical_delta += logical as u64;
+                    let _ = events_tx.send(LockstepEvent::InputSubmitted {
+                        input_id: msg.input_id,
+                        submit_start_us,
+                        submit_done_us,
+                    });
                 }
                 Err(e) => warn!("lockstep-client submit_input failed: {}", e),
             }
