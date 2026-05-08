@@ -4882,6 +4882,48 @@ mod input_latency_tests {
     }
 
     #[test]
+    fn latency_sample_preserves_phase_breakdown() {
+        let mut s = sample(7, 42);
+        s.origin_kind = lockstep_client::InputOriginKind::OsEvent;
+        s.server_receive_tick = Some(10);
+        s.server_drain_tick = Some(12);
+        s.phases.server_queue_us = 15_000;
+        s.phases.forward_to_publish_us = 800;
+
+        assert_eq!(s.origin_kind, lockstep_client::InputOriginKind::OsEvent);
+        assert_eq!(s.server_receive_tick, Some(10));
+        assert_eq!(s.server_drain_tick, Some(12));
+        assert_eq!(s.phases.server_queue_us, 15_000);
+        assert_eq!(s.phases.forward_to_publish_us, 800);
+    }
+
+    #[test]
+    fn pending_input_records_auto_origin_and_server_metadata() {
+        let pending = PendingInput {
+            submit_wall_clock_us: 1_000,
+            submit_instant: Instant::now(),
+            target_tick: 24,
+            action_kind: InputActionKind::NoOp,
+            origin_kind: lockstep_client::InputOriginKind::Auto,
+            origin_us: 900,
+            send_lockstep_input_us: 1_000,
+            submit_start_us: Some(1_010),
+            submit_done_us: Some(1_020),
+            client_receive_tickbatch_us: Some(2_000),
+            game_forward_to_sim_us: Some(2_100),
+            sim_publish_snapshot_us: Some(2_200),
+            server_receive_tick: Some(22),
+            server_drain_tick: Some(24),
+            server_queue_us: Some(16_000),
+        };
+
+        assert_eq!(pending.origin_kind, lockstep_client::InputOriginKind::Auto);
+        assert_eq!(pending.origin_us, 900);
+        assert_eq!(pending.server_drain_tick, Some(24));
+        assert_eq!(pending.server_queue_us, Some(16_000));
+    }
+
+    #[test]
     fn ability_key_index_uses_wert_and_excludes_q() {
         use fyrox::keyboard::KeyCode;
 

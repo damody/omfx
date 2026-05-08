@@ -48,6 +48,12 @@ pub enum InputOriginKind {
     Direct,
 }
 
+impl Default for InputOriginKind {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LockstepInputMsg {
     pub target_tick: u32,
