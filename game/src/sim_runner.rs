@@ -18,6 +18,10 @@ use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use log::{error, info};
+use omoba_core::lockstep_timing::{
+    LOCKSTEP_DT_F32, LOCKSTEP_FIVE_SECONDS_TICKS_U32,
+    LOCKSTEP_ONE_SECOND_TICKS_U32,
+};
 
 use specs::{Join, World, WorldExt};
 
@@ -35,7 +39,7 @@ pub use omobab::lockstep::PlayerInput;
 /// 了解實際的環老化生命週期（請參閱 lib.rs `active_explosions`）。
 pub use omobab::comp::ExplosionFx;
 
-const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = 300;
+const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 const PERMANENT_BUFF_REMAINING_RAW_THRESHOLD: i64 = (i32::MAX as i64) / 2;
 
 fn buff_remaining_secs_for_snapshot(remaining: omoba_sim::Fixed64) -> f32 {
@@ -472,12 +476,12 @@ fn run_sim_loop(
         push_inputs_into_world(&mut world, batch.tick, batch.inputs);
 
         // 更新 Tick + Time + DeltaTime，以便時間閘控系統（creep_wave、
-        // 增益計時器、彈丸飛行）實際上是提前的。鎖步為 60Hz
-        // （TickBroadcaster 的tick_period_us = 16_667），所以dt = 1/60。
+        // 增益計時器、彈丸飛行）實際上是提前的。鎖步 cadence 由
+        // `omoba_core::lockstep_timing::LOCKSTEP_TPS` 定義。
         // 如果沒有這些，本地 sim 會有 Tick 前進，但時間停留在 0，
         // 這使得 `creep_wave` 看到 `totaltime=0` 並且永遠不會產生 — 完全正確
         // 為什麼 Start Round 會觸發（is_running 翻轉）但沒有小兵出現。
-        const SIM_DT_S: f32 = 1.0 / 60.0;
+        const SIM_DT_S: f32 = LOCKSTEP_DT_F32;
         world.write_resource::<omobab::comp::resources::Tick>().0 = batch.tick as u64;
         {
             let mut t = world.write_resource::<omobab::comp::resources::Time>();
@@ -653,12 +657,12 @@ fn run_sim_loop(
         );
 
         // 「蠕變 HP 條保持滿」回歸報告的診斷
-        // （第 4-5 階段鎖步清理）。每 60 個刻度 (~1s) 採樣一次
+        // （第 4-5 階段鎖步清理）。每秒採樣一次
         // 前幾個小兵的 HP 值。如果惠普永遠不會改變
         // 跑，鏡子的傷害路徑被打破；如果 HP 減少，
         // 鏡像很好，回歸僅渲染。採樣每個
         // 60 個刻度以將日誌量保持在 TD_STRESS 規模的較低水準。
-        if batch.tick % 60 == 0 {
+        if batch.tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
             let creep_hps: Vec<(u32, i32, i32)> = snapshot
                 .entities
                 .iter()
@@ -997,7 +1001,7 @@ fn extract_snapshot(
     // 診斷：轉儲實體類型直方圖+每秒採樣，以便我們可以
     // 找出 sim_runner 累積幽靈實體的原因（411 報告為
     // 空結構+BlockedRegions）。解決根本原因後刪除。
-    if tick % 60 == 0 && !out.is_empty() {
+    if tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 && !out.is_empty() {
         let mut counts = [0u32; 5];
         for e in &out {
             counts[match e.kind {

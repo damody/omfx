@@ -38,7 +38,10 @@ use std::collections::{HashMap, BinaryHeap, VecDeque};
 use std::cmp::{Ordering, Reverse};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use omoba_core::GameEventData;
+use omoba_core::{
+    lockstep_timing::{ticks_to_seconds_f64, LOCKSTEP_ONE_SECOND_TICKS_U32, LOCKSTEP_TPS},
+    GameEventData,
+};
 
 pub use fyrox;
 
@@ -72,7 +75,7 @@ fn convert_player_input(
 }
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
-const INPUT_LATENCY_CAPACITY: usize = 120;
+const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,8 +709,8 @@ pub struct Game {
     #[visit(skip)] #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
     /// 階段 4.3：觀察到最近的「LockstepEvent::TickBatch.tick」。
-    /// 用於計算輸入的“target_tick = current_sim_tick + 3”
-    /// 提交（60 Hz 時輸入延遲 50 毫秒）。透過初始化為 0
+    /// 用於計算輸入的“target_tick = current_sim_tick + INPUT_LOOKAHEAD_TICKS”
+    /// 提交（120 Hz、2 tick 時約 16.7 毫秒）。透過初始化為 0
     /// `#[導出（預設）]`;更新了 TickBatch 手臂中的每一幀
     /// `遊戲::更新`。
     #[visit(skip)] #[reflect(hidden)]
@@ -1687,7 +1690,7 @@ impl Plugin for Game {
         // - StateHash → 僅記錄（階段 3.4 將與
         // sim_runner 用於非同步偵測的本地雜湊）。
         // - 斷開連接 → 記錄。
-        // TickBatch 每 60 個刻度 (~1s @ 60Hz) 採樣一次，以避免日誌垃圾郵件。
+        // TickBatch 每秒採樣一次，以避免日誌垃圾郵件。
         if let (Some(ref lh), Some(ref sim)) = (
             self.lockstep_handle.as_ref(),
             self.sim_runner_handle.as_ref(),
@@ -1707,7 +1710,7 @@ impl Plugin for Game {
                         // 階段 4.3：追蹤輸入 target_tick 數學的最新 sim 刻度。
                         self.current_sim_tick = tick;
                         self.current_sim_tick_observed_at = Some(now);
-                        if tick % 60 == 0 {
+                        if tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
                             log::debug!(
                                 "[lockstep] tick={} inputs={} events={}",
                                 tick, inputs.len(), server_events.len()
@@ -1769,8 +1772,8 @@ impl Plugin for Game {
                 // 恢復頂線上的蜱/實體/英雄/小兵計數
                 // 英雄面板上的狀態文字和 hp / max_hp）。
                 self.heartbeat.tick = snapshot.tick as u64;
-                // sim_runner 以鎖定步滴答率（60 Hz 心律調節器）運作。
-                self.heartbeat.game_time = (snapshot.tick as f64) / 60.0;
+                // sim_runner 以共享 lockstep cadence 運作。
+                self.heartbeat.game_time = ticks_to_seconds_f64(snapshot.tick);
                 self.heartbeat.entity_count = snapshot.entities.len() as u64;
                 self.heartbeat.hero_count = snapshot.entities.iter()
                     .filter(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
@@ -3843,7 +3846,7 @@ impl Plugin for Game {
 impl Game {
     /// 階段 4.3：將 `PlayerInput` 傳送到鎖步線（omb 的鎖定步
     /// 調度程序）。如果“lockstep_handle”為“無”，則無操作（例如僅遺留模式）。
-    /// 目標刻度 = current_sim_tick + 3（60 Hz 時輸入延遲 50 毫秒）。這
+    /// 目標刻度 = current_sim_tick + INPUT_LOOKAHEAD_TICKS（120 Hz 時 2 tick 約 16.7 毫秒）。這
     /// 底層的`GameClient`（在`omoba_core::kcp::client`中）標記了
     /// `InputSubmit` 框架帶有來自 `GameStart` 的快取的 `player_id`，所以
     /// 呼叫者不需要知道自己的身分。
@@ -4639,9 +4642,9 @@ mod input_latency_tests {
     }
 
     #[test]
-    fn input_latency_meter_caps_to_recent_120_samples() {
+    fn input_latency_meter_caps_to_recent_capacity_samples() {
         let mut meter = InputLatencyMeter::default();
-        for i in 0..200 {
+        for i in 0..(INPUT_LATENCY_CAPACITY as u32 + 80) {
             meter.push(sample(i, i));
         }
         assert_eq!(meter.samples.len(), INPUT_LATENCY_CAPACITY);

@@ -17,6 +17,7 @@ use fyrox::scene::base::BaseBuilder;
 use fyrox::scene::dim2::rectangle::RectangleBuilder;
 use fyrox::scene::transform::TransformBuilder;
 use fyrox::scene::{node::Node, Scene};
+use omoba_core::lockstep_timing::LOCKSTEP_ONE_SECOND_TICKS_U32;
 
 use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
 
@@ -76,7 +77,7 @@ impl RenderBridge {
         self.ensure_paths_drawn(&snapshot.paths, scene);
         self.ensure_blocked_regions_drawn(&snapshot.blocked_regions, scene);
 
-        if snapshot.tick % 60 == 0 {
+        if snapshot.tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
             log::debug!(
                 "render_bridge: tick={} entities={} kinds={:?} paths_drawn={} regions_drawn={}",
                 snapshot.tick,
