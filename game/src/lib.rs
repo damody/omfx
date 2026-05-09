@@ -23,6 +23,7 @@ use fyrox::{
         widget::{WidgetBuilder, WidgetMessage},
         HorizontalAlignment, UiNode, UserInterface, VerticalAlignment,
     },
+    material::{Material, MaterialResource},
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
     resource::texture::{
         CompressionOptions, TextureImportOptions, TextureMinificationFilter, TextureResource,
@@ -31,7 +32,7 @@ use fyrox::{
     scene::{
         base::BaseBuilder,
         camera::{CameraBuilder, OrthographicProjection, Projection},
-        dim2::rectangle::RectangleBuilder,
+        dim2::rectangle::{Rectangle, RectangleBuilder},
         light::{point::PointLightBuilder, BaseLightBuilder},
         node::Node,
         transform::TransformBuilder,
@@ -457,6 +458,55 @@ struct TdTemplate {
     hit_radius_backend: f32,
     slow_factor: f32,
     slow_duration: f32,
+    render_mode: String,
+    base_image: String,
+    barrel_image: String,
+    barrel_frames: Vec<String>,
+    body_frames: Vec<String>,
+    barrel_animation: sim_runner::TowerRenderAnimationSnapshot,
+    body_animation: sim_runner::TowerRenderAnimationSnapshot,
+    rotation_mode: String,
+    barrel_layout: String,
+    barrel_variants: Vec<sim_runner::TowerBarrelVariantSnapshot>,
+    barrel_offset: sim_runner::TowerRenderPointSnapshot,
+    barrel_pivot: sim_runner::TowerRenderPointSnapshot,
+    muzzle_offset: sim_runner::TowerRenderPointSnapshot,
+    default_angle_deg: f32,
+    recoil: sim_runner::TowerRecoilSnapshot,
+    attack_windup: u16,
+    attack_backswing: u16,
+}
+
+#[derive(Debug)]
+struct TowerAnimationState {
+    frames: Vec<String>,
+    elapsed: f32,
+    fps: f32,
+    fire_once: bool,
+    active: bool,
+    last_frame_index: usize,
+}
+
+#[derive(Debug)]
+struct TowerRecoilState {
+    elapsed: f32,
+    duration: f32,
+    return_duration: f32,
+    dir_rad: f32,
+}
+
+#[derive(Debug)]
+struct TowerCompositeRender {
+    base_node: Handle<Node>,
+    barrel_node: Option<Handle<Node>>,
+    body_node: Option<Handle<Node>>,
+    base_material_key: String,
+    barrel_material_key: Option<String>,
+    body_material_key: Option<String>,
+    variant_count: Option<u16>,
+    last_aim_direction: f32,
+    animation: Option<TowerAnimationState>,
+    recoil: Option<TowerRecoilState>,
 }
 
 #[derive(Default, Debug)]
@@ -557,6 +607,116 @@ fn load_td_ui_texture(asset_name: &str) -> Option<TextureResource> {
         format!("../{}", frontend_rel),
     ]);
     load_texture_from_candidate_paths(candidate_paths)
+}
+
+fn normalize_tower_asset_key(asset_path: &str) -> String {
+    asset_path
+        .trim()
+        .trim_start_matches('/')
+        .strip_prefix("scripts/base_content/")
+        .unwrap_or_else(|| asset_path.trim().trim_start_matches('/'))
+        .replace('\\', "/")
+}
+
+fn load_tower_texture(asset_path: &str) -> Option<TextureResource> {
+    let asset_key = normalize_tower_asset_key(asset_path);
+    let script_rel = if asset_key.is_empty() {
+        return None;
+    } else if asset_key.starts_with("scripts/base_content/") {
+        asset_key
+    } else {
+        format!("scripts/base_content/{}", asset_key)
+    };
+    let mut candidate_paths: Vec<String> = vec![
+        script_rel.clone(),
+        format!("../{}", script_rel),
+        format!("../../{}", script_rel),
+    ];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for ancestor in exe_dir.ancestors().take(6) {
+                candidate_paths.push(ancestor.join(&script_rel).to_string_lossy().into_owned());
+            }
+        }
+    }
+    load_texture_from_candidate_paths(candidate_paths)
+}
+
+fn texture_material(texture: TextureResource) -> MaterialResource {
+    let mut material = Material::standard_2d();
+    material.bind("diffuseTexture", Some(texture));
+    MaterialResource::new_embedded(material)
+}
+
+fn tower_visual_size(tpl: &TdTemplate) -> f32 {
+    (tpl.footprint_backend * WORLD_SCALE * 4.5).clamp(0.34, 0.72)
+}
+
+fn tower_render_offset(point: &sim_runner::TowerRenderPointSnapshot, scale: f32) -> Vector2<f32> {
+    Vector2::new(point.x * WORLD_SCALE * scale, -point.y * WORLD_SCALE * scale)
+}
+
+fn rotate_vec2(v: Vector2<f32>, angle: f32) -> Vector2<f32> {
+    let (s, c) = angle.sin_cos();
+    Vector2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+fn tower_render_angle_from_facing(facing_rad: f32, default_angle_deg: f32) -> f32 {
+    std::f32::consts::FRAC_PI_2 - facing_rad + default_angle_deg.to_radians()
+}
+
+fn tower_render_dir_from_world_rad(dir_rad: f32) -> Vector2<f32> {
+    Vector2::new(-dir_rad.cos(), dir_rad.sin())
+}
+
+fn build_tower_rect_node(
+    scene: &mut Scene,
+    material: Option<MaterialResource>,
+    center: Vector2<f32>,
+    size: f32,
+    z: f32,
+    fallback_color: Color,
+) -> Handle<Node> {
+    let mut builder = RectangleBuilder::new(
+        BaseBuilder::new()
+            .with_frustum_culling(false)
+            .with_local_transform(
+                TransformBuilder::new()
+                    .with_local_position(Vector3::new(center.x, center.y, z))
+                    .with_local_scale(Vector3::new(size, size, f32::EPSILON))
+                    .build(),
+            ),
+    )
+    .with_color(if material.is_some() {
+        Color::WHITE
+    } else {
+        fallback_color
+    });
+    if let Some(material) = material {
+        builder = builder.with_material(material);
+    }
+    builder.build(&mut scene.graph).transmute()
+}
+
+fn set_tower_rect_material(
+    scene: &mut Scene,
+    node: Handle<Node>,
+    material: Option<MaterialResource>,
+    fallback_color: Color,
+) {
+    if node.is_none() {
+        return;
+    }
+    if let Some(rect) = scene.graph[node].cast_mut::<Rectangle>() {
+        if let Some(material) = material {
+            rect.material_mut().set_value_and_mark_modified(material);
+            rect.set_color(Color::WHITE);
+        } else {
+            rect.material_mut()
+                .set_value_and_mark_modified(MaterialResource::new_embedded(Material::standard_2d()));
+            rect.set_color(fallback_color);
+        }
+    }
 }
 
 /// Bomb 爆炸紅圈特效：由 0 半徑膨脹到 `max_radius`，`duration` 秒後消失。
@@ -1142,6 +1302,22 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     td_ui_texture_cache: HashMap<String, Option<TextureResource>>,
+    /// Tower combat texture/material cache：key 是 scripts/base_content 相對路徑。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_texture_cache: HashMap<String, Option<TextureResource>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_material_cache: HashMap<String, Option<MaterialResource>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_composites: HashMap<u32, TowerCompositeRender>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_last_tower_fire_tick: Option<u32>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_last_attack_phase_tick: Option<u32>,
     #[visit(skip)]
     #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
@@ -1961,6 +2137,11 @@ impl Plugin for Game {
         self.ui_td_tower_cards = Vec::new();
         self.td_tower_button_rects = Vec::new();
         self.td_ui_texture_cache = HashMap::new();
+        self.tower_texture_cache = HashMap::new();
+        self.tower_material_cache = HashMap::new();
+        self.tower_composites = HashMap::new();
+        self.sim_last_tower_fire_tick = None;
+        self.sim_last_attack_phase_tick = None;
 
         // 商店面板（初始空字串；按 B 切換顯示內容）
         self.ui_shop_text = TextBuilder::new(
@@ -2450,6 +2631,23 @@ impl Plugin for Game {
                                 hit_radius_backend: t.hit_radius,
                                 slow_factor: t.slow_factor,
                                 slow_duration: t.slow_duration,
+                                render_mode: t.render_mode.clone(),
+                                base_image: t.base_image.clone(),
+                                barrel_image: t.barrel_image.clone(),
+                                barrel_frames: t.barrel_frames.clone(),
+                                body_frames: t.body_frames.clone(),
+                                barrel_animation: t.barrel_animation.clone(),
+                                body_animation: t.body_animation.clone(),
+                                rotation_mode: t.rotation_mode.clone(),
+                                barrel_layout: t.barrel_layout.clone(),
+                                barrel_variants: t.barrel_variants.clone(),
+                                barrel_offset: t.barrel_offset.clone(),
+                                barrel_pivot: t.barrel_pivot.clone(),
+                                muzzle_offset: t.muzzle_offset.clone(),
+                                default_angle_deg: t.default_angle_deg,
+                                recoil: t.recoil.clone(),
+                                attack_windup: t.attack_windup,
+                                attack_backswing: t.attack_backswing,
                             },
                         );
                     }
@@ -2959,7 +3157,7 @@ impl Plugin for Game {
         // 早期的 4.2 render_bridge — 每個實體曾經是單獨的場景
         // 節點 = 單獨的繪製呼叫（1000 個實體→ 3000+ 繪製）。現在的
         // 整個實體集經歷 2-3 個批次網格 = 總共 2-3 個繪製。
-        self.update_sim_batches();
+        self.update_sim_batches(scene, context.dt);
 
         // Batched mesh flush：interp loop 寫進各 batch 的 cpu_mirror，這裡一次性
         // upload 整批 vertex buffer 到 GPU。每個 batch = 1 個 mesh = 1 個 draw call。
@@ -5424,6 +5622,404 @@ impl Game {
         texture
     }
 
+    fn tower_texture_for_key(&mut self, key: &str) -> Option<TextureResource> {
+        let key = normalize_tower_asset_key(key);
+        if key.is_empty() {
+            return None;
+        }
+        if let Some(cached) = self.tower_texture_cache.get(&key) {
+            return cached.clone();
+        }
+        let texture = load_tower_texture(&key);
+        if texture.is_none() {
+            log::warn!(
+                "tower combat texture '{}' not found; using colored fallback",
+                key
+            );
+        }
+        self.tower_texture_cache.insert(key, texture.clone());
+        texture
+    }
+
+    fn tower_material_for_key(&mut self, key: &str) -> Option<MaterialResource> {
+        let key = normalize_tower_asset_key(key);
+        if key.is_empty() {
+            return None;
+        }
+        if let Some(cached) = self.tower_material_cache.get(&key) {
+            return cached.clone();
+        }
+        let material = self.tower_texture_for_key(&key).map(texture_material);
+        self.tower_material_cache.insert(key, material.clone());
+        material
+    }
+
+    fn selected_barrel_variant(
+        &self,
+        tpl: &TdTemplate,
+        upgrade_levels: [u8; 3],
+    ) -> Option<sim_runner::TowerBarrelVariantSnapshot> {
+        if tpl.barrel_layout != "radial_count_variants" {
+            return None;
+        }
+        tpl.barrel_variants
+            .iter()
+            .filter(|variant| {
+                let path_idx = variant.min_path.saturating_sub(1) as usize;
+                let level = upgrade_levels.get(path_idx).copied().unwrap_or(0);
+                level >= variant.min_level
+            })
+            .max_by_key(|variant| (variant.min_level, variant.count))
+            .cloned()
+    }
+
+    fn remove_tower_composite(&mut self, scene: &mut Scene, entity_id: u32) {
+        if let Some(comp) = self.tower_composites.remove(&entity_id) {
+            if let Some(barrel) = comp.barrel_node {
+                if barrel != comp.base_node {
+                    scene.graph.remove_node(barrel);
+                }
+            }
+            if let Some(body) = comp.body_node {
+                if body != comp.base_node {
+                    scene.graph.remove_node(body);
+                }
+            }
+            scene.graph.remove_node(comp.base_node);
+        }
+    }
+
+    fn start_tower_animation(
+        &mut self,
+        entity_id: u32,
+        frames: Vec<String>,
+        animation: &sim_runner::TowerRenderAnimationSnapshot,
+        impact_at_ms: u32,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+        let impact_secs = impact_at_ms as f32 / 1000.0;
+        let fps = if frames.len() > 1 && impact_secs > 0.0 {
+            ((frames.len() - 1) as f32 / impact_secs).max(1.0)
+        } else {
+            animation.fire_fps.max(animation.fps).max(1.0)
+        };
+        if let Some(comp) = self.tower_composites.get_mut(&entity_id) {
+            comp.animation = Some(TowerAnimationState {
+                frames,
+                elapsed: 0.0,
+                fps,
+                fire_once: animation.fire_once,
+                active: true,
+                last_frame_index: usize::MAX,
+            });
+        }
+    }
+
+    fn update_tower_composite(
+        &mut self,
+        scene: &mut Scene,
+        entity: &sim_runner::EntityRenderData,
+        tpl: &TdTemplate,
+        pos: Vector2<f32>,
+        dt: f32,
+        attack_cue: Option<&sim_runner::AttackPhaseFx>,
+        fire_cue: Option<&sim_runner::TowerFireFx>,
+    ) {
+        let upgrade_levels = entity.upgrade_levels.unwrap_or([0; 3]);
+        let selected_variant = self.selected_barrel_variant(tpl, upgrade_levels);
+        let is_animated_area = tpl.render_mode == "animated_area";
+        let base_key = normalize_tower_asset_key(if is_animated_area {
+            tpl.body_frames
+                .first()
+                .map(String::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&tpl.base_image)
+        } else {
+            &tpl.base_image
+        });
+        let barrel_key = normalize_tower_asset_key(
+            selected_variant
+                .as_ref()
+                .map(|v| v.image.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&tpl.barrel_image),
+        );
+        let active_frames: Vec<String> = if is_animated_area {
+            if tpl.body_frames.is_empty() {
+                vec![base_key.clone()]
+            } else {
+                tpl.body_frames.clone()
+            }
+        } else if let Some(variant) = selected_variant.as_ref() {
+            if variant.frames.is_empty() {
+                vec![barrel_key.clone()]
+            } else {
+                variant.frames.clone()
+            }
+        } else if tpl.barrel_frames.is_empty() {
+            vec![barrel_key.clone()]
+        } else {
+            tpl.barrel_frames.clone()
+        };
+        let animation_meta = if is_animated_area {
+            &tpl.body_animation
+        } else {
+            &tpl.barrel_animation
+        };
+        let base_size = tower_visual_size(tpl);
+        let base_material = self.tower_material_for_key(&base_key);
+        let barrel_material = (!is_animated_area)
+            .then(|| self.tower_material_for_key(&barrel_key))
+            .flatten();
+        let fallback_color = Color::from_rgba(120, 120, 255, 255);
+        if !self.tower_composites.contains_key(&entity.entity_id) {
+            let base_node = build_tower_rect_node(
+                scene,
+                base_material.clone(),
+                pos,
+                base_size,
+                Z_TOWER,
+                fallback_color,
+            );
+            let barrel_node = if is_animated_area {
+                None
+            } else {
+                Some(build_tower_rect_node(
+                    scene,
+                    barrel_material.clone(),
+                    pos,
+                    base_size,
+                    Z_TOWER - 0.04,
+                    Color::from_rgba(35, 35, 35, 255),
+                ))
+            };
+            self.tower_composites.insert(
+                entity.entity_id,
+                TowerCompositeRender {
+                    base_node,
+                    barrel_node,
+                    body_node: None,
+                    base_material_key: base_key.clone(),
+                    barrel_material_key: (!is_animated_area).then(|| barrel_key.clone()),
+                    body_material_key: is_animated_area.then(|| base_key.clone()),
+                    variant_count: selected_variant.as_ref().map(|v| v.count),
+                    last_aim_direction: tower_render_angle_from_facing(
+                        entity.facing_rad,
+                        tpl.default_angle_deg,
+                    ),
+                    animation: None,
+                    recoil: None,
+                },
+            );
+        }
+
+        let mut material_updates: Vec<(Handle<Node>, String, Color)> = Vec::new();
+        let mut animation_to_start: Option<(Vec<String>, u32)> = None;
+        {
+            let Some(comp) = self.tower_composites.get_mut(&entity.entity_id) else {
+                return;
+            };
+
+            if comp.base_material_key != base_key {
+                comp.base_material_key = base_key.clone();
+                comp.body_material_key = is_animated_area.then(|| base_key.clone());
+                material_updates.push((comp.base_node, base_key.clone(), fallback_color));
+            }
+            if !is_animated_area {
+                let variant_count = selected_variant.as_ref().map(|v| v.count);
+                if comp.barrel_material_key.as_deref() != Some(barrel_key.as_str())
+                    || comp.variant_count != variant_count
+                {
+                    comp.barrel_material_key = Some(barrel_key.clone());
+                    comp.variant_count = variant_count;
+                    comp.animation = None;
+                    if let Some(barrel) = comp.barrel_node {
+                        material_updates.push((barrel, barrel_key.clone(), Color::from_rgba(35, 35, 35, 255)));
+                    }
+                }
+            }
+
+            if let Some(cue) = attack_cue.filter(|cue| cue.entity_gen == entity.entity_gen) {
+                if tpl.rotation_mode != "fixed" && cue.dir_rad.is_finite() {
+                    comp.last_aim_direction = tower_render_angle_from_facing(cue.dir_rad, tpl.default_angle_deg);
+                }
+                animation_to_start = Some((active_frames.clone(), cue.impact_at_ms));
+            }
+            if let Some(cue) = fire_cue.filter(|cue| cue.entity_gen == entity.entity_gen) {
+                comp.recoil = Some(TowerRecoilState {
+                    elapsed: 0.0,
+                    duration: (tpl.recoil.duration_ms as f32 / 1000.0).max(0.001),
+                    return_duration: (tpl.recoil.return_ms as f32 / 1000.0).max(0.001),
+                    dir_rad: cue.dir_rad,
+                });
+                if comp.animation.as_ref().map(|a| !a.active).unwrap_or(true) {
+                    animation_to_start = Some((active_frames.clone(), tpl.recoil.duration_ms));
+                }
+            }
+        }
+
+        if let Some((frames, impact_at_ms)) = animation_to_start {
+            self.start_tower_animation(entity.entity_id, frames, animation_meta, impact_at_ms);
+        }
+
+        let mut post_material_updates: Vec<(Handle<Node>, String, Color)> = Vec::new();
+        {
+            let Some(comp) = self.tower_composites.get_mut(&entity.entity_id) else {
+                return;
+            };
+            let default_angle = tpl.default_angle_deg.to_radians();
+            let aim_angle = if tpl.rotation_mode == "fixed" {
+                default_angle
+            } else if entity.facing_rad.is_finite() {
+                let angle = tower_render_angle_from_facing(entity.facing_rad, tpl.default_angle_deg);
+                comp.last_aim_direction = angle;
+                angle
+            } else {
+                comp.last_aim_direction
+            };
+
+            if comp.animation.is_none() && animation_meta.loop_animation && active_frames.len() > 1 {
+                comp.animation = Some(TowerAnimationState {
+                    frames: active_frames.clone(),
+                    elapsed: 0.0,
+                    fps: animation_meta.fps.max(1.0),
+                    fire_once: false,
+                    active: false,
+                    last_frame_index: usize::MAX,
+                });
+            }
+            if comp
+                .animation
+                .as_ref()
+                .map(|a| !a.active && a.frames != active_frames && animation_meta.loop_animation)
+                .unwrap_or(false)
+            {
+                comp.animation = Some(TowerAnimationState {
+                    frames: active_frames.clone(),
+                    elapsed: 0.0,
+                    fps: animation_meta.fps.max(1.0),
+                    fire_once: false,
+                    active: false,
+                    last_frame_index: usize::MAX,
+                });
+            }
+
+            if let Some(anim) = comp.animation.as_mut() {
+                if !anim.frames.is_empty() {
+                    let frame_duration = (1.0 / anim.fps.max(1.0)).max(0.001);
+                    let total_duration = frame_duration * anim.frames.len() as f32;
+                    let raw_index = (anim.elapsed / frame_duration).floor() as usize;
+                    let frame_index = if anim.fire_once {
+                        raw_index.min(anim.frames.len().saturating_sub(1))
+                    } else {
+                        raw_index % anim.frames.len()
+                    };
+                    if frame_index != anim.last_frame_index {
+                        anim.last_frame_index = frame_index;
+                        let key = normalize_tower_asset_key(&anim.frames[frame_index]);
+                        let target = if is_animated_area {
+                            comp.base_node
+                        } else {
+                            comp.barrel_node.unwrap_or(comp.base_node)
+                        };
+                        let color = if is_animated_area {
+                            fallback_color
+                        } else {
+                            Color::from_rgba(35, 35, 35, 255)
+                        };
+                        post_material_updates.push((target, key.clone(), color));
+                        if is_animated_area {
+                            comp.base_material_key = key.clone();
+                            comp.body_material_key = Some(key);
+                        } else {
+                            comp.barrel_material_key = Some(key);
+                        }
+                    }
+                    anim.elapsed += dt.max(0.0);
+                    if anim.fire_once && anim.elapsed >= total_duration {
+                        if animation_meta.loop_animation && active_frames.len() > 1 {
+                            *anim = TowerAnimationState {
+                                frames: active_frames.clone(),
+                                elapsed: 0.0,
+                                fps: animation_meta.fps.max(1.0),
+                                fire_once: false,
+                                active: false,
+                                last_frame_index: usize::MAX,
+                            };
+                        } else {
+                            comp.animation = None;
+                        }
+                    }
+                }
+            }
+
+            let mut recoil_offset = Vector2::new(0.0, 0.0);
+            let mut recoil_scale = 1.0_f32;
+            if let Some(recoil) = comp.recoil.as_mut() {
+                let total = recoil.duration + recoil.return_duration;
+                let t = recoil.elapsed.min(total);
+                let attack_phase = t <= recoil.duration;
+                let amount = if attack_phase {
+                    (t / recoil.duration).clamp(0.0, 1.0)
+                } else {
+                    (1.0 - ((t - recoil.duration) / recoil.return_duration)).clamp(0.0, 1.0)
+                };
+                let min_scale = tpl.recoil.scale.clamp(0.2, 1.5);
+                recoil_scale = if attack_phase {
+                    1.0 + (min_scale - 1.0) * amount
+                } else {
+                    1.0 + (min_scale - 1.0) * amount
+                };
+                if tpl.recoil.mode != "scale_pulse" {
+                    let dir = tower_render_dir_from_world_rad(recoil.dir_rad);
+                    recoil_offset = -dir * (tpl.recoil.distance * WORLD_SCALE * amount);
+                }
+                recoil.elapsed += dt.max(0.0);
+                if recoil.elapsed >= total {
+                    comp.recoil = None;
+                }
+            }
+
+            let scale = recoil_scale.max(0.05);
+            scene.graph[comp.base_node]
+                .local_transform_mut()
+                .set_position(Vector3::new(pos.x + recoil_offset.x, pos.y + recoil_offset.y, Z_TOWER))
+                .set_rotation(UnitQuaternion::identity())
+                .set_scale(Vector3::new(base_size * scale, base_size * scale, f32::EPSILON));
+
+            if let Some(barrel) = comp.barrel_node {
+                if !is_animated_area {
+                    let offset = tower_render_offset(&tpl.barrel_offset, scale);
+                    let pivot_to_center = Vector2::new(
+                        (0.5 - tpl.barrel_pivot.x) * base_size * scale,
+                        (tpl.barrel_pivot.y - 0.5) * base_size * scale,
+                    );
+                    let barrel_center = pos
+                        + recoil_offset
+                        + offset
+                        + rotate_vec2(pivot_to_center, aim_angle);
+                    scene.graph[barrel]
+                        .local_transform_mut()
+                        .set_position(Vector3::new(
+                            barrel_center.x,
+                            barrel_center.y,
+                            Z_TOWER - 0.04,
+                        ))
+                        .set_rotation(UnitQuaternion::from_axis_angle(&Vector3::z_axis(), aim_angle))
+                        .set_scale(Vector3::new(base_size * scale, base_size * scale, f32::EPSILON));
+                }
+            }
+        }
+
+        material_updates.extend(post_material_updates);
+        for (node, key, color) in material_updates {
+            let material = self.tower_material_for_key(&key);
+            set_tower_rect_material(scene, node, material, color);
+        }
+    }
+
     /// 階段 4.3：將 `PlayerInput` 傳送到鎖步線（omb 的鎖定步
     /// 調度程序）。如果“lockstep_handle”為“無”，則無操作（例如僅遺留模式）。
     /// 目標刻度 = current_sim_tick + INPUT_LOOKAHEAD_TICKS（120 Hz 時 2 tick 約 16.7 毫秒）。這
@@ -5439,13 +6035,31 @@ impl Game {
     /// 共享 body_batch + hp_batch CPU 映像。為每個實體分配一個插槽
     /// 第一次見到時；釋放輟學時的插槽。 EntityKind::其他是
     /// 已跳過（不應呈現 RegionBlocker 等內部 ECS 行）。
-    fn update_sim_batches(&mut self) {
-        let Some(ref sim) = self.sim_runner_handle else {
+    fn update_sim_batches(&mut self, scene: &mut Scene, dt: f32) {
+        let Some(sim_state) = self.sim_runner_handle.as_ref().map(|sim| sim.state.clone()) else {
             return;
         };
-        let Ok(snapshot) = sim.state.try_lock() else {
+        let Ok(snapshot) = sim_state.try_lock() else {
             return;
         };
+
+        let mut attack_cues: HashMap<u32, &sim_runner::AttackPhaseFx> = HashMap::new();
+        if !snapshot.attack_phase_fx.is_empty()
+            && self.sim_last_attack_phase_tick != Some(snapshot.tick)
+        {
+            for cue in &snapshot.attack_phase_fx {
+                attack_cues.entry(cue.entity_id).or_insert(cue);
+            }
+            self.sim_last_attack_phase_tick = Some(snapshot.tick);
+        }
+        let mut fire_cues: HashMap<u32, &sim_runner::TowerFireFx> = HashMap::new();
+        if !snapshot.tower_fire_fx.is_empty() && self.sim_last_tower_fire_tick != Some(snapshot.tick)
+        {
+            for cue in &snapshot.tower_fire_fx {
+                fire_cues.entry(cue.entity_id).or_insert(cue);
+            }
+            self.sim_last_tower_fire_tick = Some(snapshot.tick);
+        }
 
         let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
         for e in &snapshot.entities {
@@ -5456,6 +6070,23 @@ impl Game {
 
             let pos = render_bridge::world_to_render(e);
             let (color, size, z) = render_bridge::style_for_entity(e);
+            let tower_template = if matches!(e.kind, sim_runner::EntityKind::Tower) {
+                self.td_templates.get(&e.unit_id).cloned()
+            } else {
+                None
+            };
+            let uses_composite_tower = tower_template.is_some();
+            if let Some(tpl) = tower_template.as_ref() {
+                self.update_tower_composite(
+                    scene,
+                    e,
+                    tpl,
+                    pos,
+                    dt,
+                    attack_cues.get(&e.entity_id).copied(),
+                    fire_cues.get(&e.entity_id).copied(),
+                );
+            }
 
             // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
             let slots_entry = self.sim_entity_slots.entry(e.entity_id);
@@ -5510,6 +6141,18 @@ impl Game {
                     );
                 }
             } else if let Some(batch) = self.body_batch.as_mut() {
+                if uses_composite_tower {
+                    batch.write_quad(
+                        slots.body_slot,
+                        &sprite_resources::QuadParams {
+                            center: pos,
+                            size: Vector2::new(0.001, 0.001),
+                            color: [0, 0, 0, 0],
+                            rotation: 0.0,
+                            z,
+                        },
+                    );
+                } else {
                 batch.write_quad(
                     slots.body_slot,
                     &sprite_resources::QuadParams {
@@ -5520,6 +6163,7 @@ impl Game {
                         z,
                     },
                 );
+                }
             }
 
             // HP 條（背景 + 目標）。惰性分配 — 彈體 + 不含馬力的實體
@@ -5587,9 +6231,8 @@ impl Game {
             let wants_turret = matches!(
                 e.kind,
                 sim_runner::EntityKind::Hero
-                    | sim_runner::EntityKind::Tower
                     | sim_runner::EntityKind::Creep,
-            );
+            ) || (matches!(e.kind, sim_runner::EntityKind::Tower) && !uses_composite_tower);
             if wants_turret {
                 if slots.turret_slot.is_none() {
                     if let Some(batch) = self.facing_batch.as_mut() {
@@ -5637,6 +6280,7 @@ impl Game {
         // 遺留的線路端「entity.death」事件。下面的掃描保持為
         // 對早於第一個 prev_alive 集的早期幀 eids 的防禦。
         for &eid in &snapshot.removed_entity_ids {
+            self.remove_tower_composite(scene, eid);
             if let Some(slots) = self.sim_entity_slots.remove(&eid) {
                 if let Some(batch) = self.body_batch.as_mut() {
                     batch.free(slots.body_slot);
@@ -5665,6 +6309,7 @@ impl Game {
             .copied()
             .collect();
         for id in to_remove {
+            self.remove_tower_composite(scene, id);
             if let Some(slots) = self.sim_entity_slots.remove(&id) {
                 if let Some(batch) = self.body_batch.as_mut() {
                     batch.free(slots.body_slot);

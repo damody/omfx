@@ -69,6 +69,7 @@ pub struct AppliedInputMeta {
 /// 爆炸發生；渲染線程使用 omfx 掛鐘
 /// 了解實際的環老化生命週期（請參閱 lib.rs `active_explosions`）。
 pub use omobab::comp::ExplosionFx;
+pub use omobab::comp::{AttackPhaseFx, TowerFireFx};
 
 const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 const PERMANENT_BUFF_REMAINING_RAW_THRESHOLD: i64 = (i32::MAX as i64) / 2;
@@ -147,6 +148,8 @@ pub struct SimWorldSnapshot {
     /// 針對 omfx 掛鐘，每個條目都會擴展紅色環；模擬永遠不會
     /// 讀回這個，所以它不是決定論狀態的一部分。
     pub explosions: Vec<ExplosionFx>,
+    pub tower_fire_fx: Vec<TowerFireFx>,
+    pub attack_phase_fx: Vec<AttackPhaseFx>,
     /// 用於輸入到渲染延遲配對的僅限 omfx 元資料； sim ECS 不讀取它。
     pub applied_input_ids: Vec<u32>,
     /// Per-input phase metadata mirrored from wire-edge state; sim ECS does not read it.
@@ -188,6 +191,38 @@ pub struct TowerUpgradeDefSnapshot {
     pub cost: i32,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TowerRenderPointSnapshot {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TowerRenderAnimationSnapshot {
+    pub fps: f32,
+    pub loop_animation: bool,
+    pub fire_fps: f32,
+    pub fire_once: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TowerBarrelVariantSnapshot {
+    pub min_path: u8,
+    pub min_level: u8,
+    pub count: u16,
+    pub image: String,
+    pub frames: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TowerRecoilSnapshot {
+    pub mode: String,
+    pub distance: f32,
+    pub scale: f32,
+    pub duration_ms: u32,
+    pub return_ms: u32,
+}
+
 /// 右側 TD 建立選單的 TowerTemplate 投影。鏡像
 /// 欄位 lib.rs 的 `TdTemplate` 快取需求（按鈕的標籤/成本
 /// + 佈局預覽的足跡/範圍）。源自
@@ -203,6 +238,23 @@ pub struct TowerTemplateSnapshot {
     pub hit_radius: f32,
     pub slow_factor: f32,
     pub slow_duration: f32,
+    pub render_mode: String,
+    pub base_image: String,
+    pub barrel_image: String,
+    pub barrel_frames: Vec<String>,
+    pub body_frames: Vec<String>,
+    pub barrel_animation: TowerRenderAnimationSnapshot,
+    pub body_animation: TowerRenderAnimationSnapshot,
+    pub rotation_mode: String,
+    pub barrel_layout: String,
+    pub barrel_variants: Vec<TowerBarrelVariantSnapshot>,
+    pub barrel_offset: TowerRenderPointSnapshot,
+    pub barrel_pivot: TowerRenderPointSnapshot,
+    pub muzzle_offset: TowerRenderPointSnapshot,
+    pub default_angle_deg: f32,
+    pub recoil: TowerRecoilSnapshot,
+    pub attack_windup: u16,
+    pub attack_backswing: u16,
 }
 
 /// 最後從 ECS World 中提取的每個實體渲染數據
@@ -648,6 +700,59 @@ fn run_sim_loop(
                             hit_radius: t.hit_radius,
                             slow_factor: t.slow_factor,
                             slow_duration: t.slow_duration,
+                            render_mode: t.render.render_mode.clone(),
+                            base_image: t.render.base.clone(),
+                            barrel_image: t.render.barrel.clone(),
+                            barrel_frames: t.render.barrel_frames.clone(),
+                            body_frames: t.render.body_frames.clone(),
+                            barrel_animation: TowerRenderAnimationSnapshot {
+                                fps: t.render.barrel_animation.fps,
+                                loop_animation: t.render.barrel_animation.loop_animation,
+                                fire_fps: t.render.barrel_animation.fire_fps,
+                                fire_once: t.render.barrel_animation.fire_once,
+                            },
+                            body_animation: TowerRenderAnimationSnapshot {
+                                fps: t.render.body_animation.fps,
+                                loop_animation: t.render.body_animation.loop_animation,
+                                fire_fps: t.render.body_animation.fire_fps,
+                                fire_once: t.render.body_animation.fire_once,
+                            },
+                            rotation_mode: t.render.rotation_mode.clone(),
+                            barrel_layout: t.render.barrel_layout.clone(),
+                            barrel_variants: t
+                                .render
+                                .barrel_variants
+                                .iter()
+                                .map(|v| TowerBarrelVariantSnapshot {
+                                    min_path: v.min_path,
+                                    min_level: v.min_level,
+                                    count: v.count,
+                                    image: v.image.clone(),
+                                    frames: v.frames.clone(),
+                                })
+                                .collect(),
+                            barrel_offset: TowerRenderPointSnapshot {
+                                x: t.render.barrel_offset.x,
+                                y: t.render.barrel_offset.y,
+                            },
+                            barrel_pivot: TowerRenderPointSnapshot {
+                                x: t.render.barrel_pivot.x,
+                                y: t.render.barrel_pivot.y,
+                            },
+                            muzzle_offset: TowerRenderPointSnapshot {
+                                x: t.render.muzzle_offset.x,
+                                y: t.render.muzzle_offset.y,
+                            },
+                            default_angle_deg: t.render.default_angle_deg,
+                            recoil: TowerRecoilSnapshot {
+                                mode: t.render.recoil.mode.clone(),
+                                distance: t.render.recoil.distance,
+                                scale: t.render.recoil.scale,
+                                duration_ms: t.render.recoil.duration_ms,
+                                return_ms: t.render.recoil.return_ms,
+                            },
+                            attack_windup: t.attack_timing.windup,
+                            attack_backswing: t.attack_timing.backswing,
                         })
                         .collect(),
                 );
@@ -1167,6 +1272,14 @@ fn extract_snapshot(
         let mut q = world.write_resource::<omobab::comp::ExplosionFxQueue>();
         std::mem::take(&mut q.pending)
     };
+    let tower_fire_fx: Vec<TowerFireFx> = {
+        let mut q = world.write_resource::<omobab::comp::TowerFireFxQueue>();
+        std::mem::take(&mut q.pending)
+    };
+    let attack_phase_fx: Vec<AttackPhaseFx> = {
+        let mut q = world.write_resource::<omobab::comp::AttackPhaseFxQueue>();
+        std::mem::take(&mut q.pending)
+    };
 
     SimWorldSnapshot {
         tick,
@@ -1182,6 +1295,8 @@ fn extract_snapshot(
         tower_templates: tower_templates_arc,
         tower_upgrades: tower_upgrades_arc,
         explosions,
+        tower_fire_fx,
+        attack_phase_fx,
         applied_input_ids,
         applied_input_meta,
     }
@@ -1201,6 +1316,7 @@ pub fn smoke() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn smoke_links() {
@@ -1212,6 +1328,65 @@ mod tests {
         let s = SimWorldSnapshot::default();
         assert_eq!(s.tick, 0);
         assert!(s.entities.is_empty());
+    }
+
+    #[test]
+    fn tower_template_snapshot_carries_render_metadata_in_shared_arc() {
+        let templates = Arc::new(vec![TowerTemplateSnapshot {
+            unit_id: "tower_dart".to_string(),
+            label: "Dart".to_string(),
+            cost: 200,
+            footprint: 10.0,
+            range: 350.0,
+            splash_radius: 0.0,
+            hit_radius: 0.0,
+            slow_factor: 0.0,
+            slow_duration: 0.0,
+            render_mode: "base_barrel".to_string(),
+            base_image: "assets/towers/tower_dart_base.png".to_string(),
+            barrel_image: "assets/towers/tower_dart_barrel.png".to_string(),
+            barrel_frames: vec!["assets/towers/tower_dart_barrel_frame_01.png".to_string()],
+            body_frames: Vec::new(),
+            barrel_animation: TowerRenderAnimationSnapshot {
+                fps: 12.0,
+                loop_animation: true,
+                fire_fps: 22.0,
+                fire_once: true,
+            },
+            body_animation: TowerRenderAnimationSnapshot::default(),
+            rotation_mode: "targeted".to_string(),
+            barrel_layout: "single".to_string(),
+            barrel_variants: Vec::new(),
+            barrel_offset: TowerRenderPointSnapshot { x: 0.0, y: -6.0 },
+            barrel_pivot: TowerRenderPointSnapshot { x: 0.5, y: 0.66 },
+            muzzle_offset: TowerRenderPointSnapshot { x: 0.0, y: -30.0 },
+            default_angle_deg: 0.0,
+            recoil: TowerRecoilSnapshot {
+                mode: "directional".to_string(),
+                distance: 6.0,
+                scale: 0.95,
+                duration_ms: 60,
+                return_ms: 95,
+            },
+            attack_windup: 350,
+            attack_backswing: 650,
+        }]);
+        let first = SimWorldSnapshot {
+            tower_templates: templates.clone(),
+            ..Default::default()
+        };
+        let second = SimWorldSnapshot {
+            tower_templates: templates.clone(),
+            ..Default::default()
+        };
+
+        assert!(Arc::ptr_eq(&first.tower_templates, &second.tower_templates));
+        let dart = &first.tower_templates[0];
+        assert_eq!(dart.render_mode, "base_barrel");
+        assert_eq!(dart.base_image, "assets/towers/tower_dart_base.png");
+        assert_eq!(dart.barrel_image, "assets/towers/tower_dart_barrel.png");
+        assert_eq!(dart.rotation_mode, "targeted");
+        assert_eq!(dart.recoil.mode, "directional");
     }
 
     #[test]
