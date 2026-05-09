@@ -274,6 +274,7 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 
 // 後端→渲染座標比例（後端使用800等大單位）
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
+const TD_TOWER_VISUAL_SCALE: f32 = 2.0;
 const UI_HIDDEN_POS: f32 = -9999.0;
 const TD_UI_MAX_UPGRADE_LEVEL: u8 = 4;
 const TD_SHOP_LAYOUT_DEBUG_MIN_CARDS: usize = 20;
@@ -649,7 +650,7 @@ fn texture_material(texture: TextureResource) -> MaterialResource {
 }
 
 fn tower_visual_size(tpl: &TdTemplate) -> f32 {
-    (tpl.footprint_backend * WORLD_SCALE * 4.5).clamp(0.34, 0.72)
+    (tpl.footprint_backend * WORLD_SCALE * 4.5).clamp(0.34, 0.72) * TD_TOWER_VISUAL_SCALE
 }
 
 fn tower_render_offset(point: &sim_runner::TowerRenderPointSnapshot, scale: f32) -> Vector2<f32> {
@@ -6076,6 +6077,10 @@ impl Game {
                 None
             };
             let uses_composite_tower = tower_template.is_some();
+            let hp_anchor_size = tower_template
+                .as_ref()
+                .map(tower_visual_size)
+                .unwrap_or(size);
             if let Some(tpl) = tower_template.as_ref() {
                 self.update_tower_composite(
                     scene,
@@ -6178,9 +6183,9 @@ impl Game {
                 if let (Some(bg), Some(fg)) = (slots.hp_bg_slot, slots.hp_fg_slot) {
                     // Red Alert 2 風格：黑色外框 + 鮮豔填充色。bg 全寬、fg 內縮一圈
                     // 留 2-3 px 黑邊當 outline。HP 從右邊縮（左對齊）— RA2 慣例。
-                    let bar_w = (size * 1.6).max(0.5);
+                    let bar_w = (hp_anchor_size * 1.6).max(0.5);
                     let bar_h = 0.18_f32;
-                    let bar_y = pos.y + size * 0.7;
+                    let bar_y = pos.y + hp_anchor_size * 0.7;
                     let pad = 0.04_f32; // 黑外框視覺寬度
                     let inner_w = (bar_w - pad * 2.0).max(0.001);
                     let inner_h = (bar_h - pad * 2.0).max(0.001);
