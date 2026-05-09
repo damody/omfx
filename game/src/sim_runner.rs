@@ -177,13 +177,14 @@ pub struct AbilityDefSnapshot {
 }
 
 /// TowerUpgradeDef 投影 — 僅銷售/升級面板的字段
-/// 需求（按鈕標籤名稱、退款計算成本）。
+/// 需求（按鈕標籤名稱、效果描述、退款計算成本）。
 #[derive(Clone, Debug)]
 pub struct TowerUpgradeDefSnapshot {
     pub tower_kind: String,
     pub path: u8,
     pub level: u8,
     pub name: String,
+    pub description: String,
     pub cost: i32,
 }
 
@@ -670,6 +671,7 @@ fn run_sim_loop(
                     path: d.path,
                     level: d.level,
                     name: d.name.clone(),
+                    description: d.description.clone(),
                     cost: d.cost,
                 })
                 .collect();
