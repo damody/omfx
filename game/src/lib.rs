@@ -13,9 +13,10 @@ use fyrox::{
         reflect::prelude::*,
         visitor::prelude::*,
     },
-    event::{ElementState, Event, MouseButton, WindowEvent},
+    event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     gui::{
         brush::Brush,
+        canvas::CanvasBuilder,
         image::{ImageBuilder, ImageMessage},
         message::{MessageDirection, UiMessage},
         text::{Text, TextBuilder, TextMessage},
@@ -55,6 +56,8 @@ mod lockstep_client;
 mod render_bridge;
 mod sim_runner;
 mod sprite_resources;
+
+const ABILITY_ICON_FALLBACK_PATH: &str = "data/ability_icons/ability_default_placeholder.png";
 
 /// 兩種不同的「PlayerInput」 Rust 類型之間的橋樑：omoba_core's
 /// kcp 用戶端使用自己的 prost 產生的 `proto/game.proto` 副本，
@@ -272,6 +275,73 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
 const UI_HIDDEN_POS: f32 = -9999.0;
 const TD_UI_MAX_UPGRADE_LEVEL: u8 = 4;
+const TD_SHOP_LAYOUT_DEBUG_MIN_CARDS: usize = 20;
+const TD_UI_REF_W: f32 = 1920.0;
+const TD_UI_REF_H: f32 = 1080.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UiRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl UiRect {
+    fn pos(self) -> Vector2<f32> {
+        Vector2::new(self.x, self.y)
+    }
+
+    fn tuple(self) -> (f32, f32, f32, f32) {
+        (self.x, self.y, self.w, self.h)
+    }
+
+    fn right(self) -> f32 {
+        self.x + self.w
+    }
+
+    fn bottom(self) -> f32 {
+        self.y + self.h
+    }
+
+    fn contains(self, p: Vector2<f32>) -> bool {
+        p.x >= self.x && p.x <= self.right() && p.y >= self.y && p.y <= self.bottom()
+    }
+
+    fn intersection(self, other: UiRect) -> Option<UiRect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = self.right().min(other.right());
+        let y1 = self.bottom().min(other.bottom());
+        if x1 > x0 && y1 > y0 {
+            Some(UiRect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn td_ui_ref_scale(window_size: Vector2<f32>) -> (f32, f32) {
+    (
+        (window_size.x.max(1.0) / TD_UI_REF_W).max(0.01),
+        (window_size.y.max(1.0) / TD_UI_REF_H).max(0.01),
+    )
+}
+
+fn td_ui_ref_rect(window_size: Vector2<f32>, x: f32, y: f32, w: f32, h: f32) -> UiRect {
+    let (sx, sy) = td_ui_ref_scale(window_size);
+    UiRect {
+        x: x * sx,
+        y: y * sy,
+        w: w * sx,
+        h: h * sy,
+    }
+}
 
 // 3D 相機視錐體中的 Z 層（相機在 z=-100 看 +Z，近=0.1 遠=1000）。
 // SMALLER Z = closer to camera = drawn on top (industry-standard 3D 慣例)。
@@ -391,36 +461,44 @@ struct TdTowerShopCard {
 struct TdRightShopPanel {
     bg: Handle<UiNode>,
     title_text: Handle<Text>,
+    viewport_bg: Handle<UiNode>,
+    scroll_track: Handle<UiNode>,
+    scroll_thumb: Handle<UiNode>,
     pause_icon: Handle<UiNode>,
     pause_text: Handle<Text>,
     start_icon: Handle<UiNode>,
+    panel_rect: UiRect,
+    viewport_rect: UiRect,
+    scroll_track_rect: UiRect,
+    scroll_thumb_rect: UiRect,
+    pause_rect: UiRect,
+    start_rect: UiRect,
 }
 
 #[derive(Default, Debug)]
 struct TdSelectedTowerPanel {
     bg: Handle<UiNode>,
+    tower_card_bg: Handle<UiNode>,
     tower_icon: Handle<UiNode>,
     summary_text: Handle<Text>,
+    refund_bg: Handle<UiNode>,
     gold_text: Handle<Text>,
     sell_icon: Handle<UiNode>,
+    upgrade_bgs: [Handle<UiNode>; 3],
     upgrade_icons: [Handle<UiNode>; 3],
     upgrade_price_texts: [Handle<Text>; 3],
+    left_anchor_rect: UiRect,
+    right_anchor_rect: UiRect,
+    panel_rect: UiRect,
+    tower_card_rect: UiRect,
+    refund_rect: UiRect,
+    sell_rect: UiRect,
+    upgrade_rects: [UiRect; 3],
 }
 
-fn load_texture_from_rel_path(rel_path: &str) -> Option<TextureResource> {
+fn load_texture_from_candidate_paths(candidate_paths: Vec<String>) -> Option<TextureResource> {
     use fyrox::asset::untyped::ResourceKind;
     use fyrox::core::uuid::Uuid;
-
-    let mut candidate_paths: Vec<String> = vec![
-        rel_path.to_string(),
-        format!("omfx/{}", rel_path),
-        format!("../{}", rel_path),
-    ];
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidate_paths.push(exe_dir.join(rel_path).to_string_lossy().into_owned());
-        }
-    }
 
     let bytes = candidate_paths
         .iter()
@@ -431,8 +509,43 @@ fn load_texture_from_rel_path(rel_path: &str) -> Option<TextureResource> {
     TextureResource::load_from_memory(Uuid::new_v4(), ResourceKind::Embedded, &bytes, opts).ok()
 }
 
+fn load_texture_from_rel_path(rel_path: &str) -> Option<TextureResource> {
+    let mut candidate_paths: Vec<String> = vec![
+        rel_path.to_string(),
+        format!("omfx/{}", rel_path),
+        format!("../{}", rel_path),
+    ];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidate_paths.push(exe_dir.join(rel_path).to_string_lossy().into_owned());
+        }
+    }
+    load_texture_from_candidate_paths(candidate_paths)
+}
+
 fn load_td_ui_texture(asset_name: &str) -> Option<TextureResource> {
-    load_texture_from_rel_path(&format!("data/td_ui/{}", asset_name))
+    let script_rel = format!("scripts/base_content/assets/td_ui/{}", asset_name);
+    let frontend_rel = format!("data/td_ui/{}", asset_name);
+    let mut candidate_paths: Vec<String> = vec![
+        script_rel.clone(),
+        format!("../{}", script_rel),
+        format!("../../{}", script_rel),
+    ];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for ancestor in exe_dir.ancestors().take(6) {
+                candidate_paths.push(ancestor.join(&script_rel).to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // 相容舊開發路徑；正式替換位置仍是 scripts/base_content/assets/td_ui。
+    candidate_paths.extend([
+        frontend_rel.clone(),
+        format!("omfx/{}", frontend_rel),
+        format!("../{}", frontend_rel),
+    ]);
+    load_texture_from_candidate_paths(candidate_paths)
 }
 
 /// Bomb 爆炸紅圈特效：由 0 半徑膨脹到 `max_radius`，`duration` 秒後消失。
@@ -894,6 +1007,22 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     td_tower_button_rects: Vec<(f32, f32, f32, f32)>,
+    /// 右側 TD shop viewport 的 scroll offset（1920x1080 reference units）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_shop_scroll_offset: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_shop_max_scroll: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_shop_scroll_dragging: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_shop_scroll_drag_start_y: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_shop_scroll_drag_start_offset: f32,
     /// 右側常駐 shop/control panel：買塔 + Start/Pause placeholder。
     #[visit(skip)]
     #[reflect(hidden)]
@@ -910,6 +1039,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     start_round_button_rect: (f32, f32, f32, f32),
+    /// Pause placeholder hit-test rect；目前只攔截點擊，不送 gameplay input。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    pause_button_rect: (f32, f32, f32, f32),
     /// TD 當前已完成的波數（1-based 概念；後端推送 `game/round` 時更新）。
     /// 0 表示還沒開始第一波。
     #[visit(skip)]
@@ -1102,6 +1235,14 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ability_textures: [Option<fyrox::resource::texture::TextureResource>; 4],
+    /// 目前每個技能 slot 已套用的 icon path，用來避免每 frame 重讀圖片。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ability_icon_paths: [String; 4],
+    /// 技能 icon texture cache：key 是 `AbilityDef.icon` 的相對路徑。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ability_icon_texture_cache: HashMap<String, Option<fyrox::resource::texture::TextureResource>>,
     /// 4 icon 的 screen AABB (x, y, w, h) — 供滑鼠 hit-test
     #[visit(skip)]
     #[reflect(hidden)]
@@ -1208,6 +1349,7 @@ pub struct Game {
 struct AbilityInfo {
     id: String,
     name: String,
+    icon_path: String,
     description: String,
     key_binding: String,
     max_level: i32,
@@ -1372,93 +1514,33 @@ impl Plugin for Game {
             }
         }
 
-        // 載入孫市四技能圖示（hero1_1..4）
-        // 用 Fyrox UI 內建 check.png / add.png 等的同套 pattern：
-        // TextureResource::load_from_memory + CompressionOptions::No Compression
-        // 壓縮 texture 會造成 UI renderer 拿不到可顯示的 GPU 格式 → 空白。
+        // 先用通用 placeholder 建立 4 個 Image node；實際技能 icon 會在收到
+        // AbilityRegistry snapshot 後依 AbilityDef.icon 置換。
         // 實際位置在 update() 依當前 window_size 置底中央。
         {
-            use fyrox::asset::untyped::ResourceKind;
-            use fyrox::core::uuid::Uuid;
-            use fyrox::resource::texture::{
-                CompressionOptions, TextureImportOptions, TextureMinificationFilter,
-                TextureResource, TextureResourceExtension,
-            };
-
             let slot_label = ["W", "E", "R", "T"];
             let icon_size = 64.0f32;
 
             for i in 0..4 {
-                let path = format!("data/hero1_{}.png", i + 1);
+                let path = ABILITY_ICON_FALLBACK_PATH.to_string();
                 let init_x = 500.0 + (i as f32) * 72.0;
                 let init_y = 620.0;
                 self.ability_icon_rects[i] = (init_x, init_y, icon_size, icon_size);
-
-                let mut debug_state: &'static str = "?";
-                // 路徑候選：
-                //   1. data/... （CWD=omfx 時，cargo run -p omfx）
-                //   2. omfx/data/... （CWD=repo root 時，cargo run --manifest-path omfx\Cargo.toml）
-                //   3. ../data/... （備援，CWD 深一層時）
-                //   4. {exe_dir}/data/... （打包後 release，exe 與 data 同層）
-                let mut candidate_paths: Vec<String> = vec![
-                    path.clone(),
-                    format!("omfx/{}", path),
-                    format!("../{}", path),
-                ];
-                if let Ok(exe_path) = std::env::current_exe() {
-                    if let Some(exe_dir) = exe_path.parent() {
-                        candidate_paths.push(exe_dir.join(&path).to_string_lossy().into_owned());
-                    }
+                let texture_opt = load_texture_from_rel_path(&path);
+                let mut icon_builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(init_x, init_y))
+                        .with_width(icon_size)
+                        .with_height(icon_size),
+                );
+                if let Some(ref resource) = texture_opt {
+                    icon_builder = icon_builder.with_texture(resource.clone());
                 }
-                let read_result = candidate_paths
-                    .iter()
-                    .find_map(|p| std::fs::read(p).ok().map(|b| (p.clone(), b)));
-                let texture_opt: Option<TextureResource> =
-                    match read_result.as_ref().map(|(_, b)| b) {
-                        Some(bytes) => {
-                            let opts = TextureImportOptions::default()
-                                .with_compression(CompressionOptions::NoCompression)
-                                .with_minification_filter(
-                                    TextureMinificationFilter::LinearMipMapLinear,
-                                );
-                            match TextureResource::load_from_memory(
-                                Uuid::new_v4(),
-                                ResourceKind::Embedded,
-                                bytes,
-                                opts,
-                            ) {
-                                Ok(res) => {
-                                    debug_state = "OK";
-                                    Some(res)
-                                }
-                                Err(_) => {
-                                    debug_state = "DECODE";
-                                    None
-                                }
-                            }
-                        }
-                        None => {
-                            debug_state = "READ";
-                            None
-                        }
-                    };
-
-                let _ = debug_state; // reserved for future logging
-                let icon_handle: Handle<UiNode> = if let Some(ref resource) = texture_opt {
-                    let h: Handle<fyrox::gui::image::Image> = ImageBuilder::new(
-                        WidgetBuilder::new()
-                            .with_desired_position(Vector2::new(init_x, init_y))
-                            .with_width(icon_size)
-                            .with_height(icon_size),
-                    )
-                    .with_texture(resource.clone())
-                    .build(&mut ui.build_ctx());
-                    h.transmute()
-                } else {
-                    Handle::NONE
-                };
+                let h: Handle<fyrox::gui::image::Image> = icon_builder.build(&mut ui.build_ctx());
+                let icon_handle: Handle<UiNode> = h.transmute();
                 self.ui_ability_icons[i] = icon_handle;
                 self.ability_textures[i] = texture_opt;
+                self.ability_icon_paths[i] = path;
 
                 // Icon 下方顯示等級點（● ○ ○ ○ ○）—— 由 update() 每 frame 更新文字
                 let lvl = TextBuilder::new(
@@ -1588,7 +1670,7 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(18.0.into())
+            .with_font_size(30.0.into())
             .build(&mut ui.build_ctx());
 
             self.ui_td_sell_button_text = TextBuilder::new(
@@ -1598,7 +1680,7 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(120, 20, 20, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(20.0.into())
+            .with_font_size(38.0.into())
             .build(&mut ui.build_ctx());
             self.td_sell_button_rect = (-9999.0, -9999.0, 360.0, 42.0);
 
@@ -1611,7 +1693,7 @@ impl Plugin for Game {
                         .with_foreground(Brush::Solid(Color::from_rgba(20, 60, 120, 255)).into()),
                 )
                 .with_text(String::new())
-                .with_font_size(18.0.into())
+                .with_font_size(26.0.into())
                 .build(&mut ui.build_ctx());
                 self.td_upgrade_button_rects[i] = (-9999.0, -9999.0, 360.0, 38.0);
             }
@@ -1630,6 +1712,19 @@ impl Plugin for Game {
             }
             self.ui_td_selected_panel.bg = bg_builder.build(&mut ui.build_ctx()).transmute();
 
+            self.ui_td_selected_panel.tower_card_bg = {
+                let mut builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(348.0)
+                        .with_height(255.0),
+                );
+                if let Some(tex) = load_td_ui_texture("shop_card.png") {
+                    builder = builder.with_texture(tex);
+                }
+                builder.build(&mut ui.build_ctx()).transmute()
+            };
+
             self.ui_td_selected_panel.tower_icon = {
                 let h: Handle<fyrox::gui::image::Image> = ImageBuilder::new(
                     WidgetBuilder::new()
@@ -1647,16 +1742,28 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(55, 32, 12, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(16.0.into())
+            .with_font_size(24.0.into())
             .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.refund_bg = {
+                let mut builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(177.0)
+                        .with_height(78.0),
+                );
+                if let Some(tex) = load_td_ui_texture("shop_card_locked.png") {
+                    builder = builder.with_texture(tex);
+                }
+                builder.build(&mut ui.build_ctx()).transmute()
+            };
             self.ui_td_selected_panel.gold_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                    .with_width(140.0)
+                    .with_width(177.0)
                     .with_foreground(Brush::Solid(Color::from_rgba(255, 245, 205, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(24.0.into())
+            .with_font_size(30.0.into())
             .build(&mut ui.build_ctx());
             self.ui_td_selected_panel.sell_icon = {
                 let mut builder = ImageBuilder::new(
@@ -1672,6 +1779,18 @@ impl Plugin for Game {
                 h.transmute()
             };
             for i in 0..3 {
+                self.ui_td_selected_panel.upgrade_bgs[i] = {
+                    let mut builder = ImageBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(357.0)
+                            .with_height(117.0),
+                    );
+                    if let Some(tex) = load_td_ui_texture("shop_card_selected.png") {
+                        builder = builder.with_texture(tex);
+                    }
+                    builder.build(&mut ui.build_ctx()).transmute()
+                };
                 self.ui_td_selected_panel.upgrade_icons[i] = {
                     let mut builder = ImageBuilder::new(
                         WidgetBuilder::new()
@@ -1688,11 +1807,11 @@ impl Plugin for Game {
                 self.ui_td_selected_panel.upgrade_price_texts[i] = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                        .with_width(96.0)
+                        .with_width(243.0)
                         .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
                 )
                 .with_text(String::new())
-                .with_font_size(22.0.into())
+                .with_font_size(30.0.into())
                 .build(&mut ui.build_ctx());
             }
         }
@@ -1716,9 +1835,39 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(255, 245, 225, 255)).into()),
             )
             .with_text("塔商店".to_string())
-            .with_font_size(26.0.into())
+            .with_font_size(36.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .build(&mut ui.build_ctx());
+            self.ui_td_right_panel.viewport_bg = CanvasBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(360.0)
+                    .with_height(745.0)
+                    .with_clip_to_bounds(true),
+            )
+            .build(&mut ui.build_ctx())
+            .transmute();
+            self.ui_td_right_panel.scroll_track = {
+                let builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(18.0)
+                        .with_height(745.0),
+                );
+                builder.build(&mut ui.build_ctx()).transmute()
+            };
+            self.ui_td_right_panel.scroll_thumb = {
+                let mut builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(18.0)
+                        .with_height(180.0),
+                );
+                if let Some(tex) = load_td_ui_texture("shop_card_selected.png") {
+                    builder = builder.with_texture(tex);
+                }
+                builder.build(&mut ui.build_ctx()).transmute()
+            };
             self.ui_td_right_panel.start_icon = {
                 let mut builder = ImageBuilder::new(
                     WidgetBuilder::new()
@@ -1752,7 +1901,7 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(245, 245, 245, 180)).into()),
             )
             .with_text("PAUSE".to_string())
-            .with_font_size(14.0.into())
+            .with_font_size(22.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .build(&mut ui.build_ctx());
         }
@@ -1766,9 +1915,10 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(0, 80, 0, 255)).into()),
             )
             .with_text("▶ Start Round 1".to_string())
-            .with_font_size(22.0.into())
+            .with_font_size(30.0.into())
             .build(&mut ui.build_ctx());
             self.start_round_button_rect = (-9999.0, -9999.0, 240.0, 48.0);
+            self.pause_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         }
 
         // TD 模式右側塔按鈕（text-only，動態 Vec）
@@ -2269,8 +2419,19 @@ impl Plugin for Game {
                             },
                         );
                     }
+                    let layout_placeholder = if self.td_templates.contains_key("tower_dart") {
+                        Some("tower_dart".to_string())
+                    } else {
+                        self.td_template_order.first().cloned()
+                    };
+                    if let Some(layout_placeholder) = layout_placeholder {
+                        while self.td_template_order.len() < TD_SHOP_LAYOUT_DEBUG_MIN_CARDS {
+                            self.td_template_order.push(layout_placeholder.clone());
+                        }
+                    }
                     log::info!(
-                        "TD build menu seeded: {} towers from snapshot",
+                        "TD build menu seeded: {} snapshot towers, {} displayed cards",
+                        snapshot.tower_templates.len(),
                         self.td_template_order.len()
                     );
                 }
@@ -2350,6 +2511,9 @@ impl Plugin for Game {
                             });
                         if entry.name.is_empty() {
                             entry.name = def.display_name.clone();
+                        }
+                        if !def.icon_path.is_empty() && entry.icon_path != def.icon_path {
+                            entry.icon_path = def.icon_path.clone();
                         }
                         if entry.max_level == 0 {
                             entry.max_level = def.max_level as i32;
@@ -3417,25 +3581,34 @@ impl Plugin for Game {
 
             // ===== BTD-style 右側 shop/control panel =====
             {
-                let right_margin = 12.0f32;
-                let panel_w = if self.window_size.x < 1150.0 { 246.0 } else { 286.0 };
-                let panel_x = (self.window_size.x - panel_w - right_margin).max(0.0);
-                let panel_y = 48.0f32;
-                let panel_h = (self.window_size.y - panel_y - 12.0).max(420.0);
+                let (sx, sy) = td_ui_ref_scale(self.window_size);
+                let panel = td_ui_ref_rect(self.window_size, 1479.0, 0.0, 405.0, 1080.0);
+                self.ui_td_right_panel.panel_rect = panel;
                 ui.send(
                     self.ui_td_right_panel.bg,
-                    WidgetMessage::DesiredPosition(Vector2::new(panel_x, panel_y)),
+                    WidgetMessage::DesiredPosition(panel.pos()),
                 );
-                ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel_w));
-                ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel_h));
+                ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel.w));
+                ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel.h));
+                let title = td_ui_ref_rect(self.window_size, 1503.0, 124.0, 357.0, 40.0);
                 ui.send(
                     self.ui_td_right_panel.title_text,
-                    WidgetMessage::DesiredPosition(Vector2::new(panel_x + 14.0, panel_y + 14.0)),
+                    WidgetMessage::DesiredPosition(title.pos()),
                 );
+                ui.send(self.ui_td_right_panel.title_text, WidgetMessage::Width(title.w));
                 ui.send(
                     self.ui_td_right_panel.title_text,
                     TextMessage::Text("塔商店".to_string()),
                 );
+
+                let viewport = td_ui_ref_rect(self.window_size, 1500.0, 170.0, 360.0, 745.0);
+                self.ui_td_right_panel.viewport_rect = viewport;
+                ui.send(
+                    self.ui_td_right_panel.viewport_bg,
+                    WidgetMessage::DesiredPosition(viewport.pos()),
+                );
+                ui.send(self.ui_td_right_panel.viewport_bg, WidgetMessage::Width(viewport.w));
+                ui.send(self.ui_td_right_panel.viewport_bg, WidgetMessage::Height(viewport.h));
 
                 let n = self.td_template_order.len();
                 while self.ui_td_tower_cards.len() < n {
@@ -3464,7 +3637,7 @@ impl Plugin for Game {
                             .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
                     )
                     .with_text(String::new())
-                    .with_font_size(17.0.into())
+                    .with_font_size(18.0.into())
                     .build(&mut ui.build_ctx());
                     let name_text = TextBuilder::new(
                         WidgetBuilder::new()
@@ -3473,7 +3646,7 @@ impl Plugin for Game {
                             .with_foreground(Brush::Solid(Color::from_rgba(35, 18, 6, 255)).into()),
                     )
                     .with_text(String::new())
-                    .with_font_size(15.0.into())
+                    .with_font_size(16.0.into())
                     .with_horizontal_text_alignment(HorizontalAlignment::Center)
                     .build(&mut ui.build_ctx());
                     let price_text = TextBuilder::new(
@@ -3483,9 +3656,15 @@ impl Plugin for Game {
                             .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
                     )
                     .with_text(String::new())
-                    .with_font_size(24.0.into())
+                    .with_font_size(22.0.into())
                     .with_horizontal_text_alignment(HorizontalAlignment::Center)
                     .build(&mut ui.build_ctx());
+                    for node in [bg, icon] {
+                        ui.link_nodes(node, self.ui_td_right_panel.viewport_bg, false);
+                    }
+                    for text in [key_text, name_text, price_text] {
+                        ui.link_nodes(text, self.ui_td_right_panel.viewport_bg, false);
+                    }
                     self.ui_td_tower_cards.push(TdTowerShopCard {
                         bg,
                         icon,
@@ -3515,18 +3694,30 @@ impl Plugin for Game {
                     }
                 }
 
-                let grid_top = panel_y + 92.0;
-                let controls_h = 150.0;
-                let available_h = (self.window_size.y - grid_top - controls_h).max(160.0);
-                let columns = if panel_w >= 270.0 && available_h >= 270.0 { 2 } else { 1 };
-                let gap = 10.0f32;
-                let inner_x = panel_x + 14.0;
-                let card_w = ((panel_w - 28.0) - gap * (columns as f32 - 1.0)) / columns as f32;
-                let card_h = if columns == 2 { 128.0 } else { 78.0 };
+                let columns = if self.window_size.x < 1280.0 || self.window_size.y < 720.0 {
+                    1
+                } else {
+                    2
+                };
+                let ref_card_w = if columns == 2 { 158.0 } else { 320.0 };
+                let ref_card_h = if columns == 2 { 160.0 } else { 128.0 };
+                let ref_col_gap = if columns == 2 { 166.0 } else { 0.0 };
+                let ref_row_gap = if columns == 2 { 162.0 } else { 130.0 };
+                let ref_grid_x = if columns == 2 { 1508.0 } else { 1520.0 };
+                let ref_grid_y = 170.0f32;
+                let rows = if n == 0 { 0 } else { (n + columns - 1) / columns };
+                let content_h = if rows == 0 {
+                    0.0
+                } else {
+                    (rows.saturating_sub(1) as f32) * ref_row_gap + ref_card_h
+                };
+                let viewport_h_ref = 745.0f32;
+                self.td_shop_max_scroll = (content_h - viewport_h_ref).max(0.0);
+                self.set_td_shop_scroll_offset(self.td_shop_scroll_offset);
                 let selected_kind = self.selected_tower_kind.clone();
                 for i in 0..n {
                     let uid = self.td_template_order[i].clone();
-                    let (label, cost) = self
+                    let (_label, cost) = self
                         .td_templates
                         .get(&uid)
                         .map(|tpl| (tpl.label.clone(), tpl.cost))
@@ -3535,9 +3726,17 @@ impl Plugin for Game {
                     let is_selected = selected_kind.as_deref() == Some(uid.as_str());
                     let col = i % columns;
                     let row = i / columns;
-                    let x = inner_x + col as f32 * (card_w + gap);
-                    let y = grid_top + row as f32 * (card_h + gap);
-                    self.td_tower_button_rects[i] = (x, y, card_w, card_h);
+                    let card_rect = td_ui_ref_rect(
+                        self.window_size,
+                        ref_grid_x + col as f32 * ref_col_gap,
+                        ref_grid_y + row as f32 * ref_row_gap - self.td_shop_scroll_offset,
+                        ref_card_w,
+                        ref_card_h,
+                    );
+                    let visible_rect = card_rect.intersection(viewport);
+                    self.td_tower_button_rects[i] = visible_rect
+                        .map(|r| r.tuple())
+                        .unwrap_or((UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0));
 
                     let bg_asset = if is_selected {
                         "shop_card_selected.png"
@@ -3551,49 +3750,61 @@ impl Plugin for Game {
                         .td_ui_texture(&format!("{}.png", uid))
                         .or_else(|| self.td_ui_texture("tower_fallback.png"));
                     let card = &self.ui_td_tower_cards[i];
-                    ui.send(card.bg, WidgetMessage::DesiredPosition(Vector2::new(x, y)));
-                    ui.send(card.bg, WidgetMessage::Width(card_w));
-                    ui.send(card.bg, WidgetMessage::Height(card_h));
+                    if visible_rect.is_none() {
+                        for node in [card.bg, card.icon] {
+                            ui.send(
+                                node,
+                                WidgetMessage::DesiredPosition(Vector2::new(
+                                    UI_HIDDEN_POS,
+                                    UI_HIDDEN_POS,
+                                )),
+                            );
+                        }
+                        for text in [card.key_text, card.name_text, card.price_text] {
+                            ui.send(
+                                text,
+                                WidgetMessage::DesiredPosition(Vector2::new(
+                                    UI_HIDDEN_POS,
+                                    UI_HIDDEN_POS,
+                                )),
+                            );
+                        }
+                        continue;
+                    }
+                    let local_card_pos = Vector2::new(card_rect.x - viewport.x, card_rect.y - viewport.y);
+                    ui.send(card.bg, WidgetMessage::DesiredPosition(local_card_pos));
+                    ui.send(card.bg, WidgetMessage::Width(card_rect.w));
+                    ui.send(card.bg, WidgetMessage::Height(card_rect.h));
                     ui.send(card.bg, ImageMessage::Texture(bg_tex));
-                    let icon_size = if columns == 2 { 62.0 } else { 54.0 };
+                    let icon_size = if columns == 2 { 96.0 } else { 72.0 };
                     ui.send(
                         card.icon,
                         WidgetMessage::DesiredPosition(Vector2::new(
-                            x + (card_w - icon_size) * 0.5,
-                            y + 12.0,
+                            local_card_pos.x + (card_rect.w - icon_size * sx) * 0.5,
+                            local_card_pos.y + 10.0 * sy,
                         )),
                     );
-                    ui.send(card.icon, WidgetMessage::Width(icon_size));
-                    ui.send(card.icon, WidgetMessage::Height(icon_size));
+                    ui.send(card.icon, WidgetMessage::Width(icon_size * sx));
+                    ui.send(card.icon, WidgetMessage::Height(icon_size * sy));
                     ui.send(card.icon, ImageMessage::Texture(icon_tex));
                     ui.send(
                         card.key_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(x + 6.0, y + 6.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
                     );
-                    ui.send(card.key_text, TextMessage::Text(format!("[{}]", i + 1)));
-                    let short_label = if label.chars().count() > 6 {
-                        label.chars().take(6).collect::<String>()
-                    } else {
-                        label.clone()
-                    };
+                    ui.send(card.key_text, TextMessage::Text(String::new()));
                     ui.send(
                         card.name_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(x + 4.0, y + card_h - 52.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
                     );
-                    ui.send(card.name_text, WidgetMessage::Width(card_w - 8.0));
-                    ui.send(
-                        card.name_text,
-                        TextMessage::Text(if is_selected {
-                            format!("▶ {}", short_label)
-                        } else {
-                            short_label
-                        }),
-                    );
+                    ui.send(card.name_text, TextMessage::Text(String::new()));
                     ui.send(
                         card.price_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(x + 4.0, y + card_h - 30.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            local_card_pos.x + 8.0 * sx,
+                            local_card_pos.y + card_rect.h - 54.0 * sy,
+                        )),
                     );
-                    ui.send(card.price_text, WidgetMessage::Width(card_w - 8.0));
+                    ui.send(card.price_text, WidgetMessage::Width(card_rect.w - 16.0 * sx));
                     ui.send(
                         card.price_text,
                         TextMessage::Text(if affordable {
@@ -3604,56 +3815,83 @@ impl Plugin for Game {
                     );
                 }
 
-                let pause_y = self.window_size.y - 160.0;
+                let track = td_ui_ref_rect(self.window_size, 1857.0, 170.0, 18.0, 745.0);
+                self.ui_td_right_panel.scroll_track_rect = track;
+                ui.send(
+                    self.ui_td_right_panel.scroll_track,
+                    WidgetMessage::DesiredPosition(track.pos()),
+                );
+                ui.send(self.ui_td_right_panel.scroll_track, WidgetMessage::Width(track.w));
+                ui.send(self.ui_td_right_panel.scroll_track, WidgetMessage::Height(track.h));
+
+                let thumb_h_ref = if self.td_shop_max_scroll <= 0.0 || content_h <= 0.0 {
+                    745.0
+                } else {
+                    (viewport_h_ref / content_h * 745.0).clamp(72.0, 745.0)
+                };
+                let thumb_travel_ref = (745.0 - thumb_h_ref).max(0.0);
+                let thumb_y_ref = 170.0
+                    + if self.td_shop_max_scroll > 0.0 {
+                        (self.td_shop_scroll_offset / self.td_shop_max_scroll) * thumb_travel_ref
+                    } else {
+                        0.0
+                    };
+                let thumb = td_ui_ref_rect(self.window_size, 1859.0, thumb_y_ref, 14.0, thumb_h_ref);
+                self.ui_td_right_panel.scroll_thumb_rect = thumb;
+                ui.send(
+                    self.ui_td_right_panel.scroll_thumb,
+                    WidgetMessage::DesiredPosition(thumb.pos()),
+                );
+                ui.send(self.ui_td_right_panel.scroll_thumb, WidgetMessage::Width(thumb.w));
+                ui.send(self.ui_td_right_panel.scroll_thumb, WidgetMessage::Height(thumb.h));
+
+                let pause_rect = td_ui_ref_rect(self.window_size, 1508.0, 938.0, 162.0, 111.0);
+                self.ui_td_right_panel.pause_rect = pause_rect;
+                self.pause_button_rect = pause_rect.tuple();
                 ui.send(
                     self.ui_td_right_panel.pause_icon,
-                    WidgetMessage::DesiredPosition(Vector2::new(panel_x + 18.0, pause_y)),
+                    WidgetMessage::DesiredPosition(pause_rect.pos()),
                 );
+                ui.send(self.ui_td_right_panel.pause_icon, WidgetMessage::Width(pause_rect.w));
+                ui.send(self.ui_td_right_panel.pause_icon, WidgetMessage::Height(pause_rect.h));
                 ui.send(
                     self.ui_td_right_panel.pause_text,
-                    WidgetMessage::DesiredPosition(Vector2::new(panel_x + 4.0, pause_y + 70.0)),
-                );
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            pause_rect.x,
+                            pause_rect.y + 78.0 * sy,
+                        )),
+                    );
+                    ui.send(self.ui_td_right_panel.pause_text, WidgetMessage::Width(pause_rect.w));
                 ui.send(
                     self.ui_td_right_panel.pause_text,
-                    TextMessage::Text("PAUSE 待接".to_string()),
-                );
-                let btn_w = panel_w - 32.0;
-                let btn_h = 66.0f32;
-                let x = panel_x + 16.0;
-                let y = self.window_size.y - btn_h - 22.0;
-                self.start_round_button_rect = (x, y, btn_w, btn_h);
+                        TextMessage::Text("PAUSE 待接".to_string()),
+                    );
+                let start_rect = td_ui_ref_rect(self.window_size, 1692.0, 938.0, 162.0, 111.0);
+                self.ui_td_right_panel.start_rect = start_rect;
+                self.start_round_button_rect = start_rect.tuple();
                 ui.send(
                     self.ui_td_right_panel.start_icon,
-                    WidgetMessage::DesiredPosition(Vector2::new(x + 8.0, y + 6.0)),
+                    WidgetMessage::DesiredPosition(start_rect.pos()),
                 );
+                ui.send(self.ui_td_right_panel.start_icon, WidgetMessage::Width(start_rect.w));
+                ui.send(self.ui_td_right_panel.start_icon, WidgetMessage::Height(start_rect.h));
                 if self.ui_start_round_button != Handle::<Text>::NONE {
                     ui.send(
                         self.ui_start_round_button,
-                        WidgetMessage::DesiredPosition(Vector2::new(x + 72.0, y + 17.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
                     );
-                    ui.send(self.ui_start_round_button, WidgetMessage::Width(btn_w - 78.0));
-                    let text = if self.total_rounds > 0
-                        && self.current_round >= self.total_rounds
-                        && !self.round_is_running
-                    {
-                        "全清".to_string()
-                    } else if self.round_is_running {
-                        format!("第 {} 波", self.current_round.max(1))
-                    } else {
-                        let next = self.current_round + 1;
-                        let total = self.total_rounds.max(1);
-                        format!("開始 {}/{}", next, total)
-                    };
-                    ui.send(self.ui_start_round_button, TextMessage::Text(text));
+                    ui.send(self.ui_start_round_button, WidgetMessage::Width(start_rect.w));
+                    ui.send(self.ui_start_round_button, TextMessage::Text(String::new()));
                 }
             }
 
-            // ===== BTD-style 左側 selected tower context panel =====
+            // ===== BTD-style selected tower context panel（依塔所在半邊自動換邊） =====
             {
-                let panel_x = 12.0f32;
-                let panel_y = 72.0f32;
-                let panel_w = if self.window_size.x < 1150.0 { 300.0 } else { 332.0 };
-                let panel_h = (self.window_size.y - panel_y - 20.0).max(420.0);
+                let (sx, sy) = td_ui_ref_scale(self.window_size);
+                self.ui_td_selected_panel.left_anchor_rect =
+                    td_ui_ref_rect(self.window_size, 24.0, 45.0, 426.0, 990.0);
+                self.ui_td_selected_panel.right_anchor_rect =
+                    td_ui_ref_rect(self.window_size, 1053.0, 45.0, 426.0, 990.0);
 
                 let info: Option<(String, i32, [u8; 3], String, f32)> =
                     self.selected_tower_entity.and_then(|tid| {
@@ -3680,36 +3918,86 @@ impl Plugin for Game {
                     });
 
                 if let Some((label, refund, levels, kind_key, range)) = info {
+                    let selected_x = self
+                        .selected_tower_screen_x()
+                        .unwrap_or(self.window_size.x * 0.5);
+                    let anchor_x_ref = if selected_x < self.window_size.x * 0.5 {
+                        1053.0
+                    } else {
+                        24.0
+                    };
+                    let anchor_delta_ref = anchor_x_ref - 24.0;
+                    let panel = td_ui_ref_rect(self.window_size, anchor_x_ref, 45.0, 426.0, 990.0);
+                    let tower_card = td_ui_ref_rect(
+                        self.window_size,
+                        63.0 + anchor_delta_ref,
+                        158.0,
+                        348.0,
+                        255.0,
+                    );
+                    self.ui_td_selected_panel.panel_rect = panel;
+                    self.ui_td_selected_panel.tower_card_rect = tower_card;
+
                     ui.send(
                         self.ui_td_selected_panel.bg,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x, panel_y)),
+                        WidgetMessage::DesiredPosition(panel.pos()),
                     );
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Width(panel_w));
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Height(panel_h));
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Width(panel.w));
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Height(panel.h));
+                    ui.send(
+                        self.ui_td_selected_panel.tower_card_bg,
+                        WidgetMessage::DesiredPosition(tower_card.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.tower_card_bg,
+                        WidgetMessage::Width(tower_card.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.tower_card_bg,
+                        WidgetMessage::Height(tower_card.h),
+                    );
                     let tower_tex = self
                         .td_ui_texture(&format!("{}.png", kind_key))
                         .or_else(|| self.td_ui_texture("tower_fallback.png"));
+                    let tower_icon = td_ui_ref_rect(
+                        self.window_size,
+                        150.0 + anchor_delta_ref,
+                        188.0,
+                        174.0,
+                        174.0,
+                    );
                     ui.send(
                         self.ui_td_selected_panel.tower_icon,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 98.0, panel_y + 62.0)),
+                        WidgetMessage::DesiredPosition(tower_icon.pos()),
                     );
+                    ui.send(self.ui_td_selected_panel.tower_icon, WidgetMessage::Width(tower_icon.w));
+                    ui.send(self.ui_td_selected_panel.tower_icon, WidgetMessage::Height(tower_icon.h));
                     ui.send(
                         self.ui_td_selected_panel.tower_icon,
                         ImageMessage::Texture(tower_tex),
                     );
                     ui.send(
                         self.ui_td_sell_name_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 18.0, panel_y + 18.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            tower_card.x + 24.0 * sx,
+                            tower_card.y + tower_card.h - 58.0 * sy,
+                        )),
                     );
-                    ui.send(self.ui_td_sell_name_text, WidgetMessage::Width(panel_w - 36.0));
+                    ui.send(
+                        self.ui_td_sell_name_text,
+                        WidgetMessage::Width(tower_card.w - 48.0 * sx),
+                    );
                     ui.send(self.ui_td_sell_name_text, TextMessage::Text(label.clone()));
                     ui.send(
                         self.ui_td_selected_panel.summary_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 18.0, panel_y + 198.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            panel.x + 48.0 * sx,
+                            panel.y + 405.0 * sy,
+                        )),
                     );
                     ui.send(
                         self.ui_td_selected_panel.summary_text,
-                        WidgetMessage::Width(panel_w - 36.0),
+                        WidgetMessage::Width(panel.w - 96.0 * sx),
                     );
                     ui.send(
                         self.ui_td_selected_panel.summary_text,
@@ -3719,12 +4007,16 @@ impl Plugin for Game {
                         )),
                     );
 
-                    let upgrade_w = panel_w - 28.0;
-                    let upgrade_h = 70.0f32;
-                    let first_upgrade_y = panel_y + 238.0;
                     for path in 0u8..3 {
                         let idx = path as usize;
-                        let y_up = first_upgrade_y + idx as f32 * (upgrade_h + 10.0);
+                        let upgrade_rect = td_ui_ref_rect(
+                            self.window_size,
+                            57.0 + anchor_delta_ref,
+                            480.0 + idx as f32 * 135.0,
+                            357.0,
+                            117.0,
+                        );
+                        self.ui_td_selected_panel.upgrade_rects[idx] = upgrade_rect;
                         let level = levels[idx];
                         let (main_text, price_text) = if level >= TD_UI_MAX_UPGRADE_LEVEL {
                             (format!("P{}  MAX", path + 1), "MAX".to_string())
@@ -3736,16 +4028,46 @@ impl Plugin for Game {
                                 .map(|(n, c)| (n.as_str(), *c))
                                 .unwrap_or(("?", 0));
                             (
-                                format!("P{}  L{}->L{}  {}", path + 1, level, next_level, next_name),
+                                format!("P{} L{}->L{} {}", path + 1, level, next_level, next_name),
                                 format!("${}", next_cost),
                             )
                         };
                         let icon_tex = self
                             .td_ui_texture(&format!("{}_p{}.png", kind_key, path + 1))
                             .or_else(|| self.td_ui_texture(&format!("upgrade_p{}.png", path + 1)));
+                        let bg_tex = self
+                            .td_ui_texture("upgrade_card.png")
+                            .or_else(|| self.td_ui_texture("shop_card_selected.png"));
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_bgs[idx],
+                            WidgetMessage::DesiredPosition(upgrade_rect.pos()),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_bgs[idx],
+                            WidgetMessage::Width(upgrade_rect.w),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_bgs[idx],
+                            WidgetMessage::Height(upgrade_rect.h),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_bgs[idx],
+                            ImageMessage::Texture(bg_tex),
+                        );
                         ui.send(
                             self.ui_td_selected_panel.upgrade_icons[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(panel_x + 20.0, y_up + 8.0)),
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                upgrade_rect.x + 15.0 * sx,
+                                upgrade_rect.y + 18.0 * sy,
+                            )),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_icons[idx],
+                            WidgetMessage::Width(72.0 * sx),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_icons[idx],
+                            WidgetMessage::Height(81.0 * sy),
                         );
                         ui.send(
                             self.ui_td_selected_panel.upgrade_icons[idx],
@@ -3753,49 +4075,96 @@ impl Plugin for Game {
                         );
                         ui.send(
                             self.ui_td_upgrade_buttons[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(panel_x + 86.0, y_up + 10.0)),
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                upgrade_rect.x + 114.0 * sx,
+                                upgrade_rect.y + 18.0 * sy,
+                            )),
                         );
-                        ui.send(self.ui_td_upgrade_buttons[idx], WidgetMessage::Width(upgrade_w - 96.0));
+                        ui.send(
+                            self.ui_td_upgrade_buttons[idx],
+                            WidgetMessage::Width(upgrade_rect.w - 129.0 * sx),
+                        );
                         ui.send(self.ui_td_upgrade_buttons[idx], TextMessage::Text(main_text));
                         ui.send(
                             self.ui_td_selected_panel.upgrade_price_texts[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(panel_x + panel_w - 116.0, y_up + 42.0)),
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                upgrade_rect.x + 114.0 * sx,
+                                upgrade_rect.y + 63.0 * sy,
+                            )),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_price_texts[idx],
+                            WidgetMessage::Width(upgrade_rect.w - 129.0 * sx),
                         );
                         ui.send(
                             self.ui_td_selected_panel.upgrade_price_texts[idx],
                             TextMessage::Text(price_text),
                         );
-                        self.td_upgrade_button_rects[idx] =
-                            (panel_x + 14.0, y_up, upgrade_w, upgrade_h);
+                        self.td_upgrade_button_rects[idx] = upgrade_rect.tuple();
                     }
 
-                    let sell_y = self.window_size.y - 88.0;
+                    let gold_rect = td_ui_ref_rect(
+                        self.window_size,
+                        57.0 + anchor_delta_ref,
+                        915.0,
+                        177.0,
+                        78.0,
+                    );
+                    self.ui_td_selected_panel.refund_rect = gold_rect;
+                    ui.send(
+                        self.ui_td_selected_panel.refund_bg,
+                        WidgetMessage::DesiredPosition(gold_rect.pos()),
+                    );
+                    ui.send(self.ui_td_selected_panel.refund_bg, WidgetMessage::Width(gold_rect.w));
+                    ui.send(self.ui_td_selected_panel.refund_bg, WidgetMessage::Height(gold_rect.h));
                     ui.send(
                         self.ui_td_selected_panel.gold_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 22.0, sell_y + 16.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            gold_rect.x + 8.0 * sx,
+                            gold_rect.y + 10.0 * sy,
+                        )),
                     );
                     ui.send(
                         self.ui_td_selected_panel.gold_text,
-                        TextMessage::Text(format!("${}", self.hero_state.gold)),
+                        WidgetMessage::Width(gold_rect.w - 16.0 * sx),
                     );
+                    ui.send(
+                        self.ui_td_selected_panel.gold_text,
+                        TextMessage::Text(format!("${}\n退 ${}", self.hero_state.gold, refund)),
+                    );
+                    let sell_rect = td_ui_ref_rect(
+                        self.window_size,
+                        255.0 + anchor_delta_ref,
+                        900.0,
+                        159.0,
+                        99.0,
+                    );
+                    self.ui_td_selected_panel.sell_rect = sell_rect;
                     ui.send(
                         self.ui_td_selected_panel.sell_icon,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + panel_w - 138.0, sell_y + 11.0)),
+                        WidgetMessage::DesiredPosition(sell_rect.pos()),
                     );
+                    ui.send(self.ui_td_selected_panel.sell_icon, WidgetMessage::Width(sell_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_icon, WidgetMessage::Height(sell_rect.h));
                     ui.send(
                         self.ui_td_sell_button_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + panel_w - 96.0, sell_y + 16.0)),
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            sell_rect.x,
+                            sell_rect.y + 24.0 * sy,
+                        )),
                     );
-                    ui.send(self.ui_td_sell_button_text, WidgetMessage::Width(82.0));
+                    ui.send(self.ui_td_sell_button_text, WidgetMessage::Width(sell_rect.w));
                     ui.send(
                         self.ui_td_sell_button_text,
                         TextMessage::Text(format!("出售\n${}", refund)),
                     );
-                    self.td_sell_button_rect = (panel_x + panel_w - 148.0, sell_y, 132.0, 62.0);
+                    self.td_sell_button_rect = sell_rect.tuple();
                 } else {
                     for node in [
                         self.ui_td_selected_panel.bg,
+                        self.ui_td_selected_panel.tower_card_bg,
                         self.ui_td_selected_panel.tower_icon,
+                        self.ui_td_selected_panel.refund_bg,
                         self.ui_td_selected_panel.sell_icon,
                     ] {
                         ui.send(
@@ -3816,6 +4185,10 @@ impl Plugin for Game {
                     }
                     self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
                     for path in 0..3 {
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_bgs[path],
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
                         ui.send(
                             self.ui_td_upgrade_buttons[path],
                             WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
@@ -3851,12 +4224,38 @@ impl Plugin for Game {
             // remaining = 0 的有限期 buff 從本地清掉（權威值會在下次 push 糾正）
             self.hero_state.buffs.retain(|b| b.remaining != 0.0);
 
-            let hs = &self.hero_state;
             // 更新技能 icon 下方的等級點 + 中央 CD 數字
+            let skill_points = self.hero_state.skill_points;
             for i in 0..4 {
-                let id = hs.abilities.get(i).cloned().unwrap_or_default();
-                let lvl = hs.ability_levels.get(&id).copied().unwrap_or(0);
+                let id = self
+                    .hero_state
+                    .abilities
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default();
+                let lvl = self
+                    .hero_state
+                    .ability_levels
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0);
                 let max = ability_max_level(&self.ability_info_map, &id);
+                let icon_path = self
+                    .ability_info_map
+                    .get(&id)
+                    .and_then(|info| {
+                        (!info.icon_path.is_empty()).then_some(info.icon_path.as_str())
+                    })
+                    .unwrap_or(ABILITY_ICON_FALLBACK_PATH)
+                    .to_string();
+                if self.ability_icon_paths[i] != icon_path {
+                    self.ability_icon_paths[i] = icon_path.clone();
+                    let icon_tex = self.ability_icon_texture(&icon_path);
+                    self.ability_textures[i] = icon_tex.clone();
+                    if self.ui_ability_icons[i] != Handle::<UiNode>::NONE {
+                        ui.send(self.ui_ability_icons[i], ImageMessage::Texture(icon_tex));
+                    }
+                }
                 // 等級點 ● ○
                 let dots: String = (0..max.max(1))
                     .map(|n| if n < lvl { "●" } else { "○" })
@@ -3865,7 +4264,7 @@ impl Plugin for Game {
                 ui.send(self.ui_ability_level_text[i], TextMessage::Text(dots));
 
                 // CD 數字
-                let remaining = hs.ability_cd.get(&id).copied().unwrap_or(0.0);
+                let remaining = self.hero_state.ability_cd.get(&id).copied().unwrap_or(0.0);
                 let cd_str = if remaining >= 1.0 {
                     format!("{:.0}", remaining.ceil())
                 } else if remaining > 0.0 {
@@ -3875,7 +4274,7 @@ impl Plugin for Game {
                 };
                 ui.send(self.ui_ability_cd_text[i], TextMessage::Text(cd_str));
 
-                let can_upgrade = !id.is_empty() && hs.skill_points > 0 && lvl < max;
+                let can_upgrade = !id.is_empty() && skill_points > 0 && lvl < max;
                 if can_upgrade {
                     let (x, y, w, _) = self.ability_icon_rects[i];
                     self.ability_upgrade_button_rects[i] = (x, y - 32.0, w, 32.0);
@@ -3898,6 +4297,7 @@ impl Plugin for Game {
                 }
             }
             // Inventory 顯示
+            let hs = &self.hero_state;
             let mut inv = String::new();
             for (i, slot) in hs.inventory.iter().enumerate() {
                 match slot {
@@ -4176,6 +4576,48 @@ impl Plugin for Game {
                 }
                 // 原始 pixel 座標，供 tooltip hit-test 用
                 self.mouse_screen_pos = cursor;
+                if self.td_shop_scroll_dragging {
+                    if self.td_shop_max_scroll > 0.0 {
+                        let track = self.ui_td_right_panel.scroll_track_rect;
+                        let thumb = self.ui_td_right_panel.scroll_thumb_rect;
+                        let travel = (track.h - thumb.h).max(1.0);
+                        let dy = cursor.y - self.td_shop_scroll_drag_start_y;
+                        let offset = self.td_shop_scroll_drag_start_offset
+                            + dy / travel * self.td_shop_max_scroll;
+                        self.set_td_shop_scroll_offset(offset);
+                    } else {
+                        self.td_shop_scroll_dragging = false;
+                    }
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::MouseWheel { delta, .. },
+                ..
+            } => {
+                let screen = self.mouse_screen_pos;
+                let viewport = self.ui_td_right_panel.viewport_rect;
+                let track = self.ui_td_right_panel.scroll_track_rect;
+                if self.td_shop_max_scroll > 0.0
+                    && (viewport.contains(screen) || track.contains(screen))
+                {
+                    let (_, sy) = td_ui_ref_scale(self.window_size);
+                    let delta_ref = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => -y * 120.0,
+                        MouseScrollDelta::PixelDelta(pos) => -(pos.y as f32) / sy.max(0.01),
+                    };
+                    self.set_td_shop_scroll_offset(self.td_shop_scroll_offset + delta_ref);
+                }
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        button: MouseButton::Left,
+                        state: ElementState::Released,
+                        ..
+                    },
+                ..
+            } => {
+                self.td_shop_scroll_dragging = false;
             }
             Event::WindowEvent {
                 event:
@@ -4229,29 +4671,63 @@ impl Plugin for Game {
                     }
                 }
 
+                // 右側 shop scrollbar 優先於 Start/買塔/地圖點擊。
+                if !hit_ui && self.td_shop_max_scroll > 0.0 {
+                    let thumb = self.ui_td_right_panel.scroll_thumb_rect;
+                    let track = self.ui_td_right_panel.scroll_track_rect;
+                    if thumb.contains(screen) {
+                        self.td_shop_scroll_dragging = true;
+                        self.td_shop_scroll_drag_start_y = screen.y;
+                        self.td_shop_scroll_drag_start_offset = self.td_shop_scroll_offset;
+                        hit_ui = true;
+                    } else if track.contains(screen) {
+                        let direction = if screen.y < thumb.y { -1.0 } else { 1.0 };
+                        self.set_td_shop_scroll_offset(
+                            self.td_shop_scroll_offset + direction * 630.0,
+                        );
+                        hit_ui = true;
+                    }
+                }
+
                 // 1. Start Round 按鈕 — Phase 5.x lockstep send
                 if !hit_ui {
                     let (bx, by, bw, bh) = self.start_round_button_rect;
-                    if screen.x >= bx
+                    if bx > -9000.0
+                        && screen.x >= bx
                         && screen.x <= bx + bw
                         && screen.y >= by
                         && screen.y <= by + bh
-                        && !self.round_is_running
-                        && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
                     {
-                        let input = omoba_core::kcp::game_proto::PlayerInput {
-                            action: Some(
-                                omoba_core::kcp::game_proto::player_input::Action::StartRound(
-                                    omoba_core::kcp::game_proto::StartRound {},
+                        if !self.round_is_running
+                            && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
+                        {
+                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                                action: Some(
+                                    omoba_core::kcp::game_proto::player_input::Action::StartRound(
+                                        omoba_core::kcp::game_proto::StartRound {},
+                                    ),
                                 ),
-                            ),
-                        };
-                        self.send_lockstep_input_from(
-                            input,
-                            lockstep_client::InputOriginKind::OsEvent,
-                            event_us,
-                        );
-                        log::info!("Start Round → lockstep PlayerInput::StartRound sent");
+                            };
+                            self.send_lockstep_input_from(
+                                input,
+                                lockstep_client::InputOriginKind::OsEvent,
+                                event_us,
+                            );
+                            log::info!("Start Round → lockstep PlayerInput::StartRound sent");
+                        }
+                        hit_ui = true;
+                    }
+                }
+
+                // Pause placeholder 目前沒有 gameplay action；點擊只攔截 UI，避免落到地圖。
+                if !hit_ui {
+                    let (bx, by, bw, bh) = self.pause_button_rect;
+                    if bx > -9000.0
+                        && screen.x >= bx
+                        && screen.x <= bx + bw
+                        && screen.y >= by
+                        && screen.y <= by + bh
+                    {
                         hit_ui = true;
                     }
                 }
@@ -4697,8 +5173,53 @@ impl Game {
             return cached.clone();
         }
         let texture = load_td_ui_texture(asset_name);
+        if texture.is_none() {
+            log::warn!(
+                "TD UI texture '{}' not found in scripts/base_content/assets/td_ui or fallback paths",
+                asset_name
+            );
+        }
         self.td_ui_texture_cache
             .insert(asset_name.to_string(), texture.clone());
+        texture
+    }
+
+    fn set_td_shop_scroll_offset(&mut self, offset: f32) {
+        self.td_shop_scroll_offset = offset.clamp(0.0, self.td_shop_max_scroll.max(0.0));
+    }
+
+    fn selected_tower_screen_x(&self) -> Option<f32> {
+        let tid = self.selected_tower_entity?;
+        let ent = self.network_entities.get(&tid)?;
+        let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
+        Some(
+            world_to_screen_approx(
+                ent.position.x - self.camera_world_pos.x,
+                ent.position.y - self.camera_world_pos.y,
+                self.window_size.x,
+                self.window_size.y,
+                world_height,
+            )
+            .x,
+        )
+    }
+
+    fn ability_icon_texture(&mut self, rel_path: &str) -> Option<TextureResource> {
+        let key = if rel_path.trim().is_empty() {
+            ABILITY_ICON_FALLBACK_PATH
+        } else {
+            rel_path.trim()
+        };
+        if let Some(cached) = self.ability_icon_texture_cache.get(key) {
+            return cached.clone();
+        }
+        let texture = load_texture_from_rel_path(key).or_else(|| {
+            (key != ABILITY_ICON_FALLBACK_PATH)
+                .then(|| load_texture_from_rel_path(ABILITY_ICON_FALLBACK_PATH))
+                .flatten()
+        });
+        self.ability_icon_texture_cache
+            .insert(key.to_string(), texture.clone());
         texture
     }
 
