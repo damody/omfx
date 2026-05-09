@@ -23,6 +23,10 @@ use fyrox::{
         HorizontalAlignment, UiNode, UserInterface, VerticalAlignment,
     },
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
+    resource::texture::{
+        CompressionOptions, TextureImportOptions, TextureMinificationFilter, TextureResource,
+        TextureResourceExtension,
+    },
     scene::{
         base::BaseBuilder,
         camera::{CameraBuilder, OrthographicProjection, Projection},
@@ -34,21 +38,23 @@ use fyrox::{
     },
 };
 
-use std::collections::{HashMap, BinaryHeap, VecDeque};
 use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omoba_core::{
-    lockstep_timing::{ticks_to_seconds_f64, LOCKSTEP_ONE_SECOND_TICKS_U32, LOCKSTEP_TPS},
+    lockstep_timing::{
+        ticks_to_seconds_f64, LOCKSTEP_ONE_SECOND_TICKS_U32, LOCKSTEP_TICK_PERIOD_US, LOCKSTEP_TPS,
+    },
     GameEventData,
 };
 
 pub use fyrox;
 
-mod sprite_resources;
 mod lockstep_client;
-mod sim_runner;
 mod render_bridge;
+mod sim_runner;
+mod sprite_resources;
 
 /// 兩種不同的「PlayerInput」 Rust 類型之間的橋樑：omoba_core's
 /// kcp 用戶端使用自己的 prost 產生的 `proto/game.proto` 副本，
@@ -77,6 +83,7 @@ fn convert_player_input(
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
+const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputActionKind {
@@ -114,6 +121,7 @@ impl InputActionKind {
 struct PendingInput {
     submit_wall_clock_us: u64,
     submit_instant: Instant,
+    base_tick: u32,
     target_tick: u32,
     action_kind: InputActionKind,
     origin_kind: lockstep_client::InputOriginKind,
@@ -262,6 +270,8 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 
 // 後端→渲染座標比例（後端使用800等大單位）
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
+const UI_HIDDEN_POS: f32 = -9999.0;
+const TD_UI_MAX_UPGRADE_LEVEL: u8 = 4;
 
 // 3D 相機視錐體中的 Z 層（相機在 z=-100 看 +Z，近=0.1 遠=1000）。
 // SMALLER Z = closer to camera = drawn on top (industry-standard 3D 慣例)。
@@ -297,8 +307,6 @@ const REGION_BLOCKER_THICKNESS: f32 = 0.015;
 
 // ---------------------------------------------------------------------------
 // 網路類型
-
-
 
 /// 新產生的 Creep 的偵錯路徑保持可見的秒數。
 const PATH_VISIBLE_SECS: f32 = 5.0;
@@ -368,6 +376,63 @@ struct TdTemplate {
     hit_radius_backend: f32,
     slow_factor: f32,
     slow_duration: f32,
+}
+
+#[derive(Default, Debug)]
+struct TdTowerShopCard {
+    bg: Handle<UiNode>,
+    icon: Handle<UiNode>,
+    key_text: Handle<Text>,
+    name_text: Handle<Text>,
+    price_text: Handle<Text>,
+}
+
+#[derive(Default, Debug)]
+struct TdRightShopPanel {
+    bg: Handle<UiNode>,
+    title_text: Handle<Text>,
+    pause_icon: Handle<UiNode>,
+    pause_text: Handle<Text>,
+    start_icon: Handle<UiNode>,
+}
+
+#[derive(Default, Debug)]
+struct TdSelectedTowerPanel {
+    bg: Handle<UiNode>,
+    tower_icon: Handle<UiNode>,
+    summary_text: Handle<Text>,
+    gold_text: Handle<Text>,
+    sell_icon: Handle<UiNode>,
+    upgrade_icons: [Handle<UiNode>; 3],
+    upgrade_price_texts: [Handle<Text>; 3],
+}
+
+fn load_texture_from_rel_path(rel_path: &str) -> Option<TextureResource> {
+    use fyrox::asset::untyped::ResourceKind;
+    use fyrox::core::uuid::Uuid;
+
+    let mut candidate_paths: Vec<String> = vec![
+        rel_path.to_string(),
+        format!("omfx/{}", rel_path),
+        format!("../{}", rel_path),
+    ];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidate_paths.push(exe_dir.join(rel_path).to_string_lossy().into_owned());
+        }
+    }
+
+    let bytes = candidate_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())?;
+    let opts = TextureImportOptions::default()
+        .with_compression(CompressionOptions::NoCompression)
+        .with_minification_filter(TextureMinificationFilter::LinearMipMapLinear);
+    TextureResource::load_from_memory(Uuid::new_v4(), ResourceKind::Embedded, &bytes, opts).ok()
+}
+
+fn load_td_ui_texture(asset_name: &str) -> Option<TextureResource> {
+    load_texture_from_rel_path(&format!("data/td_ui/{}", asset_name))
 }
 
 /// Bomb 爆炸紅圈特效：由 0 半徑膨脹到 `max_radius`，`duration` 秒後消失。
@@ -467,7 +532,10 @@ struct BackendGuard {
 impl Drop for BackendGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            log::info!("BackendGuard dropping — killing backend (PID: {})", child.id());
+            log::info!(
+                "BackendGuard dropping — killing backend (PID: {})",
+                child.id()
+            );
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -477,7 +545,9 @@ impl Drop for BackendGuard {
                 // 關閉作業的最後一個句柄會觸發 KILL_ON_JOB_CLOSE，
                 // 這會殺死內部任何仍然活動的進程。
                 use windows::Win32::Foundation::CloseHandle;
-                unsafe { let _ = CloseHandle(job); }
+                unsafe {
+                    let _ = CloseHandle(job);
+                }
             }
         }
     }
@@ -486,8 +556,8 @@ impl Drop for BackendGuard {
 /// 將後端產生為子進程，與目前進程的生命週期相關聯。
 /// 如果我們找不到 omb 目錄或生成失敗，則傳回「None」。
 fn spawn_backend() -> Option<BackendGuard> {
-    use std::process::{Command, Stdio};
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
 
     // 找到相對於cwd的omb目錄
     let candidates = [
@@ -542,7 +612,10 @@ fn spawn_backend() -> Option<BackendGuard> {
     let job = create_job_and_attach(&child);
     #[cfg(windows)]
     {
-        Some(BackendGuard { child: Some(child), job })
+        Some(BackendGuard {
+            child: Some(child),
+            job,
+        })
     }
     #[cfg(not(windows))]
     {
@@ -554,12 +627,14 @@ fn spawn_backend() -> Option<BackendGuard> {
 /// 並傳回作業句柄。失敗時，返回“None”——“BackendGuard”
 /// 僅退回到“Drop”時殺死。
 #[cfg(windows)]
-fn create_job_and_attach(child: &std::process::Child) -> Option<windows::Win32::Foundation::HANDLE> {
+fn create_job_and_attach(
+    child: &std::process::Child,
+) -> Option<windows::Win32::Foundation::HANDLE> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
@@ -596,7 +671,6 @@ fn create_job_and_attach(child: &std::process::Child) -> Option<windows::Win32::
         Some(job)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 遊戲插件
@@ -643,7 +717,11 @@ impl FrameProfile {
     fn emit_log(&self) {
         let w = Self::WINDOW as f64;
         let total_ms = self.total_ns as f64 / w / 1_000_000.0;
-        let max_fps = if total_ms > 0.0 { (1000.0 / total_ms) as u32 } else { 0 };
+        let max_fps = if total_ms > 0.0 {
+            (1000.0 / total_ms) as u32
+        } else {
+            0
+        };
         log::info!(
             "omfx_frame window={} avg(ms) events={:.2} interp={:.2} visual={:.2} proj={:.2} cam={:.2} ui={:.2} total={:.2} (max_fps={}, events_per_frame={:.0}, creeps={:.0}, projectiles={:.0})",
             Self::WINDOW,
@@ -704,193 +782,258 @@ impl FrameProfile {
 pub struct Game {
     scene: Handle<Scene>,
     camera: Handle<Node>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     mouse_world_pos: Vector2<f32>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     window_size: Vector2<f32>,
 
     /// 共享 sprite GPU 資源（單一四邊形 + 9 個材質）。
     /// 在第一幀上延遲初始化；重用於所有實體 sprite 網格體。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     sprite_resources: Option<sprite_resources::SharedSpriteResources>,
 
     /// 所有 entity body sprite 共用的 batched mesh — 1 個 mesh / 1 draw call 容納
     /// 數千個 entity，取代之前每 entity 1 個 Mesh 的爆量 draw call 浪費。
     /// Capacity 4096 quad（涵蓋 1800 creep + 1000 tower + 餘裕）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     body_batch: Option<sprite_resources::BatchedSpriteMesh>,
 
     /// HP bar 黑底 + 綠條 共用 batched mesh（per-vertex color，bg/fg 兩個 slot
     /// 一個 entity）。Capacity 8192 = 4096 entity × 2 (bg + fg)。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     hp_batch: Option<sprite_resources::BatchedSpriteMesh>,
 
     /// Facing arrow 共用 batched mesh（with rotation）。Capacity 4096。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     facing_batch: Option<sprite_resources::BatchedSpriteMesh>,
-
 
     // - - 網路 - -
     // 階段 5.1：刪除了舊版「network: Option<NetworkBridge>」欄位。
     /// Lockstep 用戶端（KCP 標籤 0x10-0x16）。透過驅動 sim_runner
     /// TickBatch / StateHash 在單獨的後台執行緒上。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
     /// 階段 4.3：觀察到最近的「LockstepEvent::TickBatch.tick」。
     /// 用於計算輸入的“target_tick = current_sim_tick + INPUT_LOOKAHEAD_TICKS”
     /// 提交（120 Hz、2 tick 時約 16.7 毫秒）。透過初始化為 0
     /// `#[導出（預設）]`;更新了 TickBatch 手臂中的每一幀
     /// `遊戲::更新`。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     current_sim_tick: u32,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     current_sim_tick_observed_at: Option<Instant>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     pending_inputs: HashMap<u32, PendingInput>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     pending_inputs_evict_at: Option<Instant>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     pending_inputs_evicted: u64,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     input_latency_meter: InputLatencyMeter,
     /// 階段 3.2 sim_runner 工作執行緒（執行完整的 omb ECS 排程器）
     /// 後台線程）。落在 `on_deinit` 上，所以頻道
     /// 斷開連線讓工作人員退出。階段 3.3 將連接輸入饋電
     /// 來自「lockstep_handle」；直到那時工人就會阻塞
     /// `master_seed_rx.recv()` 並且從不勾選。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
     /// 階段 3.4 渲染橋：每個畫面讀取 `SimWorldSnapshot` 並
     /// （第 4 階段）為每個實體產生/更新/消失 Fyrox sprite。
     /// 目前是記錄實體渲染資料的存根。始終分配
     /// （便宜的預設值）因此“update”中的每個畫面檢查只是一種方法
     /// 調用，而不是“Option”解包。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     render_bridge: render_bridge::RenderBridge,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     connection_status: ConnectionStatus,
     // 階段 5.1：刪除了 `event_buffer: Option<EventBuffer>` 欄位。
     // EventBuffer 驅動了舊版 GameEvent 重新排序/重播管道。
     // `network_entities` 欄位暫時保留 - 孤立渲染循環
     // Game::update 仍然迭代它（總是為空，因為 apply_event 是
     // 消失了）；階段 5.x 清理了循環 + 該欄位。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     network_entities: HashMap<u32, NetworkEntity>,
     /// BlockedRegion 線框 scene node（每個 region 一組 polygon outline segments）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     region_line_nodes: Vec<Handle<Node>>,
     /// Region blocker 近似圓 scene node（debug 視覺化；與 region 線框一起在 init 時畫）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     region_blocker_nodes: Vec<Handle<Node>>,
     /// TD 模式氣球路線的 scene node（每條 path 一組線段）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_path_nodes: Vec<Handle<Node>>,
     /// TD 模式右側塔按鈕的 UI Text node（動態 Vec：N 個塔來自 td_template_order 長度）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_td_tower_buttons: Vec<Handle<Text>>,
+    /// BTD-style 右側買塔格子（圖示 + 快捷鍵 + 價格）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_tower_cards: Vec<TdTowerShopCard>,
     /// 塔按鈕的 hit-test rects（x, y, w, h）—— 每 frame 依 window_size 更新
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_tower_button_rects: Vec<(f32, f32, f32, f32)>,
+    /// 右側常駐 shop/control panel：買塔 + Start/Pause placeholder。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_right_panel: TdRightShopPanel,
     /// 目前玩家選中的塔 unit_id（例如 "tower_dart"）；None 表示未選
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     selected_tower_kind: Option<String>,
     /// Start Round 按鈕 UI Text node。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_start_round_button: Handle<Text>,
     /// Start Round 按鈕 hit-test rect（每 frame 依 window_size 更新）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     start_round_button_rect: (f32, f32, f32, f32),
     /// TD 當前已完成的波數（1-based 概念；後端推送 `game/round` 時更新）。
     /// 0 表示還沒開始第一波。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     current_round: u32,
     /// TD 總波數（後端推送 `game/round` 時更新）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     total_rounds: u32,
     /// TD 本波是否正在跑（true = 按鈕變灰；false = 按鈕可按）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     round_is_running: bool,
     /// 是否為 TD 模式：由首次收到 hero.stats 有 lives>0 時設 true。
     /// 影響相機（固定不跟隨英雄）、zoom（拉遠讓整張路徑可見）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     is_td_mode: bool,
     /// 是否已經針對 TD 模式調整過相機 ortho（避免每 tick 重設）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_camera_configured: bool,
     /// 玩家點選中的已蓋塔 entity id（右側顯示 sell 面板、地圖上畫射程圈）；None = 未選取
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     selected_tower_entity: Option<u32>,
     /// 選中塔右側面板：塔名+等級 文字
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_td_sell_name_text: Handle<Text>,
     /// 選中塔右側面板：Sell 按鈕文字
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_td_sell_button_text: Handle<Text>,
     /// Sell 按鈕 hit-test rect（每 frame 依 window_size 更新；塔未選時放螢幕外）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_sell_button_rect: (f32, f32, f32, f32),
     /// 選中塔右側面板：3 條路線升級按鈕文字
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_td_upgrade_buttons: [Handle<Text>; 3],
+    /// BTD-style 左側 selected tower panel 補充圖示與文字 handles。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_selected_panel: TdSelectedTowerPanel,
     /// 3 條路線升級按鈕 hit-test rect；塔未選時放螢幕外
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_upgrade_button_rects: [(f32, f32, f32, f32); 3],
     /// 進行中的爆炸特效（Bomb 塔命中時 spawn）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     active_explosions: Vec<ActiveExplosion>,
     /// 階段 4.2：我們擁有「snapshot.explosions」的最高 sim 刻度
     /// 已排入「active_explosions」。渲染幀可以讀取
     /// 在SIM卡發布之前多次使用相同的快照
     /// 下一個 - 如果沒有這種重複資料刪除，我們就會產生重複的環。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     sim_last_explosion_tick: Option<u32>,
     /// TD 路徑 check_points（render 座標）— 供 placement 預覽計算是否壓到路
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_paths_render: Vec<Vec<Vector2<f32>>>,
     /// TD 禁止通行多邊形（render 座標）— 供 placement 預覽計算是否壓到 region
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_regions_render: Vec<Vec<Vector2<f32>>>,
     /// 後端送來的 TD 塔 template 快取（unit_id → TdTemplate）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_templates: HashMap<String, TdTemplate>,
     /// Template 的顯示順序（= DLL `units()` 註冊順序），供按鈕排版用
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_template_order: Vec<String>,
     /// Tower 升級定義快取：（tower_kind、路徑、等級）→（顯示名稱、成本）。
     /// 從「snapshot.tower_upgrades」（Arc 延遲建置模式）播種一次。
     /// 由「出售」按鈕用來計算退款（基礎*0.85 + Σ 升級*0.75）
     /// 並透過升級按鈕顯示下一級名稱+成本。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     td_upgrade_defs: HashMap<(String, u8, u8), (String, i32)>,
-    #[visit(skip)] #[reflect(hidden)]
+    /// TD UI texture cache：key 是 `data/td_ui/` 下的檔名；`None` 也 cache，避免缺圖每幀讀檔。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_ui_texture_cache: HashMap<String, Option<TextureResource>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
     /// P7分層預測：key = 彈丸id（伺服器`e.id()`）。
     /// 跟 client_projectiles 同 id；前者是視覺軌跡，這個是傷害預測 ledger。
     /// 視覺命中後 ClientProjectile 移除但 PendingPredDmg 留著，等 heartbeat
     /// 的 in_flight_projectiles 或 D event 真結算才移除。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     pending_pred_dmg: HashMap<u32, PendingPredDmg>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     heartbeat: HeartbeatInfo,
 
     /// Per-frame profile（每 60 frame 輸出一行 omfx_frame_profile log）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     frame_profile: FrameProfile,
 
     // --- 後端流程 ---
     /// 掉落 → 殺死後端。在整個遊戲生命週期內保持，以便任何退出
     /// 路徑（在 Windows 上透過作業對象正常、緊急、強制關閉）帶來
     /// 後端與我們一起關閉。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     backend_guard: Option<BackendGuard>,
 
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     pending_label_deletions: Vec<Handle<Text>>,
 
     /// 由「render_bridge」（sim_runner 支援）呈現的實體的 UI 文字標籤。
     /// 由“entity_id”鍵入。在實體的第一次渲染時創建，每次更新
     /// 框架，當實體從 sim 快照中退出時刪除。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     sim_entity_labels: HashMap<u32, SimEntityLabel>,
 
     /// sim_runner 支援的實體的批次網格槽所有權，由
@@ -898,125 +1041,165 @@ pub struct Game {
     /// 當實體從快照中掉落時看到並釋放。這是
     /// 節省繪製呼叫的路徑：1000 個小兵 + 1000 個塔 ≈ 總共 2 個繪製
     /// （每批一個），與每個實體一個節點，即每個四邊形一次繪製。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     sim_entity_slots: HashMap<u32, render_bridge::SimEntitySlots>,
 
     /// 子彈拖尾起點：第一次看到 projectile entity 時記下當前 render pos，
     /// 之後每 frame 從此點畫一條暖色拖尾到當前 pos。removed_entity_ids 觸發時
     /// 一起清除。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     projectile_spawn_pos: HashMap<u32, Vector2<f32>>,
 
     /// 第一幀的掛鐘時間戳；所使用的
     /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` 煙霧循環
     /// 因此，單一「cargo run」可以重現「開始-回合-然後-死亡」的場景
     /// 無需手動點擊。直到第一次 update() 勾選為止。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     auto_clock_start: Option<std::time::Instant>,
     /// 一旦發出自動開始回合輸入就鎖定，因此
     /// 調度程式只看到一個 StartRound（後續主機端讀取
     /// 會警告“回合已在運行”）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     auto_start_sent: bool,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     auto_noop_next_at_s: Option<f32>,
 
     // --- UI ---
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_status_text: Handle<Text>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_hud_text: Handle<Text>,
     /// 左下角英雄屬性面板（多行：name/title/Lv/XP/SP/三圍/HP/Gold + 4 技能等級）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_hero_stats_panel: Handle<Text>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_ability_icons: [Handle<UiNode>; 4],
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_ability_level_text: [Handle<Text>; 4],
     /// 冷卻中央大數字
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_ability_cd_text: [Handle<Text>; 4],
     /// 快捷鍵 cap [W] [E] [R] [T]
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_ability_key_text: [Handle<Text>; 4],
     /// 技能圖示上方三角升級按鈕
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_ability_upgrade_buttons: [Handle<Text>; 4],
     /// 4 技能圖片資源（HUD icon + tooltip icon 共用）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ability_textures: [Option<fyrox::resource::texture::TextureResource>; 4],
     /// 4 icon 的 screen AABB (x, y, w, h) — 供滑鼠 hit-test
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ability_icon_rects: [(f32, f32, f32, f32); 4],
     /// 4 個三角升級按鈕 hit-test rect；不可點擊時放螢幕外
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ability_upgrade_button_rects: [(f32, f32, f32, f32); 4],
     /// 技能詳細資訊 map（key = ability id），由 hero.abilities_info 事件填入
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ability_info_map: HashMap<String, AbilityInfo>,
     /// 原始滑鼠螢幕座標（pixel）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     mouse_screen_pos: Vector2<f32>,
     /// 目前 hover 的 ability slot index（0-3）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     hovered_ability: Option<usize>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_tooltip_bg: Handle<UiNode>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_tooltip_icon: Handle<UiNode>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_tooltip_text: Handle<Text>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_shop_text: Handle<Text>,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ui_end_text: Handle<Text>,
 
     // --- LoL MVP：从英雄缓存本地英雄状态。 *事件 ---
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     hero_state: LocalHeroState,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     shop_visible: bool,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     shift_held: bool,
     /// Ctrl 按住：蓋塔後不自動取消選塔模式（方便一次連蓋多個）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     ctrl_held: bool,
     /// Alt 按住：強制顯示 name label（即使 entity 數超過 NAME_LABEL_HIDE_THRESHOLD）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     alt_held: bool,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     game_ended: bool,
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     viewport_sync_elapsed: f32,
     /// 上一次實際送出的 viewport (cx, cy, hw, hh)；值不變就跳過送出避免 omb log 洗版與
     /// 無謂的 KCP decode + mutex/channel work。reconnect 時 reset 為 None 以強制重送。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     last_sent_viewport: Option<(f32, f32, f32, f32)>,
     /// Camera 目前所在 render-world 座標（用於滑鼠座標換算與 label 螢幕換算）
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     camera_world_pos: Vector2<f32>,
     /// 本秒累計的網路事件 logical (decompressed) payload bytes — UI 看「應用層」量
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     net_bytes_current: u64,
     /// 上一秒的總 logical bytes，供顯示用
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     net_bytes_last_sec: u64,
     /// 本秒累計的真實 wire bytes (壓縮後 + framing) — UI 看真實 bandwidth
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     net_wire_bytes_current: u64,
     /// 上一秒的真實 wire bytes
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     net_wire_bytes_last_sec: u64,
     /// 計時：每滿 1 秒 roll over
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     net_stats_elapsed: f32,
     /// 最新一次 PingResponse 算出的 RTT (微秒)；None = 尚未收到任何 pong。
     /// 由 lockstep bg thread 透過 LockstepEvent::Latency 推上來，1 Hz 更新。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     latest_rtt_us: Option<u64>,
     /// FPS 顯示字串（例 "FPS 250 (4.0ms)"），來自 Fyrox renderer 的 frames_per_second
     /// 統計（plugin update 是 fixed 60 Hz tick，自算 frame count 沒意義）。
-    #[visit(skip)] #[reflect(hidden)]
+    #[visit(skip)]
+    #[reflect(hidden)]
     fps_display: String,
 }
 
@@ -1077,7 +1260,7 @@ struct LocalHeroState {
     /// remaining < 0 代表無限期（例：toggle 型 sniper_mode）。前端每 tick 本地
     /// 遞減 remaining，讓倒數看起來連續；下次 push 會重設成權威值。
     buffs: Vec<LocalBuff>,
-    abilities: Vec<String>,          // ability ids, index 0=Q, 1=W, 2=E, 3=R
+    abilities: Vec<String>, // ability ids, index 0=Q, 1=W, 2=E, 3=R
     ability_levels: HashMap<String, i32>,
     /// 技能剩餘冷卻秒數（key = ability id），本地遞減
     ability_cd: HashMap<String, f32>,
@@ -1087,16 +1270,16 @@ struct LocalHeroState {
 
 /// MVP 商店清單（前端固定順序，對應後端 item id）
 const SHOP_ITEMS: &[(&str, &str, i32)] = &[
-    ("dmg_sword",    "長劍",       500),
-    ("dmg_rifle",    "無雙鐵炮",   1600),
-    ("hp_vest",      "皮甲",       450),
-    ("hp_armor",     "重裝甲",     1400),
-    ("mp_orb",       "法力珠",     400),
-    ("mp_staff",     "秘法杖",     1200),
-    ("ms_boots",     "戰靴",       400),
-    ("ms_swift",     "疾風之靴",   1300),
-    ("def_plate",    "鎖子甲",     500),
-    ("def_bulwark",  "堡壘之盾",   1500),
+    ("dmg_sword", "長劍", 500),
+    ("dmg_rifle", "無雙鐵炮", 1600),
+    ("hp_vest", "皮甲", 450),
+    ("hp_armor", "重裝甲", 1400),
+    ("mp_orb", "法力珠", 400),
+    ("mp_staff", "秘法杖", 1200),
+    ("ms_boots", "戰靴", 400),
+    ("ms_swift", "疾風之靴", 1300),
+    ("def_plate", "鎖子甲", 500),
+    ("def_bulwark", "堡壘之盾", 1500),
 ];
 
 impl Plugin for Game {
@@ -1114,13 +1297,15 @@ impl Plugin for Game {
 
         // 2D 渲染選項
         use fyrox::scene::SceneRenderingOptions;
-        scene.rendering_options.set_value_and_mark_modified(SceneRenderingOptions {
-            clear_color: Some(Color::from_rgba(30, 80, 30, 255)),
-            ambient_lighting_color: Color::WHITE,
-            environment_lighting_source: EnvironmentLightingSource::AmbientColor,
-            environment_lighting_brightness: 1.0,
-            ..Default::default()
-        });
+        scene
+            .rendering_options
+            .set_value_and_mark_modified(SceneRenderingOptions {
+                clear_color: Some(Color::from_rgba(30, 80, 30, 255)),
+                ambient_lighting_color: Color::WHITE,
+                environment_lighting_source: EnvironmentLightingSource::AmbientColor,
+                environment_lighting_brightness: 1.0,
+                ..Default::default()
+            });
 
         // Orthographic 3D camera 放在 z=-100，default look=+Z（不旋轉）。
         // 不旋轉相機，讓 `look_at_rh(eye, eye+look, up)` 算出的 side = world -X，
@@ -1177,15 +1362,12 @@ impl Plugin for Game {
 
         // 載入CJK字體（Microsoft JhengHei）進行中文文字渲染
         if let Ok(font_data) = std::fs::read("C:/Windows/Fonts/msjh.ttc") {
-            use fyrox::gui::font::{Font, FontResource, FontStyles};
             use fyrox::asset::untyped::ResourceKind;
             use fyrox::core::uuid::Uuid;
+            use fyrox::gui::font::{Font, FontResource, FontStyles};
             if let Ok(font) = Font::from_memory(font_data, 1024, FontStyles::default(), vec![]) {
-                let font_resource = FontResource::new_ok(
-                    Uuid::new_v4(),
-                    ResourceKind::Embedded,
-                    font,
-                );
+                let font_resource =
+                    FontResource::new_ok(Uuid::new_v4(), ResourceKind::Embedded, font);
                 ui.default_font = font_resource;
             }
         }
@@ -1225,40 +1407,41 @@ impl Plugin for Game {
                 ];
                 if let Ok(exe_path) = std::env::current_exe() {
                     if let Some(exe_dir) = exe_path.parent() {
-                        candidate_paths.push(
-                            exe_dir.join(&path).to_string_lossy().into_owned(),
-                        );
+                        candidate_paths.push(exe_dir.join(&path).to_string_lossy().into_owned());
                     }
                 }
-                let read_result = candidate_paths.iter().find_map(|p| {
-                    std::fs::read(p).ok().map(|b| (p.clone(), b))
-                });
-                let texture_opt: Option<TextureResource> = match read_result.as_ref().map(|(_, b)| b) {
-                    Some(bytes) => {
-                        let opts = TextureImportOptions::default()
-                            .with_compression(CompressionOptions::NoCompression)
-                            .with_minification_filter(TextureMinificationFilter::LinearMipMapLinear);
-                        match TextureResource::load_from_memory(
-                            Uuid::new_v4(),
-                            ResourceKind::Embedded,
-                            bytes,
-                            opts,
-                        ) {
-                            Ok(res) => {
-                                debug_state = "OK";
-                                Some(res)
-                            }
-                            Err(_) => {
-                                debug_state = "DECODE";
-                                None
+                let read_result = candidate_paths
+                    .iter()
+                    .find_map(|p| std::fs::read(p).ok().map(|b| (p.clone(), b)));
+                let texture_opt: Option<TextureResource> =
+                    match read_result.as_ref().map(|(_, b)| b) {
+                        Some(bytes) => {
+                            let opts = TextureImportOptions::default()
+                                .with_compression(CompressionOptions::NoCompression)
+                                .with_minification_filter(
+                                    TextureMinificationFilter::LinearMipMapLinear,
+                                );
+                            match TextureResource::load_from_memory(
+                                Uuid::new_v4(),
+                                ResourceKind::Embedded,
+                                bytes,
+                                opts,
+                            ) {
+                                Ok(res) => {
+                                    debug_state = "OK";
+                                    Some(res)
+                                }
+                                Err(_) => {
+                                    debug_state = "DECODE";
+                                    None
+                                }
                             }
                         }
-                    }
-                    None => {
-                        debug_state = "READ";
-                        None
-                    }
-                };
+                        None => {
+                            debug_state = "READ";
+                            None
+                        }
+                    };
 
                 let _ = debug_state; // reserved for future logging
                 let icon_handle: Handle<UiNode> = if let Some(ref resource) = texture_opt {
@@ -1314,13 +1497,14 @@ impl Plugin for Game {
 
                 let upgrade = TextBuilder::new(
                     WidgetBuilder::new()
-                        .with_desired_position(Vector2::new(init_x + 20.0, init_y - 42.0))
-                        .with_width(24.0)
-                        .with_height(24.0)
+                        .with_desired_position(Vector2::new(init_x, init_y - 32.0))
+                        .with_width(icon_size)
+                        .with_height(32.0)
                         .with_foreground(Brush::Solid(Color::from_rgba(80, 255, 80, 255)).into()),
                 )
                 .with_text("".to_string())
-                .with_font_size(20.0.into())
+                .with_font_size(32.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .build(&mut ui.build_ctx());
                 self.ui_ability_upgrade_buttons[i] = upgrade;
                 self.ability_upgrade_button_rects[i] = (-9999.0, -9999.0, 0.0, 0.0);
@@ -1433,6 +1617,146 @@ impl Plugin for Game {
             }
         }
 
+        // BTD-style 左側 selected tower panel：圖片資源缺失時仍由文字 fallback 顯示。
+        {
+            let mut bg_builder = ImageBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(340.0)
+                    .with_height(760.0),
+            );
+            if let Some(tex) = load_td_ui_texture("panel_left.png") {
+                bg_builder = bg_builder.with_texture(tex);
+            }
+            self.ui_td_selected_panel.bg = bg_builder.build(&mut ui.build_ctx()).transmute();
+
+            self.ui_td_selected_panel.tower_icon = {
+                let h: Handle<fyrox::gui::image::Image> = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(128.0)
+                        .with_height(128.0),
+                )
+                .build(&mut ui.build_ctx());
+                h.transmute()
+            };
+            self.ui_td_selected_panel.summary_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(300.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(55, 32, 12, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(16.0.into())
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.gold_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(140.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 245, 205, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(24.0.into())
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.sell_icon = {
+                let mut builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(42.0)
+                        .with_height(42.0),
+                );
+                if let Some(tex) = load_td_ui_texture("sell.png") {
+                    builder = builder.with_texture(tex);
+                }
+                let h: Handle<fyrox::gui::image::Image> = builder.build(&mut ui.build_ctx());
+                h.transmute()
+            };
+            for i in 0..3 {
+                self.ui_td_selected_panel.upgrade_icons[i] = {
+                    let mut builder = ImageBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(56.0)
+                            .with_height(56.0),
+                    );
+                    if let Some(tex) = load_td_ui_texture(&format!("upgrade_p{}.png", i + 1)) {
+                        builder = builder.with_texture(tex);
+                    }
+                    let h: Handle<fyrox::gui::image::Image> = builder.build(&mut ui.build_ctx());
+                    h.transmute()
+                };
+                self.ui_td_selected_panel.upgrade_price_texts[i] = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(96.0)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+                )
+                .with_text(String::new())
+                .with_font_size(22.0.into())
+                .build(&mut ui.build_ctx());
+            }
+        }
+
+        // BTD-style 右側 shop/control panel：買塔常駐，Start/Pause 固定右側。
+        {
+            let mut bg_builder = ImageBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(320.0)
+                    .with_height(920.0),
+            );
+            if let Some(tex) = load_td_ui_texture("panel_right.png") {
+                bg_builder = bg_builder.with_texture(tex);
+            }
+            self.ui_td_right_panel.bg = bg_builder.build(&mut ui.build_ctx()).transmute();
+            self.ui_td_right_panel.title_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(260.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 245, 225, 255)).into()),
+            )
+            .with_text("塔商店".to_string())
+            .with_font_size(26.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_right_panel.start_icon = {
+                let mut builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(66.0)
+                        .with_height(66.0),
+                );
+                if let Some(tex) = load_td_ui_texture("start_round.png") {
+                    builder = builder.with_texture(tex);
+                }
+                let h: Handle<fyrox::gui::image::Image> = builder.build(&mut ui.build_ctx());
+                h.transmute()
+            };
+            self.ui_td_right_panel.pause_icon = {
+                let mut builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(66.0)
+                        .with_height(66.0),
+                );
+                if let Some(tex) = load_td_ui_texture("pause.png") {
+                    builder = builder.with_texture(tex);
+                }
+                let h: Handle<fyrox::gui::image::Image> = builder.build(&mut ui.build_ctx());
+                h.transmute()
+            };
+            self.ui_td_right_panel.pause_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(96.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(245, 245, 245, 180)).into()),
+            )
+            .with_text("PAUSE".to_string())
+            .with_font_size(14.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .build(&mut ui.build_ctx());
+        }
+
         // Start Round 按鈕（右下角）
         {
             self.ui_start_round_button = TextBuilder::new(
@@ -1450,7 +1774,9 @@ impl Plugin for Game {
         // TD 模式右側塔按鈕（text-only，動態 Vec）
         // 收到 game/tower_templates 事件後才建；此時空 Vec
         self.ui_td_tower_buttons = Vec::new();
+        self.ui_td_tower_cards = Vec::new();
         self.td_tower_button_rects = Vec::new();
+        self.td_ui_texture_cache = HashMap::new();
 
         // 商店面板（初始空字串；按 B 切換顯示內容）
         self.ui_shop_text = TextBuilder::new(
@@ -1481,10 +1807,10 @@ impl Plugin for Game {
         self.backend_guard = spawn_backend();
 
         // 網路初始化
-        let server_addr = std::env::var("OMB_KCP_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:50061".to_string());
-        let player_name = std::env::var("OMB_PLAYER_NAME")
-            .unwrap_or_else(|_| "omfx_player".to_string());
+        let server_addr =
+            std::env::var("OMB_KCP_ADDR").unwrap_or_else(|_| "127.0.0.1:50061".to_string());
+        let player_name =
+            std::env::var("OMB_PLAYER_NAME").unwrap_or_else(|_| "omfx_player".to_string());
 
         // 階段 5.1：NetworkBridge 消費者削減。階段 4.5 翻轉 omb
         // `legacy_broadcast` 預設關閉，因此 0x02 GameEvent 串流是
@@ -1514,9 +1840,7 @@ impl Plugin for Game {
             // 取得父目錄並掃描 .dll，因此這對兩者都適用。
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    PathBuf::from("D:/omoba/omb/scripts/base_content.dll")
-                });
+                .unwrap_or_else(|_| PathBuf::from("D:/omoba/omb/scripts/base_content.dll"));
             // omobab::ServerSetting::default 透過相對路徑讀取“game.toml”
             // （適用於帶有 cwd=omb 的 omobab.exe）。 omfx 進程 cwd 在其他地方，
             // 所以將lazy_static指向絕對路徑。
@@ -1542,8 +1866,12 @@ impl Plugin for Game {
                                 .find_map(|l| {
                                     let mut parts = l.splitn(2, '=');
                                     let key = parts.next()?.trim();
-                                    if key != "STORY" { return None; }
-                                    let val = parts.next()?.trim()
+                                    if key != "STORY" {
+                                        return None;
+                                    }
+                                    let val = parts
+                                        .next()?
+                                        .trim()
                                         .trim_start_matches('"')
                                         .trim_end_matches('"')
                                         .to_string();
@@ -1652,7 +1980,9 @@ impl Plugin for Game {
                     if elapsed_s < start_after_s {
                         self.auto_noop_next_at_s = Some(start_after_s + interval_s);
                     } else {
-                        let next_at = self.auto_noop_next_at_s.unwrap_or(start_after_s + interval_s);
+                        let next_at = self
+                            .auto_noop_next_at_s
+                            .unwrap_or(start_after_s + interval_s);
                         if elapsed_s >= next_at {
                             let input = omoba_core::kcp::game_proto::PlayerInput {
                                 action: Some(
@@ -1680,7 +2010,8 @@ impl Plugin for Game {
                 if elapsed_s >= threshold {
                     log::info!(
                         "[auto-smoke] exiting at t={:.2}s (OMFX_AUTO_EXIT_AFTER_SEC={})",
-                        elapsed_s, v
+                        elapsed_s,
+                        v
                     );
                     std::process::exit(0);
                 }
@@ -1729,40 +2060,54 @@ impl Plugin for Game {
         // sim_runner 用於非同步偵測的本地雜湊）。
         // - 斷開連接 → 記錄。
         // TickBatch 每秒採樣一次，以避免日誌垃圾郵件。
+        let mut forwarded_pending_input_ids: Vec<u32> = Vec::new();
         if let (Some(ref lh), Some(ref sim)) = (
             self.lockstep_handle.as_ref(),
             self.sim_runner_handle.as_ref(),
         ) {
             while let Ok(ev) = lh.events_rx.try_recv() {
                 match ev {
-                    lockstep_client::LockstepEvent::Connected { master_seed, player_id } => {
+                    lockstep_client::LockstepEvent::Connected {
+                        master_seed,
+                        player_id,
+                    } => {
                         log::info!(
                             "[lockstep] connected master_seed=0x{:016x} player_id={}",
-                            master_seed, player_id
+                            master_seed,
+                            player_id
                         );
                         if let Err(e) = sim.master_seed_tx.send(master_seed) {
                             log::error!("[lockstep] failed to forward master_seed: {}", e);
                         }
                     }
-                    lockstep_client::LockstepEvent::TickBatch { tick, inputs, server_events } => {
+                    lockstep_client::LockstepEvent::TickBatch {
+                        tick,
+                        inputs,
+                        server_events,
+                    } => {
                         // 階段 4.3：追蹤輸入 target_tick 數學的最新 sim 刻度。
                         self.current_sim_tick = tick;
                         self.current_sim_tick_observed_at = Some(now);
                         if tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
                             log::debug!(
                                 "[lockstep] tick={} inputs={} events={}",
-                                tick, inputs.len(), server_events.len()
+                                tick,
+                                inputs.len(),
+                                server_events.len()
                             );
                         }
                         let game_forward_us = wall_clock_us();
                         for input in &inputs {
-                            if input.input_id == 0 { continue; }
+                            if input.input_id == 0 {
+                                continue;
+                            }
                             if let Some(pending) = self.pending_inputs.get_mut(&input.input_id) {
                                 pending.client_receive_tickbatch_us = Some(input.client_receive_us);
                                 pending.game_forward_to_sim_us = Some(game_forward_us);
                                 pending.server_receive_tick = Some(input.server_receive_tick);
                                 pending.server_drain_tick = Some(input.server_drain_tick);
                                 pending.server_queue_us = Some(input.server_queue_us);
+                                forwarded_pending_input_ids.push(input.input_id);
                             }
                         }
                         // 橋接 omoba_core 的 PlayerInput 類型 → omobab 的
@@ -1771,15 +2116,17 @@ impl Plugin for Game {
                         let converted: Vec<sim_runner::TickBatchInput> = inputs
                             .into_iter()
                             .filter_map(|input| {
-                                convert_player_input(&input.input).map(|out| sim_runner::TickBatchInput {
-                                    player_id: input.player_id,
-                                    input: out,
-                                    input_id: input.input_id,
-                                    server_receive_tick: input.server_receive_tick,
-                                    server_drain_tick: input.server_drain_tick,
-                                    server_queue_us: input.server_queue_us,
-                                    client_receive_us: input.client_receive_us,
-                                    game_forward_us,
+                                convert_player_input(&input.input).map(|out| {
+                                    sim_runner::TickBatchInput {
+                                        player_id: input.player_id,
+                                        input: out,
+                                        input_id: input.input_id,
+                                        server_receive_tick: input.server_receive_tick,
+                                        server_drain_tick: input.server_drain_tick,
+                                        server_queue_us: input.server_queue_us,
+                                        client_receive_us: input.client_receive_us,
+                                        game_forward_us,
+                                    }
                                 })
                             })
                             .collect();
@@ -1798,7 +2145,10 @@ impl Plugin for Game {
                         // 第 3.4 階段將將此與
                         // sim_runner 的本地計算雜湊。
                     }
-                    lockstep_client::LockstepEvent::NetStats { wire_delta, logical_delta } => {
+                    lockstep_client::LockstepEvent::NetStats {
+                        wire_delta,
+                        logical_delta,
+                    } => {
                         self.net_wire_bytes_current += wire_delta;
                         self.net_bytes_current += logical_delta;
                     }
@@ -1831,6 +2181,7 @@ impl Plugin for Game {
         // 下面是 SIM 權威擁有的實體。
         let mut applied_inputs_to_pair: Option<Vec<sim_runner::AppliedInputMeta>> = None;
         if let Some(ref sim) = self.sim_runner_handle {
+            self.wait_for_applied_input_snapshot(sim, &forwarded_pending_input_ids);
             if let Ok(snapshot) = sim.state.try_lock() {
                 self.render_bridge.update(&*snapshot, scene);
                 applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
@@ -1843,10 +2194,14 @@ impl Plugin for Game {
                 // sim_runner 以共享 lockstep cadence 運作。
                 self.heartbeat.game_time = ticks_to_seconds_f64(snapshot.tick);
                 self.heartbeat.entity_count = snapshot.entities.len() as u64;
-                self.heartbeat.hero_count = snapshot.entities.iter()
+                self.heartbeat.hero_count = snapshot
+                    .entities
+                    .iter()
                     .filter(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
                     .count() as u64;
-                self.heartbeat.creep_count = snapshot.entities.iter()
+                self.heartbeat.creep_count = snapshot
+                    .entities
+                    .iter()
                     .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
                     .count() as u64;
 
@@ -1876,10 +2231,8 @@ impl Plugin for Game {
                         // SceneDrawingContext（匹配 build_line_segment /
                         // add_circle_lines 約定）。此處預翻
                         // 會雙翻轉→鏡像爆炸位置。
-                        let render_pos = Vector2::new(
-                            ex.pos_x * WORLD_SCALE,
-                            ex.pos_y * WORLD_SCALE,
-                        );
+                        let render_pos =
+                            Vector2::new(ex.pos_x * WORLD_SCALE, ex.pos_y * WORLD_SCALE);
                         let max_radius = ex.radius * WORLD_SCALE;
                         let duration = (ex.duration_ms as f32 / 1000.0).max(0.05);
                         self.active_explosions.push(ActiveExplosion {
@@ -1975,9 +2328,8 @@ impl Plugin for Game {
                         entry.collision_radius_render = hit_radius_backend * WORLD_SCALE;
                         entry.attack_range_backend = range_backend;
                     }
-                    self.network_entities.retain(|id, ent| {
-                        ent.entity_type != "tower" || alive_towers.contains(id)
-                    });
+                    self.network_entities
+                        .retain(|id, ent| ent.entity_type != "tower" || alive_towers.contains(id));
                 }
 
                 // 階段 4.5：AbilityRegistry→ability_info_map。靜止的
@@ -2026,8 +2378,7 @@ impl Plugin for Game {
                 // 階段 3.x：渲染座標中的 TD 路徑檢查點
                 // `point_segment_dist_sq` 放置檢查。同樣的一擊
                 // 作為區域的人口格局。
-                if !snapshot.paths.is_empty()
-                    && self.td_paths_render.len() != snapshot.paths.len()
+                if !snapshot.paths.is_empty() && self.td_paths_render.len() != snapshot.paths.len()
                 {
                     self.td_paths_render = snapshot
                         .paths
@@ -2044,7 +2395,9 @@ impl Plugin for Game {
                 // 攜帶英雄元資料（名稱/頭銜/等級/經驗值/金幣/
                 // 力量/敏捷/智力/主要屬性）所以
                 // 面板可以以與舊版 NetworkBridge 路徑相同的方式呈現。
-                if let Some(hero) = snapshot.entities.iter()
+                if let Some(hero) = snapshot
+                    .entities
+                    .iter()
                     .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
                 {
                     self.hero_state.hp = hero.hp as f32;
@@ -2143,14 +2496,10 @@ impl Plugin for Game {
                         self.hero_state.ability_levels.clear();
                         for (i, id_opt) in ext.ability_ids.iter().enumerate() {
                             if let Some(id) = id_opt {
-                                self.hero_state.ability_levels.insert(
-                                    id.clone(),
-                                    ext.ability_levels[i],
-                                );
                                 self.hero_state
-                                    .ability_cd
-                                    .entry(id.clone())
-                                    .or_insert(0.0);
+                                    .ability_levels
+                                    .insert(id.clone(), ext.ability_levels[i]);
+                                self.hero_state.ability_cd.entry(id.clone()).or_insert(0.0);
                             }
                         }
                     } else {
@@ -2262,7 +2611,11 @@ impl Plugin for Game {
 
             // [DEBUG-STRESS] 抓 NaN / Inf / 怪座標：creep 不該飛出 ±5000 範圍
             if entity.entity_type == "creep" {
-                if !pos.x.is_finite() || !pos.y.is_finite() || pos.x.abs() > 5000.0 || pos.y.abs() > 5000.0 {
+                if !pos.x.is_finite()
+                    || !pos.y.is_finite()
+                    || pos.x.abs() > 5000.0
+                    || pos.y.abs() > 5000.0
+                {
                     log::warn!(
                         "🤡 weird creep pos id={} pos=({},{}) prev=({},{}) target=({},{}) lerp_t_dur={}/{} extrap_v={} extrap_dur={}",
                         entity_id, pos.x, pos.y,
@@ -2297,7 +2650,10 @@ impl Plugin for Game {
                 // P7 layered display HP：authoritative h 減去已 applied 但 server 還沒
                 // 反映的預測扣血，讓 visual 在子彈視覺命中當下就掉血、heartbeat reconcile
                 // 後 pending 從 retain 被移除、h 也對應降下，畫面值不會跳。
-                let pending_dmg = pending_dmg_by_target.get(&entity_id).copied().unwrap_or(0.0);
+                let pending_dmg = pending_dmg_by_target
+                    .get(&entity_id)
+                    .copied()
+                    .unwrap_or(0.0);
                 let display_h = (h - pending_dmg).max(0.0);
                 let hp_ratio = (display_h / m).clamp(0.0, 1.0);
                 let bar_w = 0.8_f32;
@@ -2376,13 +2732,16 @@ impl Plugin for Game {
                 if entity.collision_radius_render <= 0.0 {
                     continue;
                 }
-                if !matches!(entity.entity_type.as_str(), "hero" | "creep" | "unit" | "tower") {
+                if !matches!(
+                    entity.entity_type.as_str(),
+                    "hero" | "creep" | "unit" | "tower"
+                ) {
                     continue;
                 }
                 // 顏色依類型區分，方便辨識
                 let color = match entity.entity_type.as_str() {
-                    "hero" => Color::from_rgba(80, 220, 80, 220),    // 綠
-                    "creep" => Color::from_rgba(255, 60, 60, 220),   // 紅
+                    "hero" => Color::from_rgba(80, 220, 80, 220),  // 綠
+                    "creep" => Color::from_rgba(255, 60, 60, 220), // 紅
                     "unit" | "tower" => Color::from_rgba(80, 160, 255, 220), // 藍
                     _ => Color::from_rgba(255, 255, 255, 220),
                 };
@@ -2430,81 +2789,85 @@ impl Plugin for Game {
         let t_visual = std::time::Instant::now();
         {
             if let Some(kind) = self.selected_tower_kind.clone() {
-              if let Some(tpl) = self.td_templates.get(&kind).cloned() {
-                let footprint_backend = tpl.footprint_backend;
-                let range_backend = tpl.range_backend;
-                let cost = tpl.cost;
-                let mwp = self.mouse_world_pos;
-                // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
-                const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
-                let footprint_render = footprint_backend * WORLD_SCALE;
-                let clear_render = (footprint_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
-                let clear_sq = clear_render * clear_render;
-                let mut can_place = self.hero_state.gold >= cost;
-                if can_place {
-                    // 壓到 path？
-                    'outer: for path in &self.td_paths_render {
-                        for i in 0..path.len().saturating_sub(1) {
-                            if point_segment_dist_sq(mwp, path[i], path[i+1]) < clear_sq {
-                                can_place = false;
-                                break 'outer;
+                if let Some(tpl) = self.td_templates.get(&kind).cloned() {
+                    let footprint_backend = tpl.footprint_backend;
+                    let range_backend = tpl.range_backend;
+                    let cost = tpl.cost;
+                    let mwp = self.mouse_world_pos;
+                    // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
+                    const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
+                    let footprint_render = footprint_backend * WORLD_SCALE;
+                    let clear_render = (footprint_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
+                    let clear_sq = clear_render * clear_render;
+                    let mut can_place = self.hero_state.gold >= cost;
+                    if can_place {
+                        // 壓到 path？
+                        'outer: for path in &self.td_paths_render {
+                            for i in 0..path.len().saturating_sub(1) {
+                                if point_segment_dist_sq(mwp, path[i], path[i + 1]) < clear_sq {
+                                    can_place = false;
+                                    break 'outer;
+                                }
                             }
                         }
                     }
-                }
-                if can_place {
-                    // 壓到 region？
-                    for poly in &self.td_regions_render {
-                        if circle_hits_polygon(mwp, footprint_render, poly) {
-                            can_place = false;
-                            break;
+                    if can_place {
+                        // 壓到 region？
+                        for poly in &self.td_regions_render {
+                            if circle_hits_polygon(mwp, footprint_render, poly) {
+                                can_place = false;
+                                break;
+                            }
                         }
                     }
-                }
-                if can_place {
-                    // 與其他塔重疊？（只看 TD 塔）
-                    for ent in self.network_entities.values() {
-                        if ent.entity_type != "tower" { continue }
-                        if ent.tower_kind.is_none() { continue }
-                        let min_d = ent.collision_radius_render + footprint_render;
-                        if (ent.position - mwp).norm_squared() < min_d * min_d {
-                            can_place = false;
-                            break;
+                    if can_place {
+                        // 與其他塔重疊？（只看 TD 塔）
+                        for ent in self.network_entities.values() {
+                            if ent.entity_type != "tower" {
+                                continue;
+                            }
+                            if ent.tower_kind.is_none() {
+                                continue;
+                            }
+                            let min_d = ent.collision_radius_render + footprint_render;
+                            if (ent.position - mwp).norm_squared() < min_d * min_d {
+                                can_place = false;
+                                break;
+                            }
                         }
                     }
-                }
 
-                // 可蓋 → 綠；不可蓋 → 紅
-                let (foot_color, range_color) = if can_place {
-                    (
-                        Color::from_rgba(80, 220, 120, 220),
-                        Color::from_rgba(255, 255, 255, 160),
-                    )
-                } else {
-                    (
-                        Color::from_rgba(230, 50, 50, 240),
-                        Color::from_rgba(230, 80, 80, 160),
-                    )
-                };
-                // 內圈：footprint
-                add_circle_lines(
-                    scene,
-                    mwp,
-                    footprint_render,
-                    24,
-                    foot_color,
-                    Z_REGION - 0.0002,
-                );
-                // 外圈：攻擊範圍
-                add_circle_lines(
-                    scene,
-                    mwp,
-                    range_backend * WORLD_SCALE,
-                    48,
-                    range_color,
-                    Z_REGION - 0.0001,
-                );
-              } // end of `if let Some(tpl) = ...`
+                    // 可蓋 → 綠；不可蓋 → 紅
+                    let (foot_color, range_color) = if can_place {
+                        (
+                            Color::from_rgba(80, 220, 120, 220),
+                            Color::from_rgba(255, 255, 255, 160),
+                        )
+                    } else {
+                        (
+                            Color::from_rgba(230, 50, 50, 240),
+                            Color::from_rgba(230, 80, 80, 160),
+                        )
+                    };
+                    // 內圈：footprint
+                    add_circle_lines(
+                        scene,
+                        mwp,
+                        footprint_render,
+                        24,
+                        foot_color,
+                        Z_REGION - 0.0002,
+                    );
+                    // 外圈：攻擊範圍
+                    add_circle_lines(
+                        scene,
+                        mwp,
+                        range_backend * WORLD_SCALE,
+                        48,
+                        range_color,
+                        Z_REGION - 0.0001,
+                    );
+                } // end of `if let Some(tpl) = ...`
             }
         }
 
@@ -2535,12 +2898,12 @@ impl Plugin for Game {
                     for k in 1..=SEGS {
                         let theta = (k as f32) * std::f32::consts::TAU / (SEGS as f32);
                         let (s, c) = theta.sin_cos();
-                        let next = Vector3::new(
-                            -(ex.pos.x + cur_r * c),
-                            ex.pos.y + cur_r * s,
-                            z,
-                        );
-                        scene.drawing_context.add_line(Line { begin: prev, end: next, color });
+                        let next = Vector3::new(-(ex.pos.x + cur_r * c), ex.pos.y + cur_r * s, z);
+                        scene.drawing_context.add_line(Line {
+                            begin: prev,
+                            end: next,
+                            color,
+                        });
                         prev = next;
                     }
                 }
@@ -2609,7 +2972,11 @@ impl Plugin for Game {
             for (h, offset) in &proj.hit_ring {
                 scene.graph[*h]
                     .local_transform_mut()
-                    .set_position(Vector3::new(-(pos.x + offset.x), pos.y + offset.y, Z_BULLET + 0.0001));
+                    .set_position(Vector3::new(
+                        -(pos.x + offset.x),
+                        pos.y + offset.y,
+                        Z_BULLET + 0.0001,
+                    ));
             }
             if t >= 1.0 {
                 // 方向性子彈的 damage 由後端 H 事件授權，不做 optimistic 扣血
@@ -2660,8 +3027,8 @@ impl Plugin for Game {
         if self.is_td_mode {
             if !self.td_camera_configured {
                 // 一次性：放大視角、鎖定在原點
-                if let Some(cam) = scene.graph[self.camera]
-                    .cast_mut::<fyrox::scene::camera::Camera>()
+                if let Some(cam) =
+                    scene.graph[self.camera].cast_mut::<fyrox::scene::camera::Camera>()
                 {
                     cam.set_projection(Projection::Orthographic(OrthographicProjection {
                         z_near: 0.1,
@@ -2756,7 +3123,9 @@ impl Plugin for Game {
                 let screen_pos = world_to_screen_approx(
                     entity.position.x - self.camera_world_pos.x,
                     name_world_y - self.camera_world_pos.y,
-                    win.x, win.y, world_height,
+                    win.x,
+                    win.y,
+                    world_height,
                 );
                 let pos = Vector2::new(screen_pos.x - 90.0, screen_pos.y - 24.0);
                 let pos_changed = (pos.x - entity.last_label_pos.x).abs() >= 1.0
@@ -2771,7 +3140,10 @@ impl Plugin for Game {
                 // P7 layered：跟 HP bar 一致，扣掉 applied 但 server 還沒反映的預測扣血
                 let text = match entity.health {
                     Some((h, m)) => {
-                        let pending_dmg = pending_dmg_by_target.get(&entity_id).copied().unwrap_or(0.0);
+                        let pending_dmg = pending_dmg_by_target
+                            .get(&entity_id)
+                            .copied()
+                            .unwrap_or(0.0);
                         let display_h = (h - pending_dmg).max(0.0);
                         format!("{} {:.0}/{:.0}", entity.name, display_h.round(), m.round())
                     }
@@ -2807,7 +3179,8 @@ impl Plugin for Game {
                     let display_name = if !entity.hero_name.is_empty() {
                         entity.hero_name.clone()
                     } else if !entity.unit_id.is_empty() {
-                        entity.unit_id
+                        entity
+                            .unit_id
                             .strip_prefix("creep_")
                             .or_else(|| entity.unit_id.strip_prefix("tower_"))
                             .or_else(|| entity.unit_id.strip_prefix("hero_"))
@@ -2825,7 +3198,11 @@ impl Plugin for Game {
                     // 標記為不活動，以便循環後保留步驟刪除任何
                     // 從前一幀中徘徊的陳舊小部件
                     // （例如，塔剛剛出售或從未升級）。
-                    if is_tower && entity.upgrade_levels.map_or(true, |lv| lv.iter().all(|&n| n == 0)) {
+                    if is_tower
+                        && entity
+                            .upgrade_levels
+                            .map_or(true, |lv| lv.iter().all(|&n| n == 0))
+                    {
                         alive.remove(&entity.entity_id);
                         continue;
                     }
@@ -2837,12 +3214,7 @@ impl Plugin for Game {
                             _ => String::new(),
                         }
                     } else if entity.max_hp > 0 {
-                        format!(
-                            "{} {}/{}",
-                            display_name,
-                            entity.hp.max(0),
-                            entity.max_hp
-                        )
+                        format!("{} {}/{}", display_name, entity.hp.max(0), entity.max_hp)
                     } else {
                         display_name
                     };
@@ -2883,17 +3255,22 @@ impl Plugin for Game {
                             WidgetBuilder::new()
                                 .with_desired_position(pos)
                                 .with_width(220.0)
-                                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                                .with_foreground(
+                                    Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into(),
+                                ),
                         )
                         .with_text(text.clone())
                         .with_font_size(20.0.into())
                         .with_horizontal_text_alignment(HorizontalAlignment::Center)
                         .build(&mut ui.build_ctx());
-                        self.sim_entity_labels.insert(entity.entity_id, SimEntityLabel {
-                            handle,
-                            last_text: text,
-                            last_pos: pos,
-                        });
+                        self.sim_entity_labels.insert(
+                            entity.entity_id,
+                            SimEntityLabel {
+                                handle,
+                                last_text: text,
+                                last_pos: pos,
+                            },
+                        );
                     }
                 }
 
@@ -2938,8 +3315,8 @@ impl Plugin for Game {
                         format!("{} B/s", bps)
                     }
                 };
-                let wire_str = fmt_bps(self.net_wire_bytes_last_sec);   // 真實 UDP wire (壓縮後)
-                let logical_str = fmt_bps(self.net_bytes_last_sec);      // 解壓後 logical
+                let wire_str = fmt_bps(self.net_wire_bytes_last_sec); // 真實 UDP wire (壓縮後)
+                let logical_str = fmt_bps(self.net_bytes_last_sec); // 解壓後 logical
                 let ping_str = match self.latest_rtt_us {
                     Some(us) => format!("{:.1} ms", us as f64 / 1000.0),
                     None => "—".into(),
@@ -2979,7 +3356,10 @@ impl Plugin for Game {
         let status_str = if self.fps_display.is_empty() {
             format!("{} | {}", render_stats_part, connection_part)
         } else {
-            format!("{} | {} | {}", self.fps_display, render_stats_part, connection_part)
+            format!(
+                "{} | {} | {}",
+                self.fps_display, render_stats_part, connection_part
+            )
         };
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
@@ -3029,117 +3409,325 @@ impl Plugin for Game {
                     if self.ui_ability_upgrade_buttons[i] != Handle::<Text>::NONE {
                         ui.send(
                             self.ui_ability_upgrade_buttons[i],
-                            WidgetMessage::DesiredPosition(Vector2::new(x + 20.0, icon_y - 42.0)),
+                            WidgetMessage::DesiredPosition(Vector2::new(x, icon_y - 32.0)),
                         );
                     }
                 }
             }
 
-            // ===== TD 模式右側塔按鈕（動態：數量 = td_template_order.len()） =====
-            // 數量與順序由後端 tower_templates 事件決定（DLL units() 註冊順序）
+            // ===== BTD-style 右側 shop/control panel =====
             {
-                let btn_w = 240.0f32;
-                let btn_h = 36.0f32;
-                let btn_spacing = 44.0f32;
-                let right_margin = 20.0f32;
-                let x = self.window_size.x - btn_w - right_margin;
-                let base_y = 80.0f32;
+                let right_margin = 12.0f32;
+                let panel_w = if self.window_size.x < 1150.0 { 246.0 } else { 286.0 };
+                let panel_x = (self.window_size.x - panel_w - right_margin).max(0.0);
+                let panel_y = 48.0f32;
+                let panel_h = (self.window_size.y - panel_y - 12.0).max(420.0);
+                ui.send(
+                    self.ui_td_right_panel.bg,
+                    WidgetMessage::DesiredPosition(Vector2::new(panel_x, panel_y)),
+                );
+                ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel_w));
+                ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel_h));
+                ui.send(
+                    self.ui_td_right_panel.title_text,
+                    WidgetMessage::DesiredPosition(Vector2::new(panel_x + 14.0, panel_y + 14.0)),
+                );
+                ui.send(
+                    self.ui_td_right_panel.title_text,
+                    TextMessage::Text("塔商店".to_string()),
+                );
 
                 let n = self.td_template_order.len();
-                // 不夠就補 TextBuilder
-                while self.ui_td_tower_buttons.len() < n {
-                    let h = TextBuilder::new(
+                while self.ui_td_tower_cards.len() < n {
+                    let mut bg_builder = ImageBuilder::new(
                         WidgetBuilder::new()
-                            .with_desired_position(Vector2::new(-9999.0, -9999.0))
-                            .with_width(btn_w)
-                            .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(128.0)
+                            .with_height(138.0),
+                    );
+                    if let Some(tex) = load_td_ui_texture("shop_card.png") {
+                        bg_builder = bg_builder.with_texture(tex);
+                    }
+                    let bg: Handle<UiNode> = bg_builder.build(&mut ui.build_ctx()).transmute();
+                    let icon: Handle<UiNode> = ImageBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(64.0)
+                            .with_height(64.0),
+                    )
+                    .build(&mut ui.build_ctx())
+                    .transmute();
+                    let key_text = TextBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(40.0)
+                            .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
                     )
                     .with_text(String::new())
-                    .with_font_size(18.0.into())
+                    .with_font_size(17.0.into())
                     .build(&mut ui.build_ctx());
-                    self.ui_td_tower_buttons.push(h);
-                    self.td_tower_button_rects.push((-9999.0, -9999.0, btn_w, btn_h));
+                    let name_text = TextBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(116.0)
+                            .with_foreground(Brush::Solid(Color::from_rgba(35, 18, 6, 255)).into()),
+                    )
+                    .with_text(String::new())
+                    .with_font_size(15.0.into())
+                    .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                    .build(&mut ui.build_ctx());
+                    let price_text = TextBuilder::new(
+                        WidgetBuilder::new()
+                            .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                            .with_width(112.0)
+                            .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+                    )
+                    .with_text(String::new())
+                    .with_font_size(24.0.into())
+                    .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                    .build(&mut ui.build_ctx());
+                    self.ui_td_tower_cards.push(TdTowerShopCard {
+                        bg,
+                        icon,
+                        key_text,
+                        name_text,
+                        price_text,
+                    });
+                    self.td_tower_button_rects
+                        .push((UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0));
                 }
-                // 多了就藏起來（不 remove；避免頻繁 create/destroy）
-                for i in n..self.ui_td_tower_buttons.len() {
-                    ui.send(self.ui_td_tower_buttons[i],
-                        WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
-                    self.td_tower_button_rects[i] = (-9999.0, -9999.0, 0.0, 0.0);
+                for i in n..self.ui_td_tower_cards.len() {
+                    let card = &self.ui_td_tower_cards[i];
+                    for node in [card.bg, card.icon] {
+                        ui.send(
+                            node,
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                    }
+                    for text in [card.key_text, card.name_text, card.price_text] {
+                        ui.send(
+                            text,
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                    }
+                    if i < self.td_tower_button_rects.len() {
+                        self.td_tower_button_rects[i] = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+                    }
                 }
 
-                let selected = self.selected_tower_kind.as_deref();
+                let grid_top = panel_y + 92.0;
+                let controls_h = 150.0;
+                let available_h = (self.window_size.y - grid_top - controls_h).max(160.0);
+                let columns = if panel_w >= 270.0 && available_h >= 270.0 { 2 } else { 1 };
+                let gap = 10.0f32;
+                let inner_x = panel_x + 14.0;
+                let card_w = ((panel_w - 28.0) - gap * (columns as f32 - 1.0)) / columns as f32;
+                let card_h = if columns == 2 { 128.0 } else { 78.0 };
+                let selected_kind = self.selected_tower_kind.clone();
                 for i in 0..n {
-                    let y = base_y + (i as f32) * btn_spacing;
-                    self.td_tower_button_rects[i] = (x, y, btn_w, btn_h);
-                    let uid = &self.td_template_order[i];
-                    ui.send(
-                        self.ui_td_tower_buttons[i],
-                        WidgetMessage::DesiredPosition(Vector2::new(x, y)),
-                    );
-                    let prefix = if selected == Some(uid.as_str()) { "▶ " } else { "  " };
-                    let label_cost = match self.td_templates.get(uid) {
-                        Some(tpl) => format!("{}  ${}", tpl.label, tpl.cost),
-                        None      => uid.clone(),
+                    let uid = self.td_template_order[i].clone();
+                    let (label, cost) = self
+                        .td_templates
+                        .get(&uid)
+                        .map(|tpl| (tpl.label.clone(), tpl.cost))
+                        .unwrap_or_else(|| (uid.clone(), 0));
+                    let affordable = cost <= 0 || self.hero_state.gold >= cost;
+                    let is_selected = selected_kind.as_deref() == Some(uid.as_str());
+                    let col = i % columns;
+                    let row = i / columns;
+                    let x = inner_x + col as f32 * (card_w + gap);
+                    let y = grid_top + row as f32 * (card_h + gap);
+                    self.td_tower_button_rects[i] = (x, y, card_w, card_h);
+
+                    let bg_asset = if is_selected {
+                        "shop_card_selected.png"
+                    } else if !affordable {
+                        "shop_card_locked.png"
+                    } else {
+                        "shop_card.png"
                     };
-                    let text = format!("{}[{}] {}", prefix, i + 1, label_cost);
-                    ui.send(self.ui_td_tower_buttons[i], TextMessage::Text(text));
+                    let bg_tex = self.td_ui_texture(bg_asset);
+                    let icon_tex = self
+                        .td_ui_texture(&format!("{}.png", uid))
+                        .or_else(|| self.td_ui_texture("tower_fallback.png"));
+                    let card = &self.ui_td_tower_cards[i];
+                    ui.send(card.bg, WidgetMessage::DesiredPosition(Vector2::new(x, y)));
+                    ui.send(card.bg, WidgetMessage::Width(card_w));
+                    ui.send(card.bg, WidgetMessage::Height(card_h));
+                    ui.send(card.bg, ImageMessage::Texture(bg_tex));
+                    let icon_size = if columns == 2 { 62.0 } else { 54.0 };
+                    ui.send(
+                        card.icon,
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            x + (card_w - icon_size) * 0.5,
+                            y + 12.0,
+                        )),
+                    );
+                    ui.send(card.icon, WidgetMessage::Width(icon_size));
+                    ui.send(card.icon, WidgetMessage::Height(icon_size));
+                    ui.send(card.icon, ImageMessage::Texture(icon_tex));
+                    ui.send(
+                        card.key_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(x + 6.0, y + 6.0)),
+                    );
+                    ui.send(card.key_text, TextMessage::Text(format!("[{}]", i + 1)));
+                    let short_label = if label.chars().count() > 6 {
+                        label.chars().take(6).collect::<String>()
+                    } else {
+                        label.clone()
+                    };
+                    ui.send(
+                        card.name_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(x + 4.0, y + card_h - 52.0)),
+                    );
+                    ui.send(card.name_text, WidgetMessage::Width(card_w - 8.0));
+                    ui.send(
+                        card.name_text,
+                        TextMessage::Text(if is_selected {
+                            format!("▶ {}", short_label)
+                        } else {
+                            short_label
+                        }),
+                    );
+                    ui.send(
+                        card.price_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(x + 4.0, y + card_h - 30.0)),
+                    );
+                    ui.send(card.price_text, WidgetMessage::Width(card_w - 8.0));
+                    ui.send(
+                        card.price_text,
+                        TextMessage::Text(if affordable {
+                            format!("${}", cost)
+                        } else {
+                            format!("缺 ${}", cost)
+                        }),
+                    );
+                }
+
+                let pause_y = self.window_size.y - 160.0;
+                ui.send(
+                    self.ui_td_right_panel.pause_icon,
+                    WidgetMessage::DesiredPosition(Vector2::new(panel_x + 18.0, pause_y)),
+                );
+                ui.send(
+                    self.ui_td_right_panel.pause_text,
+                    WidgetMessage::DesiredPosition(Vector2::new(panel_x + 4.0, pause_y + 70.0)),
+                );
+                ui.send(
+                    self.ui_td_right_panel.pause_text,
+                    TextMessage::Text("PAUSE 待接".to_string()),
+                );
+                let btn_w = panel_w - 32.0;
+                let btn_h = 66.0f32;
+                let x = panel_x + 16.0;
+                let y = self.window_size.y - btn_h - 22.0;
+                self.start_round_button_rect = (x, y, btn_w, btn_h);
+                ui.send(
+                    self.ui_td_right_panel.start_icon,
+                    WidgetMessage::DesiredPosition(Vector2::new(x + 8.0, y + 6.0)),
+                );
+                if self.ui_start_round_button != Handle::<Text>::NONE {
+                    ui.send(
+                        self.ui_start_round_button,
+                        WidgetMessage::DesiredPosition(Vector2::new(x + 72.0, y + 17.0)),
+                    );
+                    ui.send(self.ui_start_round_button, WidgetMessage::Width(btn_w - 78.0));
+                    let text = if self.total_rounds > 0
+                        && self.current_round >= self.total_rounds
+                        && !self.round_is_running
+                    {
+                        "全清".to_string()
+                    } else if self.round_is_running {
+                        format!("第 {} 波", self.current_round.max(1))
+                    } else {
+                        let next = self.current_round + 1;
+                        let total = self.total_rounds.max(1);
+                        format!("開始 {}/{}", next, total)
+                    };
+                    ui.send(self.ui_start_round_button, TextMessage::Text(text));
                 }
             }
 
-            // ===== TD 模式：選中塔 Sell 面板（右側，4 塔按鈕下方） =====
+            // ===== BTD-style 左側 selected tower context panel =====
             {
-                // Wider panel so the upgrade button text (含 next-level
-                // 升級名稱）不會在視覺上被
-                // 窗戶邊緣。
-                let panel_w = 360.0f32;
-                let name_h = 28.0f32;
-                let btn_h = 42.0f32;
-                let right_margin = 20.0f32;
-                let x = self.window_size.x - panel_w - right_margin;
-                // 定位在 N 塔按鈕下方再留一個 gap（N 動態 = td_template_order.len()）
-                let n_btn = self.td_template_order.len().max(1) as f32;
-                let y_name = 80.0f32 + n_btn * 44.0 + 20.0;
-                let y_btn = y_name + name_h + 4.0;
+                let panel_x = 12.0f32;
+                let panel_y = 72.0f32;
+                let panel_w = if self.window_size.x < 1150.0 { 300.0 } else { 332.0 };
+                let panel_h = (self.window_size.y - panel_y - 20.0).max(420.0);
 
-                // Sell 面板從 td_templates 快取讀 label + cost（單一事實來源）
-                // 同時讀 base_cost + upgrade_levels + 已升各路 def name 供升級
-                // 按鈕顯示。Refund 鏡 omb sell_tower 算法：base*0.85 + Σ(已升 def.cost*0.75)。
-                let info: Option<(String, i32, i32, [u8; 3], String)> = self.selected_tower_entity.and_then(|tid| {
-                    let ent = self.network_entities.get(&tid)?;
-                    let kind_key = ent.tower_kind.as_deref()?.to_string();
-                    let tpl = self.td_templates.get(&kind_key)?;
-                    let mut refund = (tpl.cost as f32 * 0.85) as i32;
-                    for path in 0..3u8 {
-                        for level in 1..=ent.upgrade_levels[path as usize] {
-                            if let Some((_, cost)) = self.td_upgrade_defs.get(&(kind_key.clone(), path, level)) {
-                                refund += (*cost as f32 * 0.75) as i32;
+                let info: Option<(String, i32, [u8; 3], String, f32)> =
+                    self.selected_tower_entity.and_then(|tid| {
+                        let ent = self.network_entities.get(&tid)?;
+                        let kind_key = ent.tower_kind.as_deref()?.to_string();
+                        let tpl = self.td_templates.get(&kind_key)?;
+                        let mut refund = (tpl.cost as f32 * 0.85) as i32;
+                        for path in 0..3u8 {
+                            for level in 1..=ent.upgrade_levels[path as usize] {
+                                if let Some((_, cost)) =
+                                    self.td_upgrade_defs.get(&(kind_key.clone(), path, level))
+                                {
+                                    refund += (*cost as f32 * 0.75) as i32;
+                                }
                             }
                         }
-                    }
-                    Some((tpl.label.clone(), refund, tpl.cost, ent.upgrade_levels, kind_key))
-                });
+                        Some((
+                            tpl.label.clone(),
+                            refund,
+                            ent.upgrade_levels,
+                            kind_key,
+                            ent.attack_range_backend,
+                        ))
+                    });
 
-                if let Some((label, refund, _base_cost, levels, kind_key)) = info {
-                    ui.send(self.ui_td_sell_name_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(x, y_name)));
-                    ui.send(self.ui_td_sell_name_text,
-                        TextMessage::Text(format!("▸ {}", label)));
+                if let Some((label, refund, levels, kind_key, range)) = info {
+                    ui.send(
+                        self.ui_td_selected_panel.bg,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x, panel_y)),
+                    );
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Width(panel_w));
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Height(panel_h));
+                    let tower_tex = self
+                        .td_ui_texture(&format!("{}.png", kind_key))
+                        .or_else(|| self.td_ui_texture("tower_fallback.png"));
+                    ui.send(
+                        self.ui_td_selected_panel.tower_icon,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 98.0, panel_y + 62.0)),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.tower_icon,
+                        ImageMessage::Texture(tower_tex),
+                    );
+                    ui.send(
+                        self.ui_td_sell_name_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 18.0, panel_y + 18.0)),
+                    );
+                    ui.send(self.ui_td_sell_name_text, WidgetMessage::Width(panel_w - 36.0));
+                    ui.send(self.ui_td_sell_name_text, TextMessage::Text(label.clone()));
+                    ui.send(
+                        self.ui_td_selected_panel.summary_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 18.0, panel_y + 198.0)),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.summary_text,
+                        WidgetMessage::Width(panel_w - 36.0),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.summary_text,
+                        TextMessage::Text(format!(
+                            "等級 {} / {} / {}   射程 {:.0}",
+                            levels[0], levels[1], levels[2], range
+                        )),
+                    );
 
-                    ui.send(self.ui_td_sell_button_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(x, y_btn)));
-                    ui.send(self.ui_td_sell_button_text,
-                        TextMessage::Text(format!("[SELL] ${}", refund)));
-                    self.td_sell_button_rect = (x, y_btn, panel_w, btn_h);
-
-                    // 3 條升級按鈕。文字格式：`[P{path}] L{cur}->L{next} <name> ${cost}`
-                    // — 升級名直接從 td_upgrade_defs 拿（避免用 ■/□ 等字型可能缺字的
-                    // unicode glyph）。滿級顯示 MAX。
-                    let up_btn_h = 38.0f32;
+                    let upgrade_w = panel_w - 28.0;
+                    let upgrade_h = 70.0f32;
+                    let first_upgrade_y = panel_y + 238.0;
                     for path in 0u8..3 {
-                        let level = levels[path as usize];
-                        let y_up = y_btn + btn_h + 6.0 + (path as f32) * (up_btn_h + 4.0);
-                        let text = if level >= 4 {
-                            format!("[P{}] MAX", path + 1)
+                        let idx = path as usize;
+                        let y_up = first_upgrade_y + idx as f32 * (upgrade_h + 10.0);
+                        let level = levels[idx];
+                        let (main_text, price_text) = if level >= TD_UI_MAX_UPGRADE_LEVEL {
+                            (format!("P{}  MAX", path + 1), "MAX".to_string())
                         } else {
                             let next_level = level + 1;
                             let (next_name, next_cost) = self
@@ -3147,66 +3735,118 @@ impl Plugin for Game {
                                 .get(&(kind_key.clone(), path, next_level))
                                 .map(|(n, c)| (n.as_str(), *c))
                                 .unwrap_or(("?", 0));
-                            format!("[P{}] L{}->L{} {} ${}",
-                                path + 1, level, next_level, next_name, next_cost)
+                            (
+                                format!("P{}  L{}->L{}  {}", path + 1, level, next_level, next_name),
+                                format!("${}", next_cost),
+                            )
                         };
-                        ui.send(self.ui_td_upgrade_buttons[path as usize],
-                            WidgetMessage::DesiredPosition(Vector2::new(x, y_up)));
-                        ui.send(self.ui_td_upgrade_buttons[path as usize],
-                            TextMessage::Text(text));
-                        self.td_upgrade_button_rects[path as usize] = (x, y_up, panel_w, up_btn_h);
+                        let icon_tex = self
+                            .td_ui_texture(&format!("{}_p{}.png", kind_key, path + 1))
+                            .or_else(|| self.td_ui_texture(&format!("upgrade_p{}.png", path + 1)));
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_icons[idx],
+                            WidgetMessage::DesiredPosition(Vector2::new(panel_x + 20.0, y_up + 8.0)),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_icons[idx],
+                            ImageMessage::Texture(icon_tex),
+                        );
+                        ui.send(
+                            self.ui_td_upgrade_buttons[idx],
+                            WidgetMessage::DesiredPosition(Vector2::new(panel_x + 86.0, y_up + 10.0)),
+                        );
+                        ui.send(self.ui_td_upgrade_buttons[idx], WidgetMessage::Width(upgrade_w - 96.0));
+                        ui.send(self.ui_td_upgrade_buttons[idx], TextMessage::Text(main_text));
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_price_texts[idx],
+                            WidgetMessage::DesiredPosition(Vector2::new(panel_x + panel_w - 116.0, y_up + 42.0)),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_price_texts[idx],
+                            TextMessage::Text(price_text),
+                        );
+                        self.td_upgrade_button_rects[idx] =
+                            (panel_x + 14.0, y_up, upgrade_w, upgrade_h);
                     }
-                } else {
-                    // 未選塔：藏在螢幕外
-                    ui.send(self.ui_td_sell_name_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
-                    ui.send(self.ui_td_sell_button_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
-                    self.td_sell_button_rect = (-9999.0, -9999.0, 0.0, 0.0);
-                    for path in 0..3 {
-                        ui.send(self.ui_td_upgrade_buttons[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)));
-                        self.td_upgrade_button_rects[path] = (-9999.0, -9999.0, 0.0, 0.0);
-                    }
-                }
-            }
 
-            // ===== TD 模式 Start Round 按鈕（右下角） =====
-            {
-                let btn_w = 260.0f32;
-                let btn_h = 48.0f32;
-                let right_margin = 20.0f32;
-                let bottom_margin = 140.0f32; // 避開技能列
-                let x = self.window_size.x - btn_w - right_margin;
-                let y = self.window_size.y - btn_h - bottom_margin;
-                self.start_round_button_rect = (x, y, btn_w, btn_h);
-                if self.ui_start_round_button != Handle::<Text>::NONE {
+                    let sell_y = self.window_size.y - 88.0;
                     ui.send(
-                        self.ui_start_round_button,
-                        WidgetMessage::DesiredPosition(Vector2::new(x, y)),
+                        self.ui_td_selected_panel.gold_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + 22.0, sell_y + 16.0)),
                     );
-                    let text = if self.total_rounds > 0 && self.current_round >= self.total_rounds && !self.round_is_running {
-                        "✓ ALL ROUNDS CLEAR".to_string()
-                    } else if self.round_is_running {
-                        format!("⏸ Round {} Running...", self.current_round.max(1))
-                    } else {
-                        let next = self.current_round + 1;
-                        let total = self.total_rounds.max(1);
-                        format!("▶ START ROUND {} / {}", next, total)
-                    };
-                    ui.send(self.ui_start_round_button, TextMessage::Text(text));
+                    ui.send(
+                        self.ui_td_selected_panel.gold_text,
+                        TextMessage::Text(format!("${}", self.hero_state.gold)),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_icon,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + panel_w - 138.0, sell_y + 11.0)),
+                    );
+                    ui.send(
+                        self.ui_td_sell_button_text,
+                        WidgetMessage::DesiredPosition(Vector2::new(panel_x + panel_w - 96.0, sell_y + 16.0)),
+                    );
+                    ui.send(self.ui_td_sell_button_text, WidgetMessage::Width(82.0));
+                    ui.send(
+                        self.ui_td_sell_button_text,
+                        TextMessage::Text(format!("出售\n${}", refund)),
+                    );
+                    self.td_sell_button_rect = (panel_x + panel_w - 148.0, sell_y, 132.0, 62.0);
+                } else {
+                    for node in [
+                        self.ui_td_selected_panel.bg,
+                        self.ui_td_selected_panel.tower_icon,
+                        self.ui_td_selected_panel.sell_icon,
+                    ] {
+                        ui.send(
+                            node,
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                    }
+                    for text in [
+                        self.ui_td_sell_name_text,
+                        self.ui_td_sell_button_text,
+                        self.ui_td_selected_panel.summary_text,
+                        self.ui_td_selected_panel.gold_text,
+                    ] {
+                        ui.send(
+                            text,
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                    }
+                    self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+                    for path in 0..3 {
+                        ui.send(
+                            self.ui_td_upgrade_buttons[path],
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_icons[path],
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                        ui.send(
+                            self.ui_td_selected_panel.upgrade_price_texts[path],
+                            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        );
+                        self.td_upgrade_button_rects[path] =
+                            (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+                    }
                 }
             }
 
             // 技能冷卻每 frame 遞減
             for cd in self.hero_state.ability_cd.values_mut() {
-                if *cd > 0.0 { *cd = (*cd - dt).max(0.0); }
+                if *cd > 0.0 {
+                    *cd = (*cd - dt).max(0.0);
+                }
             }
 
             // Buff 倒數：本地每 frame 遞減，讓面板顯示連續變化；
             // 下次 backend push 的 snapshot 會重設成權威值，避免漂移。
             for b in self.hero_state.buffs.iter_mut() {
-                if b.remaining > 0.0 { b.remaining = (b.remaining - dt).max(0.0); }
+                if b.remaining > 0.0 {
+                    b.remaining = (b.remaining - dt).max(0.0);
+                }
             }
             // remaining = 0 的有限期 buff 從本地清掉（權威值會在下次 push 糾正）
             self.hero_state.buffs.retain(|b| b.remaining != 0.0);
@@ -3238,11 +3878,23 @@ impl Plugin for Game {
                 let can_upgrade = !id.is_empty() && hs.skill_points > 0 && lvl < max;
                 if can_upgrade {
                     let (x, y, w, _) = self.ability_icon_rects[i];
-                    self.ability_upgrade_button_rects[i] = (x + (w - 24.0) * 0.5, y - 42.0, 24.0, 24.0);
-                    ui.send(self.ui_ability_upgrade_buttons[i], TextMessage::Text("▲".to_string()));
+                    self.ability_upgrade_button_rects[i] = (x, y - 32.0, w, 32.0);
+                    if self.ui_ability_key_text[i] != Handle::<Text>::NONE {
+                        ui.send(
+                            self.ui_ability_key_text[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(x + 20.0, y - 54.0)),
+                        );
+                    }
+                    ui.send(
+                        self.ui_ability_upgrade_buttons[i],
+                        TextMessage::Text("▲".to_string()),
+                    );
                 } else {
                     self.ability_upgrade_button_rects[i] = (-9999.0, -9999.0, 0.0, 0.0);
-                    ui.send(self.ui_ability_upgrade_buttons[i], TextMessage::Text(String::new()));
+                    ui.send(
+                        self.ui_ability_upgrade_buttons[i],
+                        TextMessage::Text(String::new()),
+                    );
                 }
             }
             // Inventory 顯示
@@ -3262,7 +3914,14 @@ impl Plugin for Game {
             let hud = if hs.lives > 0 {
                 format!(
                     "LIVES {}   GOLD {}   |   HP {:.0}/{:.0}  LV {}  XP {}/{}  SP {}",
-                    hs.lives, hs.gold, hs.hp, hs.max_hp, hs.level, hs.xp, hs.xp_next, hs.skill_points,
+                    hs.lives,
+                    hs.gold,
+                    hs.hp,
+                    hs.max_hp,
+                    hs.level,
+                    hs.xp,
+                    hs.xp_next,
+                    hs.skill_points,
                 )
             } else {
                 format!(
@@ -3283,14 +3942,24 @@ impl Plugin for Game {
                     format!("{} · {}", hs.name, hs.title)
                 };
                 // 主屬性標記：與主屬性相同的三圍後面加 ★
-                let tag = |attr: &str| if hs.primary_attribute == attr { "★" } else { " " };
+                let tag = |attr: &str| {
+                    if hs.primary_attribute == attr {
+                        "★"
+                    } else {
+                        " "
+                    }
+                };
                 let mut ability_lines = String::new();
                 for (i, id) in hs.abilities.iter().enumerate().take(4) {
                     let lvl = hs.ability_levels.get(id).copied().unwrap_or(0);
                     let key = ["Q", "W", "E", "R"].get(i).copied().unwrap_or("?");
                     ability_lines.push_str(&format!("\n[{}] {:<22} 等級 {}/4", key, id, lvl));
                 }
-                let aps = if hs.attack_interval > 0.0 { 1.0 / hs.attack_interval } else { 0.0 };
+                let aps = if hs.attack_interval > 0.0 {
+                    1.0 / hs.attack_interval
+                } else {
+                    0.0
+                };
                 // 組 buff 區塊：每行 "[id] 剩餘 X.Xs" 或 "[id] 持續 ∞"
                 let mut buff_lines = String::new();
                 if hs.buffs.is_empty() {
@@ -3325,22 +3994,36 @@ impl Plugin for Game {
                      ── 技能 ──{}\n\
                      ── 效果 ──{}",
                     header,
-                    hs.level, hs.xp, hs.xp_next, hs.skill_points,
-                    hs.strength, tag("strength"),
-                    hs.agility, tag("agility"),
-                    hs.intelligence, tag("intelligence"),
-                    hs.hp as i32, hs.max_hp as i32, hs.gold,
-                    hs.armor, hs.magic_resist, hs.move_speed,
-                    hs.attack_damage, hs.attack_interval, hs.attack_range,
-                    hs.bullet_speed, aps,
+                    hs.level,
+                    hs.xp,
+                    hs.xp_next,
+                    hs.skill_points,
+                    hs.strength,
+                    tag("strength"),
+                    hs.agility,
+                    tag("agility"),
+                    hs.intelligence,
+                    tag("intelligence"),
+                    hs.hp as i32,
+                    hs.max_hp as i32,
+                    hs.gold,
+                    hs.armor,
+                    hs.magic_resist,
+                    hs.move_speed,
+                    hs.attack_damage,
+                    hs.attack_interval,
+                    hs.attack_range,
+                    hs.bullet_speed,
+                    aps,
                     ability_lines,
                     buff_lines,
                 );
-                // 英雄屬性面板移到左上（status bar y=2 + HUD y=24 之下，y=50 起）
+                // 選中塔時左側 context panel 會展開，英雄屬性暫時右移避免文字重疊。
+                let panel_x = if self.selected_tower_entity.is_some() { 360.0 } else { 10.0 };
                 let panel_y = 50.0;
                 ui.send(
                     self.ui_hero_stats_panel,
-                    WidgetMessage::DesiredPosition(Vector2::new(10.0, panel_y)),
+                    WidgetMessage::DesiredPosition(Vector2::new(panel_x, panel_y)),
                 );
                 ui.send(self.ui_hero_stats_panel, TextMessage::Text(panel_text));
             }
@@ -3358,7 +4041,11 @@ impl Plugin for Game {
             };
             ui.send(self.ui_shop_text, TextMessage::Text(shop));
 
-            let end_str = if self.game_ended { "VICTORY!".to_string() } else { String::new() };
+            let end_str = if self.game_ended {
+                "VICTORY!".to_string()
+            } else {
+                String::new()
+            };
             ui.send(self.ui_end_text, TextMessage::Text(end_str));
 
             // ===== 技能 tooltip hit-test + 更新 =====
@@ -3378,13 +4065,17 @@ impl Plugin for Game {
                     Some(idx) => {
                         // 更新 tooltip icon texture
                         if let Some(tex) = self.ability_textures[idx].as_ref() {
-                            ui.send(self.ui_tooltip_icon, ImageMessage::Texture(Some(tex.clone())));
+                            ui.send(
+                                self.ui_tooltip_icon,
+                                ImageMessage::Texture(Some(tex.clone())),
+                            );
                         }
                         // 查 ability info 組 tooltip 字串
                         let hs = &self.hero_state;
                         let ability_id = hs.abilities.get(idx).cloned().unwrap_or_default();
                         let cur_lvl = hs.ability_levels.get(&ability_id).copied().unwrap_or(0);
-                        let tooltip_str = if let Some(info) = self.ability_info_map.get(&ability_id) {
+                        let tooltip_str = if let Some(info) = self.ability_info_map.get(&ability_id)
+                        {
                             format_ability_tooltip(info, cur_lvl)
                         } else {
                             format!("(尚未收到技能資訊)\nSlot {}", idx)
@@ -3409,8 +4100,12 @@ impl Plugin for Game {
             if self.hovered_ability.is_some() {
                 let mut tx = mouse.x + 16.0;
                 let mut ty = mouse.y - 190.0;
-                if tx + 460.0 > win.x { tx = (win.x - 460.0).max(0.0); }
-                if ty < 0.0 { ty = 0.0; }
+                if tx + 460.0 > win.x {
+                    tx = (win.x - 460.0).max(0.0);
+                }
+                if ty < 0.0 {
+                    ty = 0.0;
+                }
                 ui.send(
                     self.ui_tooltip_icon,
                     WidgetMessage::DesiredPosition(Vector2::new(tx, ty)),
@@ -3436,7 +4131,8 @@ impl Plugin for Game {
         self.frame_profile.projectiles_seen += self.client_projectiles.len() as u64;
         // Fyrox 渲染器統計資料（即時幀時間，包括渲染提交 + GPU + 垂直同步等待）
         if let fyrox::engine::GraphicsContext::Initialized(ref gc) = context.graphics_context {
-            self.frame_profile.record_render_stats(&gc.renderer.get_statistics());
+            self.frame_profile
+                .record_render_stats(&gc.renderer.get_statistics());
         }
         self.frame_profile.finish_frame();
 
@@ -3497,8 +4193,10 @@ impl Plugin for Game {
                 for i in 0..4 {
                     let (bx, by, bw, bh) = self.ability_upgrade_button_rects[i];
                     if bx > -9000.0
-                        && screen.x >= bx && screen.x <= bx + bw
-                        && screen.y >= by && screen.y <= by + bh
+                        && screen.x >= bx
+                        && screen.x <= bx + bw
+                        && screen.y >= by
+                        && screen.y <= by + bh
                     {
                         self.send_upgrade_ability_input_from(
                             i as u32,
@@ -3514,8 +4212,10 @@ impl Plugin for Game {
                 if !hit_ui {
                     for i in 0..4 {
                         let (bx, by, bw, bh) = self.ability_icon_rects[i];
-                        if screen.x >= bx && screen.x <= bx + bw
-                            && screen.y >= by && screen.y <= by + bh
+                        if screen.x >= bx
+                            && screen.x <= bx + bw
+                            && screen.y >= by
+                            && screen.y <= by + bh
                         {
                             self.send_cast_ability_input_from(
                                 i as u32,
@@ -3532,8 +4232,10 @@ impl Plugin for Game {
                 // 1. Start Round 按鈕 — Phase 5.x lockstep send
                 if !hit_ui {
                     let (bx, by, bw, bh) = self.start_round_button_rect;
-                    if screen.x >= bx && screen.x <= bx + bw
-                        && screen.y >= by && screen.y <= by + bh
+                    if screen.x >= bx
+                        && screen.x <= bx + bw
+                        && screen.y >= by
+                        && screen.y <= by + bh
                         && !self.round_is_running
                         && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
                     {
@@ -3560,9 +4262,13 @@ impl Plugin for Game {
                     let mut hit_idx: Option<usize> = None;
                     for (i, rect) in self.td_tower_button_rects.iter().enumerate() {
                         let (bx, by, bw, bh) = *rect;
-                        if i >= self.td_template_order.len() { break }
-                        if screen.x >= bx && screen.x <= bx + bw
-                            && screen.y >= by && screen.y <= by + bh
+                        if i >= self.td_template_order.len() {
+                            break;
+                        }
+                        if screen.x >= bx
+                            && screen.x <= bx + bw
+                            && screen.y >= by
+                            && screen.y <= by + bh
                         {
                             hit_idx = Some(i);
                             break;
@@ -3580,8 +4286,10 @@ impl Plugin for Game {
                 // 3. Sell 按鈕（只有有已選中塔時生效）
                 if !hit_ui && self.selected_tower_entity.is_some() {
                     let (bx, by, bw, bh) = self.td_sell_button_rect;
-                    if screen.x >= bx && screen.x <= bx + bw
-                        && screen.y >= by && screen.y <= by + bh
+                    if screen.x >= bx
+                        && screen.x <= bx + bw
+                        && screen.y >= by
+                        && screen.y <= by + bh
                     {
                         if let Some(tid) = self.selected_tower_entity {
                             // 階段 2.2：TowerSell 鎖步輸入。 tid 是
@@ -3617,8 +4325,10 @@ impl Plugin for Game {
                     for path in 0u8..3 {
                         let (bx, by, bw, bh) = self.td_upgrade_button_rects[path as usize];
                         if bx > -9000.0
-                            && screen.x >= bx && screen.x < bx + bw
-                            && screen.y >= by && screen.y < by + bh
+                            && screen.x >= bx
+                            && screen.x < bx + bw
+                            && screen.y >= by
+                            && screen.y < by + bh
                         {
                             if let Some(tid) = self.selected_tower_entity {
                                 // 階段 2.3：TowerUpgrade 鎖步輸入。 tid 是
@@ -3714,8 +4424,12 @@ impl Plugin for Game {
                     let mwp = self.mouse_world_pos;
                     let mut best: Option<(u32, f32)> = None;
                     for (id, ent) in self.network_entities.iter() {
-                        if ent.entity_type != "tower" { continue }
-                        if ent.tower_kind.is_none() { continue } // 只選 TD 塔（非 MOBA lane/base）
+                        if ent.entity_type != "tower" {
+                            continue;
+                        }
+                        if ent.tower_kind.is_none() {
+                            continue;
+                        } // 只選 TD 塔（非 MOBA lane/base）
                         let d = (ent.position - mwp).norm();
                         let pick_radius = (ent.collision_radius_render * 1.6).max(0.6);
                         if d <= pick_radius {
@@ -3760,9 +4474,9 @@ impl Plugin for Game {
                         target: Some(target),
                     };
                     let input = omoba_core::kcp::game_proto::PlayerInput {
-                        action: Some(
-                            omoba_core::kcp::game_proto::player_input::Action::MoveTo(move_to),
-                        ),
+                        action: Some(omoba_core::kcp::game_proto::player_input::Action::MoveTo(
+                            move_to,
+                        )),
                     };
                     self.send_lockstep_input_from(
                         input,
@@ -3773,7 +4487,10 @@ impl Plugin for Game {
             }
             // LoL MVP 鍵盤輸入
             Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { event: key_event, .. },
+                event:
+                    WindowEvent::KeyboardInput {
+                        event: key_event, ..
+                    },
                 ..
             } => {
                 use fyrox::event::ElementState as ES;
@@ -3800,7 +4517,9 @@ impl Plugin for Game {
                     }
                     _ => {}
                 }
-                if !pressed { return Ok(()); }
+                if !pressed {
+                    return Ok(());
+                }
 
                 let world = self.mouse_world_pos;
                 // Phase 5.1：legacy `tx` / `send` closure (NetworkBridge cmd_tx)
@@ -3833,7 +4552,8 @@ impl Plugin for Game {
                             KeyCode::KeyR => "R",
                             KeyCode::KeyT => "T",
                             _ => unreachable!(),
-                        }.to_string();
+                        }
+                        .to_string();
                         if self.shift_held {
                             if let Some(ability_index) = ability_key_index(key) {
                                 self.send_upgrade_ability_input_from(
@@ -3853,8 +4573,14 @@ impl Plugin for Game {
                         self.shop_visible = !self.shop_visible;
                     }
                     // TD 模式：1-9 鍵盤快捷選塔（依 td_template_order 順序）；Escape 取消選取
-                    KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4
-                    | KeyCode::Digit5 | KeyCode::Digit6 | KeyCode::Digit7 | KeyCode::Digit8
+                    KeyCode::Digit1
+                    | KeyCode::Digit2
+                    | KeyCode::Digit3
+                    | KeyCode::Digit4
+                    | KeyCode::Digit5
+                    | KeyCode::Digit6
+                    | KeyCode::Digit7
+                    | KeyCode::Digit8
                     | KeyCode::Digit9
                         if !self.shop_visible =>
                     {
@@ -3882,16 +4608,27 @@ impl Plugin for Game {
                         }
                     }
                     // 數字鍵: shop 開啟時購買對應 index 裝備；否則使用對應背包 slot
-                    KeyCode::Digit0 | KeyCode::Digit1 | KeyCode::Digit2
-                    | KeyCode::Digit3 | KeyCode::Digit4 | KeyCode::Digit5
-                    | KeyCode::Digit6 | KeyCode::Digit7 | KeyCode::Digit8
+                    KeyCode::Digit0
+                    | KeyCode::Digit1
+                    | KeyCode::Digit2
+                    | KeyCode::Digit3
+                    | KeyCode::Digit4
+                    | KeyCode::Digit5
+                    | KeyCode::Digit6
+                    | KeyCode::Digit7
+                    | KeyCode::Digit8
                     | KeyCode::Digit9 => {
                         let idx: usize = match key {
-                            KeyCode::Digit0 => 0, KeyCode::Digit1 => 1,
-                            KeyCode::Digit2 => 2, KeyCode::Digit3 => 3,
-                            KeyCode::Digit4 => 4, KeyCode::Digit5 => 5,
-                            KeyCode::Digit6 => 6, KeyCode::Digit7 => 7,
-                            KeyCode::Digit8 => 8, KeyCode::Digit9 => 9,
+                            KeyCode::Digit0 => 0,
+                            KeyCode::Digit1 => 1,
+                            KeyCode::Digit2 => 2,
+                            KeyCode::Digit3 => 3,
+                            KeyCode::Digit4 => 4,
+                            KeyCode::Digit5 => 5,
+                            KeyCode::Digit6 => 6,
+                            KeyCode::Digit7 => 7,
+                            KeyCode::Digit8 => 8,
+                            KeyCode::Digit9 => 9,
                             _ => unreachable!(),
                         };
                         // 階段 5.1：刪除舊的 BuyItem / SellItem（項目
@@ -3955,6 +4692,16 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    fn td_ui_texture(&mut self, asset_name: &str) -> Option<TextureResource> {
+        if let Some(cached) = self.td_ui_texture_cache.get(asset_name) {
+            return cached.clone();
+        }
+        let texture = load_td_ui_texture(asset_name);
+        self.td_ui_texture_cache
+            .insert(asset_name.to_string(), texture.clone());
+        texture
+    }
+
     /// 階段 4.3：將 `PlayerInput` 傳送到鎖步線（omb 的鎖定步
     /// 調度程序）。如果“lockstep_handle”為“無”，則無操作（例如僅遺留模式）。
     /// 目標刻度 = current_sim_tick + INPUT_LOOKAHEAD_TICKS（120 Hz 時 2 tick 約 16.7 毫秒）。這
@@ -3971,8 +4718,12 @@ impl Game {
     /// 第一次見到時；釋放輟學時的插槽。 EntityKind::其他是
     /// 已跳過（不應呈現 RegionBlocker 等內部 ECS 行）。
     fn update_sim_batches(&mut self) {
-        let Some(ref sim) = self.sim_runner_handle else { return };
-        let Ok(snapshot) = sim.state.try_lock() else { return };
+        let Some(ref sim) = self.sim_runner_handle else {
+            return;
+        };
+        let Ok(snapshot) = sim.state.try_lock() else {
+            return;
+        };
 
         let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
         for e in &snapshot.entities {
@@ -3987,11 +4738,7 @@ impl Game {
             // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
             let slots_entry = self.sim_entity_slots.entry(e.entity_id);
             let slots = slots_entry.or_insert_with(|| {
-                let body_slot = self
-                    .body_batch
-                    .as_mut()
-                    .map(|b| b.alloc())
-                    .unwrap_or(0);
+                let body_slot = self.body_batch.as_mut().map(|b| b.alloc()).unwrap_or(0);
                 render_bridge::SimEntitySlots {
                     body_slot,
                     hp_bg_slot: None,
@@ -4003,10 +4750,7 @@ impl Game {
             if matches!(e.kind, sim_runner::EntityKind::Projectile) {
                 // 子彈：從發射點到當前位置畫一條暖色拖尾矩形（不是中央小方塊）。
                 // 第一次看到該 eid 時把 spawn_pos 鎖定為當前 render pos。
-                let spawn_pos = *self
-                    .projectile_spawn_pos
-                    .entry(e.entity_id)
-                    .or_insert(pos);
+                let spawn_pos = *self.projectile_spawn_pos.entry(e.entity_id).or_insert(pos);
                 let dx = pos.x - spawn_pos.x;
                 let dy = pos.y - spawn_pos.y;
                 let trail_len = (dx * dx + dy * dy).sqrt();
@@ -4015,8 +4759,16 @@ impl Game {
                 let max_trail = 0.6_f32;
                 let len = trail_len.min(max_trail).max(0.05);
                 // 若拖尾被截短，從尾端往前算實際 tail 起點。
-                let dir_x = if trail_len > 0.0001 { dx / trail_len } else { 1.0 };
-                let dir_y = if trail_len > 0.0001 { dy / trail_len } else { 0.0 };
+                let dir_x = if trail_len > 0.0001 {
+                    dx / trail_len
+                } else {
+                    1.0
+                };
+                let dir_y = if trail_len > 0.0001 {
+                    dy / trail_len
+                } else {
+                    0.0
+                };
                 let tail_x = pos.x - dir_x * len;
                 let tail_y = pos.y - dir_y * len;
                 let mid = Vector2::new((pos.x + tail_x) * 0.5, (pos.y + tail_y) * 0.5);
@@ -4063,7 +4815,7 @@ impl Game {
                     let bar_w = (size * 1.6).max(0.5);
                     let bar_h = 0.18_f32;
                     let bar_y = pos.y + size * 0.7;
-                    let pad = 0.04_f32;             // 黑外框視覺寬度
+                    let pad = 0.04_f32; // 黑外框視覺寬度
                     let inner_w = (bar_w - pad * 2.0).max(0.001);
                     let inner_h = (bar_h - pad * 2.0).max(0.001);
                     let hp_ratio = (e.hp as f32 / e.max_hp as f32).clamp(0.0, 1.0);
@@ -4168,11 +4920,17 @@ impl Game {
                     batch.free(slots.body_slot);
                 }
                 if let Some(batch) = self.hp_batch.as_mut() {
-                    if let Some(bg) = slots.hp_bg_slot { batch.free(bg); }
-                    if let Some(fg) = slots.hp_fg_slot { batch.free(fg); }
+                    if let Some(bg) = slots.hp_bg_slot {
+                        batch.free(bg);
+                    }
+                    if let Some(fg) = slots.hp_fg_slot {
+                        batch.free(fg);
+                    }
                 }
                 if let Some(batch) = self.facing_batch.as_mut() {
-                    if let Some(t) = slots.turret_slot { batch.free(t); }
+                    if let Some(t) = slots.turret_slot {
+                        batch.free(t);
+                    }
                 }
             }
             // 子彈消失時清拖尾起點 cache（HashMap 不會自己縮）
@@ -4190,11 +4948,17 @@ impl Game {
                     batch.free(slots.body_slot);
                 }
                 if let Some(batch) = self.hp_batch.as_mut() {
-                    if let Some(bg) = slots.hp_bg_slot { batch.free(bg); }
-                    if let Some(fg) = slots.hp_fg_slot { batch.free(fg); }
+                    if let Some(bg) = slots.hp_bg_slot {
+                        batch.free(bg);
+                    }
+                    if let Some(fg) = slots.hp_fg_slot {
+                        batch.free(fg);
+                    }
                 }
                 if let Some(batch) = self.facing_batch.as_mut() {
-                    if let Some(t) = slots.turret_slot { batch.free(t); }
+                    if let Some(t) = slots.turret_slot {
+                        batch.free(t);
+                    }
                 }
             }
             self.projectile_spawn_pos.remove(&id);
@@ -4209,19 +4973,32 @@ impl Game {
         let render_us = wall_clock_us();
         for meta in applied_inputs {
             let input_id = meta.input_id;
-            let Some(pending) = self.pending_inputs.remove(&input_id) else { continue };
-            let submit_start_us = pending.submit_start_us.unwrap_or(pending.send_lockstep_input_us);
+            let Some(pending) = self.pending_inputs.remove(&input_id) else {
+                continue;
+            };
+            let submit_start_us = pending
+                .submit_start_us
+                .unwrap_or(pending.send_lockstep_input_us);
             let submit_done_us = pending.submit_done_us.unwrap_or(submit_start_us);
-            let client_receive_us = pending.client_receive_tickbatch_us.unwrap_or(meta.client_receive_us);
-            let game_forward_us = pending.game_forward_to_sim_us.unwrap_or(meta.game_forward_us);
-            let sim_publish_us = pending.sim_publish_snapshot_us.unwrap_or(meta.sim_publish_us);
+            let client_receive_us = pending
+                .client_receive_tickbatch_us
+                .unwrap_or(meta.client_receive_us);
+            let game_forward_us = pending
+                .game_forward_to_sim_us
+                .unwrap_or(meta.game_forward_us);
+            let sim_publish_us = pending
+                .sim_publish_snapshot_us
+                .unwrap_or(meta.sim_publish_us);
             let total_ms = render_us
                 .saturating_sub(pending.submit_wall_clock_us)
                 .saturating_div(1_000)
                 .min(u64::from(u32::MAX)) as u32;
             let phases = LatencyPhaseDurations {
-                origin_to_send_us: pending.send_lockstep_input_us.saturating_sub(pending.origin_us),
-                send_to_submit_start_us: submit_start_us.saturating_sub(pending.send_lockstep_input_us),
+                origin_to_send_us: pending
+                    .send_lockstep_input_us
+                    .saturating_sub(pending.origin_us),
+                send_to_submit_start_us: submit_start_us
+                    .saturating_sub(pending.send_lockstep_input_us),
                 submit_io_us: submit_done_us.saturating_sub(submit_start_us),
                 submit_to_client_receive_us: client_receive_us.saturating_sub(submit_done_us),
                 server_queue_us: pending.server_queue_us.unwrap_or(meta.server_queue_us),
@@ -4229,6 +5006,23 @@ impl Game {
                 forward_to_publish_us: sim_publish_us.saturating_sub(game_forward_us),
                 publish_to_pair_us: render_us.saturating_sub(sim_publish_us),
             };
+            let additive_total_us = phases
+                .origin_to_send_us
+                .saturating_add(phases.send_to_submit_start_us)
+                .saturating_add(phases.submit_io_us)
+                .saturating_add(phases.submit_to_client_receive_us)
+                .saturating_add(phases.client_receive_to_forward_us)
+                .saturating_add(phases.forward_to_publish_us)
+                .saturating_add(phases.publish_to_pair_us);
+            let server_receive_tick = pending
+                .server_receive_tick
+                .or(Some(meta.server_receive_tick));
+            let server_drain_tick = pending.server_drain_tick.or(Some(meta.server_drain_tick));
+            let sim_latency_ticks = server_drain_tick
+                .map(|drain_tick| drain_tick.wrapping_sub(pending.base_tick))
+                .unwrap_or(0);
+            let tick_quantized_latency_us =
+                u64::from(sim_latency_ticks).saturating_mul(LOCKSTEP_TICK_PERIOD_US);
             self.input_latency_meter.push(LatencySample {
                 input_id,
                 action_kind: pending.action_kind,
@@ -4236,21 +5030,24 @@ impl Game {
                 submitted_at: pending.submit_instant,
                 origin_kind: pending.origin_kind,
                 target_tick: pending.target_tick,
-                server_receive_tick: pending.server_receive_tick.or(Some(meta.server_receive_tick)),
-                server_drain_tick: pending.server_drain_tick.or(Some(meta.server_drain_tick)),
+                server_receive_tick,
+                server_drain_tick,
                 phases: phases.clone(),
             });
             log::debug!(
-                "input_render_latency: id={} kind={:?} target_tick={} submit_us={} render_us={} total_ms={}",
+                "input_render_latency: id={} kind={:?} base_tick={} target_tick={} submit_us={} render_us={} total_ms={} sim_latency_ticks={} tick_quantized_latency_us={}",
                 input_id,
                 pending.action_kind,
+                pending.base_tick,
                 pending.target_tick,
                 pending.submit_wall_clock_us,
                 render_us,
                 total_ms,
+                sim_latency_ticks,
+                tick_quantized_latency_us,
             );
             log::debug!(
-                "input_latency_phase: id={} origin={:?} origin_to_send_us={} send_to_submit_start_us={} submit_io_us={} submit_to_client_receive_us={} server_queue_us={} client_receive_to_forward_us={} forward_to_publish_us={} publish_to_pair_us={} server_receive_tick={:?} server_drain_tick={:?}",
+                "input_latency_phase: id={} origin={:?} origin_to_send_us={} send_to_submit_start_us={} submit_io_us={} submit_to_client_receive_us={} server_queue_us={} client_receive_to_forward_us={} forward_to_publish_us={} publish_to_pair_us={} server_receive_tick={:?} server_drain_tick={:?} additive_total_us={} server_queue_nested_us={} base_tick={} sim_latency_ticks={} tick_quantized_latency_us={}",
                 input_id,
                 pending.origin_kind,
                 phases.origin_to_send_us,
@@ -4261,11 +5058,42 @@ impl Game {
                 phases.client_receive_to_forward_us,
                 phases.forward_to_publish_us,
                 phases.publish_to_pair_us,
-                pending.server_receive_tick.or(Some(meta.server_receive_tick)),
-                pending.server_drain_tick.or(Some(meta.server_drain_tick)),
+                server_receive_tick,
+                server_drain_tick,
+                additive_total_us,
+                phases.server_queue_us,
+                pending.base_tick,
+                sim_latency_ticks,
+                tick_quantized_latency_us,
             );
         }
         self.evict_stale_pending_inputs();
+    }
+
+    fn wait_for_applied_input_snapshot(
+        &self,
+        sim: &sim_runner::SimRunnerHandle,
+        input_ids: &[u32],
+    ) {
+        if input_ids.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_micros(INPUT_SAME_FRAME_WAIT_US);
+        loop {
+            if let Ok(snapshot) = sim.state.try_lock() {
+                if snapshot
+                    .applied_input_meta
+                    .iter()
+                    .any(|meta| input_ids.iter().any(|input_id| meta.input_id == *input_id))
+                {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn evict_stale_pending_inputs(&mut self) {
@@ -4294,7 +5122,9 @@ impl Game {
         origin_kind: lockstep_client::InputOriginKind,
         origin_us: u64,
     ) {
-        let Some(handle) = self.lockstep_handle.as_ref() else { return };
+        let Some(handle) = self.lockstep_handle.as_ref() else {
+            return;
+        };
         let input_id = handle.next_input_id();
         let action_kind = InputActionKind::from_player_input(&input);
         let submit_wall_clock_us = wall_clock_us();
@@ -4323,28 +5153,36 @@ impl Game {
             log::warn!("[lockstep] input_tx send failed: {e}");
             return;
         }
-        self.pending_inputs.insert(input_id, PendingInput {
-            submit_wall_clock_us,
-            submit_instant,
-            target_tick,
-            action_kind,
-            origin_kind,
-            origin_us,
-            send_lockstep_input_us: submit_wall_clock_us,
-            submit_start_us: None,
-            submit_done_us: None,
-            client_receive_tickbatch_us: None,
-            game_forward_to_sim_us: None,
-            sim_publish_snapshot_us: None,
-            server_receive_tick: None,
-            server_drain_tick: None,
-            server_queue_us: None,
-        });
+        self.pending_inputs.insert(
+            input_id,
+            PendingInput {
+                submit_wall_clock_us,
+                submit_instant,
+                base_tick,
+                target_tick,
+                action_kind,
+                origin_kind,
+                origin_us,
+                send_lockstep_input_us: submit_wall_clock_us,
+                submit_start_us: None,
+                submit_done_us: None,
+                client_receive_tickbatch_us: None,
+                game_forward_to_sim_us: None,
+                sim_publish_snapshot_us: None,
+                server_receive_tick: None,
+                server_drain_tick: None,
+                server_queue_us: None,
+            },
+        );
     }
 
     fn send_upgrade_ability_input(&mut self, ability_index: u32) {
         let now_us = wall_clock_us();
-        self.send_upgrade_ability_input_from(ability_index, lockstep_client::InputOriginKind::Direct, now_us);
+        self.send_upgrade_ability_input_from(
+            ability_index,
+            lockstep_client::InputOriginKind::Direct,
+            now_us,
+        );
     }
 
     fn send_upgrade_ability_input_from(
@@ -4361,7 +5199,10 @@ impl Game {
             ),
         };
         self.send_lockstep_input_from(input, origin_kind, origin_us);
-        log::info!("Ability upgrade lockstep input submitted: index={}", ability_index);
+        log::info!(
+            "Ability upgrade lockstep input submitted: index={}",
+            ability_index
+        );
     }
 
     fn send_cast_ability_input(&mut self, ability_index: u32, target_world: Option<Vector2<f32>>) {
@@ -4393,7 +5234,10 @@ impl Game {
             ),
         };
         self.send_lockstep_input_from(input, origin_kind, origin_us);
-        log::info!("Ability cast lockstep input submitted: index={}", ability_index);
+        log::info!(
+            "Ability cast lockstep input submitted: index={}",
+            ability_index
+        );
     }
 
     // 階段 5.1（第 2 階段）：apply_event + 30+ 舊版 GameEvent 處理程序
@@ -4443,17 +5287,28 @@ fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
     let show_next = cur_lvl < max;
 
     fn at_f32(arr: &[f32], idx: usize) -> Option<f32> {
-        if arr.is_empty() { None } else { Some(arr[idx.min(arr.len() - 1)]) }
+        if arr.is_empty() {
+            None
+        } else {
+            Some(arr[idx.min(arr.len() - 1)])
+        }
     }
     fn at_i32(arr: &[i32], idx: usize) -> Option<i32> {
-        if arr.is_empty() { None } else { Some(arr[idx.min(arr.len() - 1)]) }
+        if arr.is_empty() {
+            None
+        } else {
+            Some(arr[idx.min(arr.len() - 1)])
+        }
     }
 
     let mut out = String::new();
 
     // ===== 標題列 =====
     if is_ultimate {
-        out.push_str(&format!("★ {}  (終極)   [{}]\n", info.name, info.key_binding));
+        out.push_str(&format!(
+            "★ {}  (終極)   [{}]\n",
+            info.name, info.key_binding
+        ));
     } else {
         out.push_str(&format!("{}   [{}]\n", info.name, info.key_binding));
     }
@@ -4478,7 +5333,9 @@ fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
         out.push_str(&format!("  魔力消耗：{}\n", c));
     }
     if let Some(c) = at_f32(&info.cast_range, show_idx) {
-        if c > 0.0 { out.push_str(&format!("  施放範圍：{:.0}\n", c)); }
+        if c > 0.0 {
+            out.push_str(&format!("  施放範圍：{:.0}\n", c));
+        }
     }
 
     // ===== 效果（傷害 / 其他）=====
@@ -4487,8 +5344,7 @@ fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
         out.push_str("【效果】\n");
         // 優先顯示常見欄位（damage / heal / ratio / duration / stun / slow）
         let priority_keys = [
-            "damage", "heal", "shield", "duration",
-            "stun", "slow", "ad_ratio", "ap_ratio", "ratio",
+            "damage", "heal", "shield", "duration", "stun", "slow", "ad_ratio", "ap_ratio", "ratio",
         ];
         let mut shown: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for pk in priority_keys.iter() {
@@ -4507,17 +5363,26 @@ fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
     // ===== 下一級提升 =====
     if show_next {
         let mut delta_lines: Vec<String> = Vec::new();
-        if let (Some(c), Some(n)) = (at_f32(&info.cooldown, show_idx), at_f32(&info.cooldown, next_idx)) {
+        if let (Some(c), Some(n)) = (
+            at_f32(&info.cooldown, show_idx),
+            at_f32(&info.cooldown, next_idx),
+        ) {
             if (c - n).abs() > f32::EPSILON {
                 delta_lines.push(format!("  冷卻 {:.1}s → {:.1}s", c, n));
             }
         }
-        if let (Some(c), Some(n)) = (at_i32(&info.mana_cost, show_idx), at_i32(&info.mana_cost, next_idx)) {
+        if let (Some(c), Some(n)) = (
+            at_i32(&info.mana_cost, show_idx),
+            at_i32(&info.mana_cost, next_idx),
+        ) {
             if c != n {
                 delta_lines.push(format!("  魔力 {} → {}", c, n));
             }
         }
-        if let (Some(c), Some(n)) = (at_f32(&info.cast_range, show_idx), at_f32(&info.cast_range, next_idx)) {
+        if let (Some(c), Some(n)) = (
+            at_f32(&info.cast_range, show_idx),
+            at_f32(&info.cast_range, next_idx),
+        ) {
             if c > 0.0 && (c - n).abs() > f32::EPSILON {
                 delta_lines.push(format!("  射程 {:.0} → {:.0}", c, n));
             }
@@ -4536,14 +5401,20 @@ fn format_ability_tooltip(info: &AbilityInfo, cur_lvl: i32) -> String {
         if !delta_lines.is_empty() {
             out.push_str(bar);
             out.push_str("【下一級】\n");
-            for l in &delta_lines { out.push_str(l); out.push('\n'); }
+            for l in &delta_lines {
+                out.push_str(l);
+                out.push('\n');
+            }
         }
     }
 
     // ===== 升級提示 =====
     out.push_str(bar);
     if cur_lvl < max {
-        out.push_str(&format!("Shift + {} 升級（需 1 技能點）\n", info.key_binding));
+        out.push_str(&format!(
+            "Shift + {} 升級（需 1 技能點）\n",
+            info.key_binding
+        ));
     } else {
         out.push_str("已達最高等級\n");
     }
@@ -4571,7 +5442,11 @@ fn push_effect_line(out: &mut String, key: &str, v: &serde_json::Value, show_idx
 }
 
 fn fmt_num(n: f64) -> String {
-    if (n - n.round()).abs() < 1e-6 { format!("{:.0}", n) } else { format!("{:.2}", n) }
+    if (n - n.round()).abs() < 1e-6 {
+        format!("{:.0}", n)
+    } else {
+        format!("{:.2}", n)
+    }
 }
 
 fn effect_label(key: &str) -> &str {
@@ -4609,7 +5484,11 @@ fn build_facing_arrow(
     let handle = resources.build_mesh(scene, resources.surf_facing.clone());
     scene.graph[handle]
         .local_transform_mut()
-        .set_position(Vector3::new(-pos_x + offset_x, pos_y + offset_y, Z_HP_BAR - 0.02))
+        .set_position(Vector3::new(
+            -pos_x + offset_x,
+            pos_y + offset_y,
+            Z_HP_BAR - 0.02,
+        ))
         .set_scale(Vector3::new(length, thickness, 1.0))
         .set_rotation(rotation);
     handle
@@ -4620,7 +5499,14 @@ fn build_path_segment(
     from: Vector2<f32>,
     to: Vector2<f32>,
 ) -> Option<Handle<Node>> {
-    build_line_segment(scene, from, to, 0.05, Color::from_rgba(255, 100, 255, 180), Z_PATH)
+    build_line_segment(
+        scene,
+        from,
+        to,
+        0.05,
+        Color::from_rgba(255, 100, 255, 180),
+        Z_PATH,
+    )
 }
 
 /// 建立一條在 world 座標 (from → to) 的細長線段矩形。
@@ -4704,10 +5590,7 @@ fn build_circle_outline(
         let b_local = pts[(i + 1) % segments];
         let a_world = Vector2::new(center.x + a_local.x, center.y + a_local.y);
         let b_world = Vector2::new(center.x + b_local.x, center.y + b_local.y);
-        let offset = Vector2::new(
-            (a_local.x + b_local.x) * 0.5,
-            (a_local.y + b_local.y) * 0.5,
-        );
+        let offset = Vector2::new((a_local.x + b_local.x) * 0.5, (a_local.y + b_local.y) * 0.5);
         if let Some(h) = build_line_segment(scene, a_world, b_world, thickness, color, z) {
             result.push((h, offset));
         }
@@ -4736,12 +5619,12 @@ fn add_circle_lines(
     for k in 1..=segments {
         let theta = (k as f32) * std::f32::consts::TAU / (segments as f32);
         let (s, c) = theta.sin_cos();
-        let next = Vector3::new(
-            -(center.x + radius * c),
-            center.y + radius * s,
-            z,
-        );
-        scene.drawing_context.add_line(Line { begin: prev, end: next, color });
+        let next = Vector3::new(-(center.x + radius * c), center.y + radius * s, z);
+        scene.drawing_context.add_line(Line {
+            begin: prev,
+            end: next,
+            color,
+        });
         prev = next;
     }
 }
@@ -4753,10 +5636,19 @@ fn add_circle_lines(
 fn parse_heartbeat(data: &serde_json::Value) -> HeartbeatInfo {
     HeartbeatInfo {
         tick: data.get("tick").and_then(|v| v.as_u64()).unwrap_or(0),
-        game_time: data.get("game_time").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        entity_count: data.get("entity_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        game_time: data
+            .get("game_time")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        entity_count: data
+            .get("entity_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         hero_count: data.get("hero_count").and_then(|v| v.as_u64()).unwrap_or(0),
-        creep_count: data.get("creep_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        creep_count: data
+            .get("creep_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     }
 }
 
@@ -4776,7 +5668,13 @@ fn world_to_grid(wx: f32, wy: f32) -> Option<(usize, usize)> {
     }
 }
 
-fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32, world_height: f32) -> Vector2<f32> {
+fn world_to_screen_approx(
+    wx: f32,
+    wy: f32,
+    window_w: f32,
+    window_h: f32,
+    world_height: f32,
+) -> Vector2<f32> {
     let aspect = window_w / window_h;
     let world_width = world_height * aspect;
     // +X world → +X screen（camera 的 -1 X scale 已把原本的翻轉抵消）
@@ -4788,7 +5686,9 @@ fn world_to_screen_approx(wx: f32, wy: f32, window_w: f32, window_h: f32, world_
 
 /// Ray-casting 點在多邊形內判定（凹/凸皆可）。與 omb/src/util/geometry.rs 同演算法。
 fn point_in_polygon(p: Vector2<f32>, poly: &[Vector2<f32>]) -> bool {
-    if poly.len() < 3 { return false; }
+    if poly.len() < 3 {
+        return false;
+    }
     let mut inside = false;
     let n = poly.len();
     let mut j = n - 1;
@@ -4797,7 +5697,9 @@ fn point_in_polygon(p: Vector2<f32>, poly: &[Vector2<f32>]) -> bool {
         let pj = poly[j];
         let cond = (pi.y > p.y) != (pj.y > p.y)
             && p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y + f32::EPSILON) + pi.x;
-        if cond { inside = !inside; }
+        if cond {
+            inside = !inside;
+        }
         j = i;
     }
     inside
@@ -4808,7 +5710,9 @@ fn point_segment_dist_sq(p: Vector2<f32>, a: Vector2<f32>, b: Vector2<f32>) -> f
     let ab = b - a;
     let ap = p - a;
     let len_sq = ab.x * ab.x + ab.y * ab.y;
-    if len_sq < 1e-8 { return ap.norm_squared(); }
+    if len_sq < 1e-8 {
+        return ap.norm_squared();
+    }
     let t = (ap.x * ab.x + ap.y * ab.y) / len_sq;
     let t = t.clamp(0.0, 1.0);
     let proj = a + ab * t;
@@ -4817,14 +5721,20 @@ fn point_segment_dist_sq(p: Vector2<f32>, a: Vector2<f32>, b: Vector2<f32>) -> f
 
 /// 圓 vs 多邊形：圓心在內 → true；或任一邊距圓心 < r → true。
 fn circle_hits_polygon(center: Vector2<f32>, r: f32, poly: &[Vector2<f32>]) -> bool {
-    if poly.len() < 3 { return false; }
-    if point_in_polygon(center, poly) { return true; }
+    if poly.len() < 3 {
+        return false;
+    }
+    if point_in_polygon(center, poly) {
+        return true;
+    }
     let r2 = r * r;
     let n = poly.len();
     for i in 0..n {
         let a = poly[i];
         let b = poly[(i + 1) % n];
-        if point_segment_dist_sq(center, a, b) < r2 { return true; }
+        if point_segment_dist_sq(center, a, b) < r2 {
+            return true;
+        }
     }
     false
 }
@@ -4902,6 +5812,7 @@ mod input_latency_tests {
         let pending = PendingInput {
             submit_wall_clock_us: 1_000,
             submit_instant: Instant::now(),
+            base_tick: 22,
             target_tick: 24,
             action_kind: InputActionKind::NoOp,
             origin_kind: lockstep_client::InputOriginKind::Auto,
@@ -4919,6 +5830,7 @@ mod input_latency_tests {
 
         assert_eq!(pending.origin_kind, lockstep_client::InputOriginKind::Auto);
         assert_eq!(pending.origin_us, 900);
+        assert_eq!(pending.base_tick, 22);
         assert_eq!(pending.server_drain_tick, Some(24));
         assert_eq!(pending.server_queue_us, Some(16_000));
     }

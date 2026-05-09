@@ -1,9 +1,9 @@
 //! 使用 plugin 模式啟動的遊戲執行器。
+use fyrox::core::log::Log;
 use fyrox::engine::executor::Executor;
 use fyrox::event_loop::EventLoop;
-use fyrox::core::log::Log;
 use simplelog::{
-    CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, ColorChoice, WriteLogger,
+    ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, WriteLogger,
 };
 use std::fs::File;
 
@@ -53,7 +53,9 @@ fn configured_log_settings() -> LogSettings {
         level: LevelFilter::Info,
         allow_modules: Vec::new(),
     };
-    let Ok(value) = std::env::var("RUST_LOG") else { return settings };
+    let Ok(value) = std::env::var("RUST_LOG") else {
+        return settings;
+    };
 
     let mut has_bare_level = false;
     // simplelog 沒有 EnvFilter parser。沿用最高等級需求，
@@ -64,10 +66,14 @@ fn configured_log_settings() -> LogSettings {
             continue;
         }
         let (candidate, module) = if let Some((module, level)) = directive.split_once('=') {
-            let Some(level) = parse_log_level(level.trim()) else { continue };
+            let Some(level) = parse_log_level(level.trim()) else {
+                continue;
+            };
             (level, Some(module))
         } else {
-            let Some(level) = parse_log_level(directive) else { continue };
+            let Some(level) = parse_log_level(directive) else {
+                continue;
+            };
             has_bare_level = true;
             (level, None)
         };
@@ -113,7 +119,12 @@ fn main() {
     let cfg = cfg_builder.build();
     let log_file = File::create("omfx_app.log").expect("create omfx_app.log");
     let _ = CombinedLogger::init(vec![
-        TermLogger::new(log_settings.level, cfg.clone(), TerminalMode::Mixed, ColorChoice::Auto),
+        TermLogger::new(
+            log_settings.level,
+            cfg.clone(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
         WriteLogger::new(log_settings.level, cfg, log_file),
     ]);
 

@@ -11,8 +11,8 @@
 
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use log::{error, info};
 use omoba_core::lockstep_timing::{
-    LOCKSTEP_DT_F32, LOCKSTEP_FIVE_SECONDS_TICKS_U32,
+    lockstep_dt_fixed_raw_for_tick, ticks_to_seconds_f64, LOCKSTEP_FIVE_SECONDS_TICKS_U32,
     LOCKSTEP_ONE_SECOND_TICKS_U32,
 };
 
@@ -346,10 +346,7 @@ pub struct SimRunnerHandle {
 /// `omobab::state::initialization::create_world_for_scene` 並運行
 /// 每個蜱蟲的輸入驅動的共享階段 3 調度程序
 /// `tick_input_rx`。
-pub fn spawn_sim_runner(
-    base_content_dll_path: PathBuf,
-    scene_path: PathBuf,
-) -> SimRunnerHandle {
+pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> SimRunnerHandle {
     let state = Arc::new(Mutex::new(SimWorldSnapshot::default()));
     let state_for_thread = state.clone();
 
@@ -436,9 +433,8 @@ fn run_sim_loop(
     // 字段，不在 ECS 中，正是為了避免借用衝突。更換
     // 具有“Default::default()”（空註冊表）的資源很好，因為
     // 沒有其他任何東西會查詢 ECS 駐留的 ScriptRegistry。
-    let script_registry: omobab::scripting::ScriptRegistry = std::mem::take(
-        &mut *world.write_resource::<omobab::scripting::ScriptRegistry>(),
-    );
+    let script_registry: omobab::scripting::ScriptRegistry =
+        std::mem::take(&mut *world.write_resource::<omobab::scripting::ScriptRegistry>());
 
     info!("sim_runner: dispatcher ready, entering tick loop");
 
@@ -489,11 +485,7 @@ fn run_sim_loop(
             }
         };
 
-        for input in batch
-            .inputs
-            .iter()
-            .filter(|input| input.input_id != 0)
-        {
+        for input in batch.inputs.iter().filter(|input| input.input_id != 0) {
             recent_applied_inputs.push_back((
                 batch.tick,
                 AppliedInputMeta {
@@ -507,10 +499,9 @@ fn run_sim_loop(
                 },
             ));
         }
-        while recent_applied_inputs
-            .front()
-            .is_some_and(|(tick, _)| batch.tick.saturating_sub(*tick) > APPLIED_INPUT_ID_RETENTION_TICKS)
-        {
+        while recent_applied_inputs.front().is_some_and(|(tick, _)| {
+            batch.tick.saturating_sub(*tick) > APPLIED_INPUT_ID_RETENTION_TICKS
+        }) {
             recent_applied_inputs.pop_front();
         }
         let applied_input_meta = recent_applied_inputs
@@ -529,15 +520,14 @@ fn run_sim_loop(
         // 如果沒有這些，本地 sim 會有 Tick 前進，但時間停留在 0，
         // 這使得 `creep_wave` 看到 `totaltime=0` 並且永遠不會產生 — 完全正確
         // 為什麼 Start Round 會觸發（is_running 翻轉）但沒有小兵出現。
-        const SIM_DT_S: f32 = LOCKSTEP_DT_F32;
         world.write_resource::<omobab::comp::resources::Tick>().0 = batch.tick as u64;
         {
             let mut t = world.write_resource::<omobab::comp::resources::Time>();
-            t.0 = (batch.tick as f64) * (SIM_DT_S as f64);
+            t.0 = ticks_to_seconds_f64(batch.tick);
         }
         {
             let mut dt = world.write_resource::<omobab::comp::resources::DeltaTime>();
-            dt.0 = omoba_sim::Fixed64::from_raw((SIM_DT_S * 1024.0) as i64);
+            dt.0 = omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64));
         }
 
         dispatcher.dispatch(&world);
@@ -608,7 +598,7 @@ fn run_sim_loop(
             &mut world,
             &script_registry,
             batch.tick as u64,
-            omoba_sim::Fixed64::from_raw((SIM_DT_S * 1024.0) as i64),
+            omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64)),
             sink_tx.clone(),
         );
         // 處理推送的任何結果腳本（投射物/損壞/等）。
@@ -671,8 +661,10 @@ fn run_sim_loop(
         // 塔模板），因此 iter_all 從勾選 1 開始就非空。惰性保護
         // 鏡像其他註冊表以實現對稱。
         if tower_upgrades_arc.is_empty() {
-            let reg = world.read_resource::<omobab::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
-            let mut defs: Vec<TowerUpgradeDefSnapshot> = reg.iter_all()
+            let reg =
+                world.read_resource::<omobab::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
+            let mut defs: Vec<TowerUpgradeDefSnapshot> = reg
+                .iter_all()
                 .map(|d| TowerUpgradeDefSnapshot {
                     tower_kind: d.tower_kind.clone(),
                     path: d.path,
@@ -683,7 +675,8 @@ fn run_sim_loop(
                 .collect();
             if !defs.is_empty() {
                 defs.sort_by(|a, b| {
-                    a.tower_kind.cmp(&b.tower_kind)
+                    a.tower_kind
+                        .cmp(&b.tower_kind)
                         .then(a.path.cmp(&b.path))
                         .then(a.level.cmp(&b.level))
                 });
@@ -713,8 +706,8 @@ fn run_sim_loop(
         // （第 4-5 階段鎖步清理）。每秒採樣一次
         // 前幾個小兵的 HP 值。如果惠普永遠不會改變
         // 跑，鏡子的傷害路徑被打破；如果 HP 減少，
-        // 鏡像很好，回歸僅渲染。採樣每個
-        // 60 個刻度以將日誌量保持在 TD_STRESS 規模的較低水準。
+        // 鏡像很好，回歸僅渲染。採樣每秒一次以將日誌量保持在
+        // TD_STRESS 規模的較低水準。
         if batch.tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
             let creep_hps: Vec<(u32, i32, i32)> = snapshot
                 .entities
@@ -727,7 +720,9 @@ fn run_sim_loop(
                 log::info!(
                     "[mirror-snapshot] tick={} creep_count={} sample_hp={:?}",
                     batch.tick,
-                    snapshot.entities.iter()
+                    snapshot
+                        .entities
+                        .iter()
                         .filter(|e| matches!(e.kind, EntityKind::Creep))
                         .count(),
                     creep_hps,
@@ -745,7 +740,9 @@ fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Err
     let mut world = omobab::state::initialization::create_world_for_scene(scene_path)?;
     // 使用權威的 MasterSeed 覆蓋預設的 MasterSeed
     // 遊戲開始。必須在第一次調度之前發生。
-    world.write_resource::<omobab::comp::resources::MasterSeed>().0 = master_seed;
+    world
+        .write_resource::<omobab::comp::resources::MasterSeed>()
+        .0 = master_seed;
     Ok(world)
 }
 
@@ -782,12 +779,12 @@ fn extract_snapshot(
     // 板條箱根部，因此請穿過平坦的路徑而不是
     // 逐個模組（有些子模組如“comp::state”發生衝突
     // 與 State 結構命名空間）。
-    use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, TAttack, Tower};
-    use omobab::comp::hero::AttributeType;
+    use omobab::ability_runtime::{BuffStore, UnitStats};
     use omobab::comp::gold::Gold;
+    use omobab::comp::hero::AttributeType;
     use omobab::comp::inventory::Inventory;
     use omobab::scripting::ScriptUnitTag;
-    use omobab::ability_runtime::{BuffStore, UnitStats};
+    use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, TAttack, Tower};
 
     let entities = world.entities();
     let pos_storage = world.read_storage::<Pos>();
@@ -914,7 +911,11 @@ fn extract_snapshot(
                 .map(|p| stats.final_armor(p.def_physic, entity).to_f32_for_render())
                 .unwrap_or(0.0);
             let magic_resist = prop
-                .map(|p| stats.final_magic_resist(p.def_magic, entity).to_f32_for_render())
+                .map(|p| {
+                    stats
+                        .final_magic_resist(p.def_magic, entity)
+                        .to_f32_for_render()
+                })
                 .unwrap_or(0.0);
             let move_speed = prop
                 .map(|p| stats.final_move_speed(p.msd, entity).to_f32_for_render())
@@ -923,17 +924,24 @@ fn extract_snapshot(
                 .map(|a| stats.final_atk(a.atk_physic.v, entity).to_f32_for_render())
                 .unwrap_or(0.0);
             let attack_range = atk
-                .map(|a| stats.final_attack_range(a.range.v, entity).to_f32_for_render())
+                .map(|a| {
+                    stats
+                        .final_attack_range(a.range.v, entity)
+                        .to_f32_for_render()
+                })
                 .unwrap_or(0.0);
             // Attack_speed_sec = 基本間隔 / asd_mult。 asd_乘數 = 1
             // 指基礎； > 1 表示更快（間隔更短）。鏡子
             // 在 `build_hero_stats_payload` 中完成分割。
             let attack_speed_sec = atk
                 .map(|a| {
-                    let asd_mult =
-                        stats.final_attack_speed_mult(entity).to_f32_for_render();
+                    let asd_mult = stats.final_attack_speed_mult(entity).to_f32_for_render();
                     let base = a.asd.v.to_f32_for_render();
-                    if asd_mult > 0.0 { base / asd_mult } else { base }
+                    if asd_mult > 0.0 {
+                        base / asd_mult
+                    } else {
+                        base
+                    }
                 })
                 .unwrap_or(0.0);
             let bullet_speed = atk
@@ -952,8 +960,7 @@ fn extract_snapshot(
                     BuffSnapshot {
                         buff_id: id.to_string(),
                         remaining_secs,
-                        payload_json: serde_json::to_string(&entry.payload)
-                            .unwrap_or_default(),
+                        payload_json: serde_json::to_string(&entry.payload).unwrap_or_default(),
                     }
                 })
                 .collect();
@@ -1049,7 +1056,12 @@ fn extract_snapshot(
     let paths: Vec<Vec<(f32, f32)>> = world
         .read_resource::<BTreeMap<String, Path>>()
         .values()
-        .map(|p| p.check_points.iter().map(|cp| (cp.pos.x, cp.pos.y)).collect())
+        .map(|p| {
+            p.check_points
+                .iter()
+                .map(|cp| (cp.pos.x, cp.pos.y))
+                .collect()
+        })
         .collect();
 
     // 診斷：轉儲實體類型直方圖+每秒採樣，以便我們可以
@@ -1068,14 +1080,32 @@ fn extract_snapshot(
         }
         log::info!(
             "[sim_runner] tick={} total={} hero={} tower={} creep={} proj={} other={}",
-            tick, out.len(), counts[0], counts[1], counts[2], counts[3], counts[4],
+            tick,
+            out.len(),
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
         );
         // 前 10 個非英雄實體 — 顯示其 pos / unit_id 以暗示來源。
-        for (i, e) in out.iter().filter(|e| !matches!(e.kind, EntityKind::Hero)).enumerate().take(10) {
+        for (i, e) in out
+            .iter()
+            .filter(|e| !matches!(e.kind, EntityKind::Hero))
+            .enumerate()
+            .take(10)
+        {
             log::info!(
                 "  [{}] id={} gen={} kind={:?} unit_id={:?} pos=({:.0},{:.0}) hp={}/{}",
-                i, e.entity_id, e.entity_gen, e.kind, e.unit_id,
-                e.pos_x, e.pos_y, e.hp, e.max_hp,
+                i,
+                e.entity_id,
+                e.entity_gen,
+                e.kind,
+                e.unit_id,
+                e.pos_x,
+                e.pos_y,
+                e.hp,
+                e.max_hp,
             );
         }
     }

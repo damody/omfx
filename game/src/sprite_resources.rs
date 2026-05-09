@@ -19,10 +19,10 @@
 
 use fyrox::core::algebra::{Vector2, Vector3};
 use fyrox::core::color::Color;
+use fyrox::core::math::TriangleDefinition;
 use fyrox::core::pool::Handle;
 use fyrox::material::{Material, MaterialResource};
 use fyrox::scene::base::BaseBuilder;
-use fyrox::core::math::TriangleDefinition;
 use fyrox::scene::mesh::buffer::{
     BytesStorage, TriangleBuffer, VertexAttributeDataType, VertexAttributeDescriptor,
     VertexAttributeUsage, VertexBuffer, VertexTrait,
@@ -169,11 +169,7 @@ impl SharedSpriteResources {
 
     /// 建立 3D Mesh 節點，使用每種顏色的 quad 與共用材質。
     /// 呼叫端需在後續設定 `local_transform`（位置、縮放、旋轉）。
-    pub fn build_mesh(
-        &self,
-        scene: &mut Scene,
-        surface: SurfaceResource,
-    ) -> Handle<Node> {
+    pub fn build_mesh(&self, scene: &mut Scene, surface: SurfaceResource) -> Handle<Node> {
         MeshBuilder::new(BaseBuilder::new().with_frustum_culling(false))
             .with_surfaces(vec![SurfaceBuilder::new(surface)
                 .with_material(self.material.clone())

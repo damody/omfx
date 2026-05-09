@@ -22,8 +22,8 @@
 //!   尚未接上 UI 輸入；階段 3 將接鍵盤／滑鼠輸入。
 //!
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,10 +80,12 @@ pub struct LockstepTickInput {
 
 #[derive(Debug, Clone)]
 pub enum LockstepEvent {
-    Connected { master_seed: u64, player_id: u32 },
+    Connected {
+        master_seed: u64,
+        player_id: u32,
+    },
     /// 階段 3.3：改為攜帶完整 TickBatch 內容（inputs + server events），
     /// 而非只傳筆數；讓 sim_runner 可用實際玩家輸入驅動 ECS dispatcher。
-
     TickBatch {
         tick: u32,
         inputs: Vec<LockstepTickInput>,
@@ -94,17 +96,27 @@ pub enum LockstepEvent {
         submit_start_us: u64,
         submit_done_us: u64,
     },
-    StateHash { tick: u32, hash: u64 },
+    StateHash {
+        tick: u32,
+        hash: u64,
+    },
     /// 自上次上報以來的網路吞吐位元組增量，含入站
     /// （`TickBatch` / `StateHash` / `SnapshotResp` / `GameStart`）與
     /// 出站（`InputSubmit`）兩方向；兩邊都算「lockstep 流量」。
     /// 背景執行緒每次收完一個 frame 會輸出一筆，主執行緒再彙總到
     /// 每秒 HUD 計數。
-    NetStats { wire_delta: u64, logical_delta: u64 },
+    NetStats {
+        wire_delta: u64,
+        logical_delta: u64,
+    },
     /// 從最近一次 `PingResponse` 取得 RTT，`pong` 每秒約 1 次更新一次；
     /// HUD 顯示最後一筆結果。
-    Latency { rtt_us: u64 },
-    Disconnected { reason: String },
+    Latency {
+        rtt_us: u64,
+    },
+    Disconnected {
+        reason: String,
+    },
 }
 
 /// 背景 lockstep client 的操作句柄。
@@ -156,7 +168,14 @@ pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClien
                 }
             };
             rt.block_on(async move {
-                run_client(addr, player_name, events_tx, input_rx, latest_tick_for_thread).await;
+                run_client(
+                    addr,
+                    player_name,
+                    events_tx,
+                    input_rx,
+                    latest_tick_for_thread,
+                )
+                .await;
             });
         })
         .expect("spawn omfx-lockstep-client thread");
@@ -243,10 +262,8 @@ async fn run_client(
     loop {
         wire_delta = 0;
         logical_delta = 0;
-        let recv_result = tokio::time::timeout(
-            std::time::Duration::from_millis(2),
-            rx.recv(),
-        ).await;
+        let recv_result =
+            tokio::time::timeout(std::time::Duration::from_millis(2), rx.recv()).await;
         match recv_result {
             Err(_elapsed) => {
                 let now = std::time::Instant::now();
@@ -266,7 +283,11 @@ async fn run_client(
                 });
                 break;
             }
-            Ok(Some(LockstepInbound::TickBatch { msg: b, wire_bytes, logical_bytes })) => {
+            Ok(Some(LockstepInbound::TickBatch {
+                msg: b,
+                wire_bytes,
+                logical_bytes,
+            })) => {
                 let client_receive_us = wall_clock_us();
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
@@ -306,7 +327,11 @@ async fn run_client(
                     server_events,
                 });
             }
-            Ok(Some(LockstepInbound::StateHash { msg: sh, wire_bytes, logical_bytes })) => {
+            Ok(Some(LockstepInbound::StateHash {
+                msg: sh,
+                wire_bytes,
+                logical_bytes,
+            })) => {
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
                 let _ = events_tx.send(LockstepEvent::StateHash {
@@ -314,17 +339,29 @@ async fn run_client(
                     hash: sh.hash,
                 });
             }
-            Ok(Some(LockstepInbound::GameStart { wire_bytes, logical_bytes, .. })) => {
+            Ok(Some(LockstepInbound::GameStart {
+                wire_bytes,
+                logical_bytes,
+                ..
+            })) => {
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
                 warn!("lockstep-client got unexpected GameStart after join — ignoring");
             }
-            Ok(Some(LockstepInbound::Pong { rtt_us, wire_bytes, logical_bytes })) => {
+            Ok(Some(LockstepInbound::Pong {
+                rtt_us,
+                wire_bytes,
+                logical_bytes,
+            })) => {
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
                 let _ = events_tx.send(LockstepEvent::Latency { rtt_us });
             }
-            Ok(Some(LockstepInbound::SnapshotResp { msg: resp, wire_bytes, logical_bytes })) => {
+            Ok(Some(LockstepInbound::SnapshotResp {
+                msg: resp,
+                wire_bytes,
+                logical_bytes,
+            })) => {
                 wire_delta += wire_bytes as u64;
                 logical_delta += logical_bytes as u64;
                 let (bytes_len, schema) = match &resp.state {
@@ -342,7 +379,10 @@ async fn run_client(
         // lockstep 流量總數。
         while let Ok(msg) = input_rx.try_recv() {
             let submit_start_us = wall_clock_us();
-            match client.submit_input(msg.target_tick, msg.input, msg.input_id).await {
+            match client
+                .submit_input(msg.target_tick, msg.input, msg.input_id)
+                .await
+            {
                 Ok((logical, wire)) => {
                     let submit_done_us = wall_clock_us();
                     wire_delta += wire as u64;

@@ -218,23 +218,33 @@ impl RenderBridge {
                     BaseBuilder::new().with_local_transform(
                         TransformBuilder::new()
                             .with_local_position(Vector3::new(mid_x, mid_y, Z_RB_PATH))
-                            .with_local_rotation(fyrox::core::algebra::UnitQuaternion::from_axis_angle(
-                                &fyrox::core::algebra::Vector3::z_axis(),
-                                angle,
-                            ))
+                            .with_local_rotation(
+                                fyrox::core::algebra::UnitQuaternion::from_axis_angle(
+                                    &fyrox::core::algebra::Vector3::z_axis(),
+                                    angle,
+                                ),
+                            )
                             .with_local_scale(Vector3::new(len, PATH_LINE_THICKNESS, f32::EPSILON))
                             .build(),
                     ),
                 )
-                .with_color(Color::from_rgba(PATH_COLOR.0, PATH_COLOR.1, PATH_COLOR.2, PATH_COLOR.3))
+                .with_color(Color::from_rgba(
+                    PATH_COLOR.0,
+                    PATH_COLOR.1,
+                    PATH_COLOR.2,
+                    PATH_COLOR.3,
+                ))
                 .build(&mut scene.graph)
                 .transmute();
                 self.path_nodes.push(seg);
             }
         }
         self.paths_drawn = true;
-        log::info!("render_bridge: drew {} path nodes for {} path(s)",
-            self.path_nodes.len(), paths.len());
+        log::info!(
+            "render_bridge: drew {} path nodes for {} path(s)",
+            self.path_nodes.len(),
+            paths.len()
+        );
     }
 }
 
@@ -267,7 +277,7 @@ pub struct SimEntitySlots {
 }
 
 /// 回傳給 lib.rs batched-mesh 寫入器的樣式。顏色採
-    /// 依實體種類基礎色，並以 unit_id hash 做微幅偏移，讓 dart / bomb / ice
+/// 依實體種類基礎色，並以 unit_id hash 做微幅偏移，讓 dart / bomb / ice
 /// 等塔類在未導入真材質前仍能視覺區分。
 pub fn style_for_entity(entity: &EntityRenderData) -> ([u8; 4], f32, f32) {
     let (base_rgb, size, z) = match entity.kind {
@@ -307,9 +317,13 @@ fn rotate_rgb(base: (u8, u8, u8), hash: u8) -> (u8, u8, u8) {
     let b = base.2 as i32 ^ ((h * 23) & 0xFF);
     let bump = |v: i32| -> u8 {
         let v = v.clamp(0, 255);
-        if v < 80 { (v + 80) as u8 }
-        else if v > 200 { v as u8 }
-        else { (v + 40).min(255) as u8 }
+        if v < 80 {
+            (v + 80) as u8
+        } else if v > 200 {
+            v as u8
+        } else {
+            (v + 40).min(255) as u8
+        }
     };
     (bump(r), bump(g), bump(b))
 }

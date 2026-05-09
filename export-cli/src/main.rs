@@ -3,11 +3,11 @@
 //! 範例：`cargo run --package export-cli -- --target-platform pc`
 //!       或 `cargo run --package export-cli -- --help` 查閱說明。
 
-use omfx::Game;
 use fyrox::core::log::Log;
 use fyrox::engine::executor::Executor;
 use fyrox::event_loop::EventLoop;
 use fyrox_build_tools::export::cli_export;
+use omfx::Game;
 
 fn main() {
     Log::set_file_name("omfxExport.log");
