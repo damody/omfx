@@ -300,6 +300,9 @@ pub struct EntityRenderData {
     /// 這與“network_entities”無關，因此快照變體是
     /// 鎖步側後視鏡。
     pub upgrade_levels: Option<[u8; 3]>,
+    /// 聚合 BuffStore 後的實際攻擊射程。塔升級會用永久 buff 改變
+    /// `TAttack.range` 的最終值，前端選中塔範圍圈必須讀這個值。
+    pub attack_range: f32,
 }
 
 /// 階段3.3：英雄面板的單一buff快照。
@@ -891,7 +894,7 @@ fn extract_snapshot(
     use omobab::comp::hero::AttributeType;
     use omobab::comp::inventory::Inventory;
     use omobab::scripting::ScriptUnitTag;
-    use omobab::{CProperty, Creep, Facing, Hero, Pos, Projectile, TAttack, Tower};
+    use omobab::{CProperty, Creep, Facing, Hero, IsBuilding, Pos, Projectile, TAttack, Tower};
 
     let entities = world.entities();
     let pos_storage = world.read_storage::<Pos>();
@@ -908,7 +911,7 @@ fn extract_snapshot(
     // 只讀－沒有 ECS 突變，因此決定論不受影響。
     let tatk_storage = world.read_storage::<TAttack>();
     let buff_store = world.read_resource::<BuffStore>();
-    let stats = UnitStats::from_refs(&*buff_store, /*is_building*/ false);
+    let is_building_storage = world.read_storage::<IsBuilding>();
     // 階段 4.4：英雄庫存存儲 — 只有英雄實體才會填入此存儲，
     // 因此對於非英雄行（無），查找很便宜。
     let inventory_storage = world.read_storage::<Inventory>();
@@ -956,6 +959,15 @@ fn extract_snapshot(
             .map(|t| t.unit_id.clone())
             .unwrap_or_default();
         let gold = gold_storage.get(entity).map(|g| g.0).unwrap_or(0);
+        let stats = UnitStats::from_refs(&*buff_store, is_building_storage.get(entity).is_some());
+        let attack_range = tatk_storage
+            .get(entity)
+            .map(|a| {
+                stats
+                    .final_attack_range(a.range.v, entity)
+                    .to_f32_for_render()
+            })
+            .unwrap_or(0.0);
 
         // 僅限英雄的元資料。每個英雄實體讀取一次，保持零成本
         // 對於非英雄行。
@@ -1029,13 +1041,6 @@ fn extract_snapshot(
                 .unwrap_or(0.0);
             let attack_damage = atk
                 .map(|a| stats.final_atk(a.atk_physic.v, entity).to_f32_for_render())
-                .unwrap_or(0.0);
-            let attack_range = atk
-                .map(|a| {
-                    stats
-                        .final_attack_range(a.range.v, entity)
-                        .to_f32_for_render()
-                })
                 .unwrap_or(0.0);
             // Attack_speed_sec = 基本間隔 / asd_mult。 asd_乘數 = 1
             // 指基礎； > 1 表示更快（間隔更短）。鏡子
@@ -1152,6 +1157,7 @@ fn extract_snapshot(
             gold,
             hero_ext,
             upgrade_levels,
+            attack_range,
         });
     }
 

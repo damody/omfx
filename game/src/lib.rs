@@ -350,10 +350,51 @@ fn td_upgrade_effect_text(description: &str) -> String {
     if text.is_empty() {
         return "效果待補".to_string();
     }
-    text.replace("，", "\n")
+    let text = text
+        .replace("，", "\n")
         .replace(", ", "\n")
         .replace(',', "\n")
-        .replace('、', "\n")
+        .replace('、', "\n");
+    td_wrap_ui_text(&text, 14, 4)
+}
+
+fn td_upgrade_title_text(name: &str) -> String {
+    let text = name.trim();
+    if text.is_empty() {
+        return "?".to_string();
+    }
+    td_wrap_ui_text(text, 10, 2)
+}
+
+fn td_wrap_ui_text(text: &str, max_units: usize, max_lines: usize) -> String {
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let mut line = String::new();
+        let mut units = 0usize;
+        for ch in raw_line.trim().chars() {
+            let ch_units = if ch.is_ascii() { 1 } else { 2 };
+            if units + ch_units > max_units && !line.trim().is_empty() {
+                lines.push(line.trim().to_string());
+                if lines.len() >= max_lines {
+                    return lines.join("\n");
+                }
+                line.clear();
+                units = 0;
+                if ch.is_whitespace() {
+                    continue;
+                }
+            }
+            line.push(ch);
+            units += ch_units;
+        }
+        if !line.trim().is_empty() {
+            lines.push(line.trim().to_string());
+            if lines.len() >= max_lines {
+                return lines.join("\n");
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 // 3D 相機視錐體中的 Z 層（相機在 z=-100 看 +Z，近=0.1 遠=1000）。
@@ -654,7 +695,10 @@ fn tower_visual_size(tpl: &TdTemplate) -> f32 {
 }
 
 fn tower_render_offset(point: &sim_runner::TowerRenderPointSnapshot, scale: f32) -> Vector2<f32> {
-    Vector2::new(point.x * WORLD_SCALE * scale, -point.y * WORLD_SCALE * scale)
+    Vector2::new(
+        point.x * WORLD_SCALE * scale,
+        -point.y * WORLD_SCALE * scale,
+    )
 }
 
 fn rotate_vec2(v: Vector2<f32>, angle: f32) -> Vector2<f32> {
@@ -714,7 +758,9 @@ fn set_tower_rect_material(
             rect.set_color(Color::WHITE);
         } else {
             rect.material_mut()
-                .set_value_and_mark_modified(MaterialResource::new_embedded(Material::standard_2d()));
+                .set_value_and_mark_modified(MaterialResource::new_embedded(
+                    Material::standard_2d(),
+                ));
             rect.set_color(fallback_color);
         }
     }
@@ -1397,6 +1443,13 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ui_hud_text: Handle<Text>,
+    /// TD 上方 icon HUD：HP / lives / gold。TD 模式用圖示+數字取代文字條。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_top_hud_icons: [Handle<UiNode>; 3],
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_top_hud_texts: [Handle<Text>; 3],
     /// 左下角英雄屬性面板（多行：name/title/Lv/XP/SP/三圍/HP/Gold + 4 技能等級）
     #[visit(skip)]
     #[reflect(hidden)]
@@ -1838,6 +1891,32 @@ impl Plugin for Game {
         .with_font_size(18.0.into())
         .build(&mut ui.build_ctx());
 
+        // TD 上方資源 HUD：用 icon + 數字取代 LIVES/GOLD/HP 文字列。
+        for (i, asset) in ["hud_hp.png", "hud_lives.png", "hud_gold.png"]
+            .iter()
+            .enumerate()
+        {
+            let mut icon_builder = ImageBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(64.0)
+                    .with_height(64.0),
+            );
+            if let Some(tex) = load_td_ui_texture(asset) {
+                icon_builder = icon_builder.with_texture(tex);
+            }
+            self.ui_td_top_hud_icons[i] = icon_builder.build(&mut ui.build_ctx()).transmute();
+            self.ui_td_top_hud_texts[i] = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(180.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(34.0.into())
+            .build(&mut ui.build_ctx());
+        }
+
         // 左下角英雄屬性面板（多行）；實際位置由 update() 依 window_size 重定位
         self.ui_hero_stats_panel = TextBuilder::new(
             WidgetBuilder::new()
@@ -1882,7 +1961,7 @@ impl Plugin for Game {
                         .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
                 )
                 .with_text(String::new())
-                .with_font_size(25.0.into())
+                .with_font_size(19.0.into())
                 .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .build(&mut ui.build_ctx());
                 self.td_upgrade_button_rects[i] = (-9999.0, -9999.0, 360.0, 38.0);
@@ -2011,7 +2090,7 @@ impl Plugin for Game {
                         .with_foreground(Brush::Solid(Color::from_rgba(92, 55, 26, 255)).into()),
                 )
                 .with_text(String::new())
-                .with_font_size(22.0.into())
+                .with_font_size(18.0.into())
                 .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .build(&mut ui.build_ctx());
                 self.ui_td_selected_panel.upgrade_price_texts[i] = TextBuilder::new(
@@ -2705,11 +2784,16 @@ impl Plugin for Game {
                         } else {
                             Some(e.unit_id.clone())
                         };
-                        let (hit_radius_backend, range_backend) = tower_kind
+                        let (footprint_backend, template_range_backend) = tower_kind
                             .as_deref()
                             .and_then(|uid| self.td_templates.get(uid))
-                            .map(|t| (t.hit_radius_backend, t.range_backend))
+                            .map(|t| (t.footprint_backend, t.range_backend))
                             .unwrap_or((0.4, 0.0));
+                        let range_backend = if e.attack_range > 0.0 {
+                            e.attack_range
+                        } else {
+                            template_range_backend
+                        };
                         let pos = Vector2::new(e.pos_x * WORLD_SCALE, e.pos_y * WORLD_SCALE);
                         let entry = self
                             .network_entities
@@ -2719,7 +2803,7 @@ impl Plugin for Game {
                         entry.position = pos;
                         entry.tower_kind = tower_kind;
                         entry.upgrade_levels = e.upgrade_levels.unwrap_or([0; 3]);
-                        entry.collision_radius_render = hit_radius_backend * WORLD_SCALE;
+                        entry.collision_radius_render = footprint_backend * WORLD_SCALE;
                         entry.attack_range_backend = range_backend;
                     }
                     self.network_entities
@@ -3815,7 +3899,15 @@ impl Plugin for Game {
             // ===== BTD-style 右側 shop/control panel =====
             {
                 let (sx, sy) = td_ui_ref_scale(self.window_size);
-                let panel = td_ui_ref_rect(self.window_size, 1479.0, 0.0, 405.0, 1080.0);
+                let right_panel_x_ref = 1555.0f32;
+                let right_panel_w_ref = 365.0f32;
+                let panel = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref,
+                    0.0,
+                    right_panel_w_ref,
+                    1080.0,
+                );
                 self.ui_td_right_panel.panel_rect = panel;
                 ui.send(
                     self.ui_td_right_panel.bg,
@@ -3823,7 +3915,13 @@ impl Plugin for Game {
                 );
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel.w));
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel.h));
-                let title = td_ui_ref_rect(self.window_size, 1503.0, 124.0, 357.0, 40.0);
+                let title = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + 24.0,
+                    124.0,
+                    right_panel_w_ref - 48.0,
+                    40.0,
+                );
                 ui.send(
                     self.ui_td_right_panel.title_text,
                     WidgetMessage::DesiredPosition(title.pos()),
@@ -3837,7 +3935,15 @@ impl Plugin for Game {
                     TextMessage::Text("塔商店".to_string()),
                 );
 
-                let viewport = td_ui_ref_rect(self.window_size, 1500.0, 170.0, 360.0, 745.0);
+                let shop_viewport_y_ref = 170.0f32;
+                let shop_viewport_h_ref = 745.0f32;
+                let viewport = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + 17.0,
+                    shop_viewport_y_ref,
+                    314.0,
+                    shop_viewport_h_ref,
+                );
                 self.ui_td_right_panel.viewport_rect = viewport;
                 ui.send(
                     self.ui_td_right_panel.viewport_bg,
@@ -3951,12 +4057,16 @@ impl Plugin for Game {
                 } else {
                     2
                 };
-                let ref_card_w = if columns == 2 { 158.0 } else { 320.0 };
-                let ref_card_h = if columns == 2 { 160.0 } else { 128.0 };
-                let ref_col_gap = if columns == 2 { 166.0 } else { 0.0 };
-                let ref_row_gap = if columns == 2 { 162.0 } else { 130.0 };
-                let ref_grid_x = if columns == 2 { 1508.0 } else { 1520.0 };
-                let ref_grid_y = 170.0f32;
+                let ref_card_w = if columns == 2 { 142.0 } else { 286.0 };
+                let ref_card_h = if columns == 2 { 118.0 } else { 104.0 };
+                let ref_col_gap = if columns == 2 { 151.0 } else { 0.0 };
+                let ref_row_gap = if columns == 2 { 124.0 } else { 108.0 };
+                let ref_grid_x = if columns == 2 {
+                    right_panel_x_ref + 23.0
+                } else {
+                    right_panel_x_ref + 30.0
+                };
+                let ref_grid_y = if columns == 2 { 176.0 } else { 172.0 };
                 let rows = if n == 0 {
                     0
                 } else {
@@ -3967,8 +4077,7 @@ impl Plugin for Game {
                 } else {
                     (rows.saturating_sub(1) as f32) * ref_row_gap + ref_card_h
                 };
-                let viewport_h_ref = 745.0f32;
-                self.td_shop_max_scroll = (content_h - viewport_h_ref).max(0.0);
+                self.td_shop_max_scroll = (content_h - shop_viewport_h_ref).max(0.0);
                 self.set_td_shop_scroll_offset(self.td_shop_scroll_offset);
                 let selected_kind = self.selected_tower_kind.clone();
                 for i in 0..n {
@@ -4036,12 +4145,12 @@ impl Plugin for Game {
                     ui.send(card.bg, WidgetMessage::Width(card_rect.w));
                     ui.send(card.bg, WidgetMessage::Height(card_rect.h));
                     ui.send(card.bg, ImageMessage::Texture(bg_tex));
-                    let icon_size = if columns == 2 { 96.0 } else { 72.0 };
+                    let icon_size = if columns == 2 { 64.0 } else { 58.0 };
                     ui.send(
                         card.icon,
                         WidgetMessage::DesiredPosition(Vector2::new(
                             local_card_pos.x + (card_rect.w - icon_size * sx) * 0.5,
-                            local_card_pos.y + 10.0 * sy,
+                            local_card_pos.y + 7.0 * sy,
                         )),
                     );
                     ui.send(card.icon, WidgetMessage::Width(icon_size * sx));
@@ -4061,7 +4170,7 @@ impl Plugin for Game {
                         card.price_text,
                         WidgetMessage::DesiredPosition(Vector2::new(
                             local_card_pos.x + 8.0 * sx,
-                            local_card_pos.y + card_rect.h - 54.0 * sy,
+                            local_card_pos.y + card_rect.h - 37.0 * sy,
                         )),
                     );
                     ui.send(
@@ -4078,7 +4187,13 @@ impl Plugin for Game {
                     );
                 }
 
-                let track = td_ui_ref_rect(self.window_size, 1857.0, 170.0, 18.0, 745.0);
+                let track = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + right_panel_w_ref - 28.0,
+                    shop_viewport_y_ref,
+                    16.0,
+                    shop_viewport_h_ref,
+                );
                 self.ui_td_right_panel.scroll_track_rect = track;
                 ui.send(
                     self.ui_td_right_panel.scroll_track,
@@ -4094,19 +4209,25 @@ impl Plugin for Game {
                 );
 
                 let thumb_h_ref = if self.td_shop_max_scroll <= 0.0 || content_h <= 0.0 {
-                    745.0
+                    shop_viewport_h_ref
                 } else {
-                    (viewport_h_ref / content_h * 745.0).clamp(72.0, 745.0)
+                    (shop_viewport_h_ref / content_h * shop_viewport_h_ref)
+                        .clamp(72.0, shop_viewport_h_ref)
                 };
-                let thumb_travel_ref = (745.0 - thumb_h_ref).max(0.0);
-                let thumb_y_ref = 170.0
+                let thumb_travel_ref = (shop_viewport_h_ref - thumb_h_ref).max(0.0);
+                let thumb_y_ref = shop_viewport_y_ref
                     + if self.td_shop_max_scroll > 0.0 {
                         (self.td_shop_scroll_offset / self.td_shop_max_scroll) * thumb_travel_ref
                     } else {
                         0.0
                     };
-                let thumb =
-                    td_ui_ref_rect(self.window_size, 1859.0, thumb_y_ref, 14.0, thumb_h_ref);
+                let thumb = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + right_panel_w_ref - 26.0,
+                    thumb_y_ref,
+                    12.0,
+                    thumb_h_ref,
+                );
                 self.ui_td_right_panel.scroll_thumb_rect = thumb;
                 ui.send(
                     self.ui_td_right_panel.scroll_thumb,
@@ -4121,7 +4242,13 @@ impl Plugin for Game {
                     WidgetMessage::Height(thumb.h),
                 );
 
-                let pause_rect = td_ui_ref_rect(self.window_size, 1508.0, 938.0, 162.0, 111.0);
+                let pause_rect = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + 25.0,
+                    938.0,
+                    142.0,
+                    111.0,
+                );
                 self.ui_td_right_panel.pause_rect = pause_rect;
                 self.pause_button_rect = pause_rect.tuple();
                 ui.send(
@@ -4151,7 +4278,13 @@ impl Plugin for Game {
                     self.ui_td_right_panel.pause_text,
                     TextMessage::Text("PAUSE 待接".to_string()),
                 );
-                let start_rect = td_ui_ref_rect(self.window_size, 1692.0, 938.0, 162.0, 111.0);
+                let start_rect = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + 190.0,
+                    938.0,
+                    142.0,
+                    111.0,
+                );
                 self.ui_td_right_panel.start_rect = start_rect;
                 self.start_round_button_rect = start_rect.tuple();
                 ui.send(
@@ -4338,7 +4471,7 @@ impl Plugin for Game {
                                 .get(&(kind_key.clone(), path, next_level))
                                 .map(|(n, _, c)| (n.as_str(), *c))
                                 .unwrap_or(("?", 0));
-                            (next_name.to_string(), format!("${}", next_cost))
+                            (td_upgrade_title_text(next_name), format!("${}", next_cost))
                         };
                         let effect_text = if level >= TD_UI_MAX_UPGRADE_LEVEL {
                             "已滿級".to_string()
@@ -4373,17 +4506,17 @@ impl Plugin for Game {
                         ui.send(
                             self.ui_td_selected_panel.upgrade_icons[idx],
                             WidgetMessage::DesiredPosition(Vector2::new(
-                                upgrade_button_rect.x + (upgrade_button_rect.w - 92.0 * sx) * 0.5,
-                                upgrade_button_rect.y + 34.0 * sy,
+                                upgrade_button_rect.x + (upgrade_button_rect.w - 76.0 * sx) * 0.5,
+                                upgrade_button_rect.y + 42.0 * sy,
                             )),
                         );
                         ui.send(
                             self.ui_td_selected_panel.upgrade_icons[idx],
-                            WidgetMessage::Width(92.0 * sx),
+                            WidgetMessage::Width(76.0 * sx),
                         );
                         ui.send(
                             self.ui_td_selected_panel.upgrade_icons[idx],
-                            WidgetMessage::Height(66.0 * sy),
+                            WidgetMessage::Height(50.0 * sy),
                         );
                         ui.send(
                             self.ui_td_selected_panel.upgrade_icons[idx],
@@ -4408,7 +4541,7 @@ impl Plugin for Game {
                             self.ui_td_selected_panel.upgrade_status_texts[idx],
                             WidgetMessage::DesiredPosition(Vector2::new(
                                 upgrade_rect.x + 50.0 * sx,
-                                upgrade_rect.y + 34.0 * sy,
+                                upgrade_rect.y + 24.0 * sy,
                             )),
                         );
                         ui.send(
@@ -4707,18 +4840,9 @@ impl Plugin for Game {
                     None => inv.push_str(&format!("[{}]- ", i + 1)),
                 }
             }
-            let hud = if hs.lives > 0 {
-                format!(
-                    "LIVES {}   GOLD {}   |   HP {:.0}/{:.0}  LV {}  XP {}/{}  SP {}",
-                    hs.lives,
-                    hs.gold,
-                    hs.hp,
-                    hs.max_hp,
-                    hs.level,
-                    hs.xp,
-                    hs.xp_next,
-                    hs.skill_points,
-                )
+            let is_td_hud = hs.lives > 0 || self.is_td_mode;
+            let hud = if is_td_hud {
+                String::new()
             } else {
                 format!(
                     "HP {:.0}/{:.0}  LV {}  XP {}/{}  GOLD {}  SP {}  |  {}",
@@ -4726,6 +4850,52 @@ impl Plugin for Game {
                 )
             };
             ui.send(self.ui_hud_text, TextMessage::Text(hud));
+            if is_td_hud {
+                let (sx, sy) = td_ui_ref_scale(self.window_size);
+                let hud_items = [
+                    ("hp", format!("{:.0}/{:.0}", hs.hp, hs.max_hp), 690.0),
+                    ("lives", format!("{}", hs.lives), 900.0),
+                    ("gold", format!("${}", hs.gold), 1090.0),
+                ];
+                for (i, (_, text, x_ref)) in hud_items.iter().enumerate() {
+                    let icon_rect = td_ui_ref_rect(self.window_size, *x_ref, 36.0, 58.0, 58.0);
+                    ui.send(
+                        self.ui_td_top_hud_icons[i],
+                        WidgetMessage::DesiredPosition(icon_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_top_hud_icons[i],
+                        WidgetMessage::Width(icon_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_top_hud_icons[i],
+                        WidgetMessage::Height(icon_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_top_hud_texts[i],
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            icon_rect.x + 66.0 * sx,
+                            icon_rect.y + 12.0 * sy,
+                        )),
+                    );
+                    ui.send(
+                        self.ui_td_top_hud_texts[i],
+                        WidgetMessage::Width(180.0 * sx),
+                    );
+                    ui.send(self.ui_td_top_hud_texts[i], TextMessage::Text(text.clone()));
+                }
+            } else {
+                for i in 0..3 {
+                    ui.send(
+                        self.ui_td_top_hud_icons[i],
+                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                    );
+                    ui.send(
+                        self.ui_td_top_hud_texts[i],
+                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                    );
+                }
+            }
 
             // 左下角英雄屬性面板：每 tick 重組文字並依 window_size 重定位
             {
@@ -5837,14 +6007,19 @@ impl Game {
                     comp.variant_count = variant_count;
                     comp.animation = None;
                     if let Some(barrel) = comp.barrel_node {
-                        material_updates.push((barrel, barrel_key.clone(), Color::from_rgba(35, 35, 35, 255)));
+                        material_updates.push((
+                            barrel,
+                            barrel_key.clone(),
+                            Color::from_rgba(35, 35, 35, 255),
+                        ));
                     }
                 }
             }
 
             if let Some(cue) = attack_cue.filter(|cue| cue.entity_gen == entity.entity_gen) {
                 if tpl.rotation_mode != "fixed" && cue.dir_rad.is_finite() {
-                    comp.last_aim_direction = tower_render_angle_from_facing(cue.dir_rad, tpl.default_angle_deg);
+                    comp.last_aim_direction =
+                        tower_render_angle_from_facing(cue.dir_rad, tpl.default_angle_deg);
                 }
                 animation_to_start = Some((active_frames.clone(), cue.impact_at_ms));
             }
@@ -5874,14 +6049,16 @@ impl Game {
             let aim_angle = if tpl.rotation_mode == "fixed" {
                 default_angle
             } else if entity.facing_rad.is_finite() {
-                let angle = tower_render_angle_from_facing(entity.facing_rad, tpl.default_angle_deg);
+                let angle =
+                    tower_render_angle_from_facing(entity.facing_rad, tpl.default_angle_deg);
                 comp.last_aim_direction = angle;
                 angle
             } else {
                 comp.last_aim_direction
             };
 
-            if comp.animation.is_none() && animation_meta.loop_animation && active_frames.len() > 1 {
+            if comp.animation.is_none() && animation_meta.loop_animation && active_frames.len() > 1
+            {
                 comp.animation = Some(TowerAnimationState {
                     frames: active_frames.clone(),
                     elapsed: 0.0,
@@ -5986,9 +6163,17 @@ impl Game {
             let scale = recoil_scale.max(0.05);
             scene.graph[comp.base_node]
                 .local_transform_mut()
-                .set_position(Vector3::new(pos.x + recoil_offset.x, pos.y + recoil_offset.y, Z_TOWER))
+                .set_position(Vector3::new(
+                    pos.x + recoil_offset.x,
+                    pos.y + recoil_offset.y,
+                    Z_TOWER,
+                ))
                 .set_rotation(UnitQuaternion::identity())
-                .set_scale(Vector3::new(base_size * scale, base_size * scale, f32::EPSILON));
+                .set_scale(Vector3::new(
+                    base_size * scale,
+                    base_size * scale,
+                    f32::EPSILON,
+                ));
 
             if let Some(barrel) = comp.barrel_node {
                 if !is_animated_area {
@@ -5997,10 +6182,8 @@ impl Game {
                         (0.5 - tpl.barrel_pivot.x) * base_size * scale,
                         (tpl.barrel_pivot.y - 0.5) * base_size * scale,
                     );
-                    let barrel_center = pos
-                        + recoil_offset
-                        + offset
-                        + rotate_vec2(pivot_to_center, aim_angle);
+                    let barrel_center =
+                        pos + recoil_offset + offset + rotate_vec2(pivot_to_center, aim_angle);
                     scene.graph[barrel]
                         .local_transform_mut()
                         .set_position(Vector3::new(
@@ -6008,8 +6191,15 @@ impl Game {
                             barrel_center.y,
                             Z_TOWER - 0.04,
                         ))
-                        .set_rotation(UnitQuaternion::from_axis_angle(&Vector3::z_axis(), aim_angle))
-                        .set_scale(Vector3::new(base_size * scale, base_size * scale, f32::EPSILON));
+                        .set_rotation(UnitQuaternion::from_axis_angle(
+                            &Vector3::z_axis(),
+                            aim_angle,
+                        ))
+                        .set_scale(Vector3::new(
+                            base_size * scale,
+                            base_size * scale,
+                            f32::EPSILON,
+                        ));
                 }
             }
         }
@@ -6054,7 +6244,8 @@ impl Game {
             self.sim_last_attack_phase_tick = Some(snapshot.tick);
         }
         let mut fire_cues: HashMap<u32, &sim_runner::TowerFireFx> = HashMap::new();
-        if !snapshot.tower_fire_fx.is_empty() && self.sim_last_tower_fire_tick != Some(snapshot.tick)
+        if !snapshot.tower_fire_fx.is_empty()
+            && self.sim_last_tower_fire_tick != Some(snapshot.tick)
         {
             for cue in &snapshot.tower_fire_fx {
                 fire_cues.entry(cue.entity_id).or_insert(cue);
@@ -6158,16 +6349,16 @@ impl Game {
                         },
                     );
                 } else {
-                batch.write_quad(
-                    slots.body_slot,
-                    &sprite_resources::QuadParams {
-                        center: pos,
-                        size: Vector2::new(size, size),
-                        color,
-                        rotation: 0.0,
-                        z,
-                    },
-                );
+                    batch.write_quad(
+                        slots.body_slot,
+                        &sprite_resources::QuadParams {
+                            center: pos,
+                            size: Vector2::new(size, size),
+                            color,
+                            rotation: 0.0,
+                            z,
+                        },
+                    );
                 }
             }
 
@@ -6248,9 +6439,9 @@ impl Game {
             // 相同的“face_batch”，因此兩條路徑共用一個繪製呼叫。
             let wants_turret = matches!(
                 e.kind,
-                sim_runner::EntityKind::Hero
-                    | sim_runner::EntityKind::Creep,
-            ) || (matches!(e.kind, sim_runner::EntityKind::Tower) && !uses_composite_tower);
+                sim_runner::EntityKind::Hero | sim_runner::EntityKind::Creep,
+            ) || (matches!(e.kind, sim_runner::EntityKind::Tower)
+                && !uses_composite_tower);
             if wants_turret {
                 if slots.turret_slot.is_none() {
                     if let Some(batch) = self.facing_batch.as_mut() {
