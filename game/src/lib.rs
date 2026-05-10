@@ -291,6 +291,7 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 
 // 後端→渲染座標比例（後端使用800等大單位）
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
+const TD_PATH_HALF_WIDTH_BACKEND: f32 = 64.0;
 const UI_HIDDEN_POS: f32 = -9999.0;
 const TD_UI_MAX_UPGRADE_LEVEL: u8 = 4;
 const TD_SHOP_LAYOUT_DEBUG_MIN_CARDS: usize = 20;
@@ -3300,59 +3301,9 @@ impl Plugin for Game {
                 if let Some(tpl) = self.td_templates.get(&kind).cloned() {
                     let placement_radius_render = tower_placement_radius_render(&tpl);
                     let range_backend = tpl.range_backend;
-                    let cost = tpl.cost;
                     let mwp = self.mouse_world_pos;
                     // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
-                    const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
-                    let clear_render =
-                        (tpl.placement_radius_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
-                    let clear_sq = clear_render * clear_render;
-                    let mut can_place = self.hero_state.gold >= cost;
-                    if can_place {
-                        // 壓到 path？
-                        'outer: for path in &self.td_paths_render {
-                            for i in 0..path.len().saturating_sub(1) {
-                                if point_segment_dist_sq(mwp, path[i], path[i + 1]) < clear_sq {
-                                    can_place = false;
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                    if can_place {
-                        // 壓到 region？
-                        for poly in &self.td_regions_render {
-                            if circle_hits_polygon(mwp, placement_radius_render, poly) {
-                                can_place = false;
-                                break;
-                            }
-                        }
-                    }
-                    if can_place {
-                        // 與其他塔重疊？（只看 TD 塔）
-                        for ent in self.network_entities.values() {
-                            if ent.entity_type != "tower" {
-                                continue;
-                            }
-                            if ent.tower_kind.is_none() {
-                                continue;
-                            }
-                            let Some(existing_radius) = ent
-                                .tower_kind
-                                .as_ref()
-                                .and_then(|kind| self.td_templates.get(kind))
-                                .map(tower_placement_radius_render)
-                            else {
-                                can_place = false;
-                                break;
-                            };
-                            let min_d = existing_radius + placement_radius_render;
-                            if (ent.position - mwp).norm_squared() < min_d * min_d {
-                                can_place = false;
-                                break;
-                            }
-                        }
-                    }
+                    let can_place = self.can_place_tower_at(&tpl, mwp);
 
                     // 可蓋 → 綠；不可蓋 → 紅
                     let (foot_color, range_color) = if can_place {
@@ -5461,41 +5412,53 @@ impl Plugin for Game {
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
-                        // 階段 2.1：TowerPlace 鎖步輸入。選定的塔類型
-                        // 是unit_id字串（例如“tower_dart”）－轉換為
-                        // 原型 u32 kind_id 通過 omoba_template_ids::tower_by_name。
-                        match omoba_template_ids::tower_by_name(&kind) {
-                            Some(tid) => {
-                                let pos = world_render_to_vec2i(world_pos);
-                                let input = omoba_core::kcp::game_proto::PlayerInput {
-                                    action: Some(
-                                        omoba_core::kcp::game_proto::player_input::Action::TowerPlace(
-                                            omoba_core::kcp::game_proto::TowerPlace {
-                                                tower_kind_id: tid.0 as u32,
-                                                pos: Some(pos),
-                                            },
+                        let can_place = self
+                            .td_templates
+                            .get(&kind)
+                            .map(|tpl| self.can_place_tower_at(tpl, world_pos))
+                            .unwrap_or(false);
+                        if can_place {
+                            // 階段 2.1：TowerPlace 鎖步輸入。選定的塔類型
+                            // 是unit_id字串（例如“tower_dart”）－轉換為
+                            // 原型 u32 kind_id 通過 omoba_template_ids::tower_by_name。
+                            match omoba_template_ids::tower_by_name(&kind) {
+                                Some(tid) => {
+                                    let pos = world_render_to_vec2i(world_pos);
+                                    let input = omoba_core::kcp::game_proto::PlayerInput {
+                                        action: Some(
+                                            omoba_core::kcp::game_proto::player_input::Action::TowerPlace(
+                                                omoba_core::kcp::game_proto::TowerPlace {
+                                                    tower_kind_id: tid.0 as u32,
+                                                    pos: Some(pos),
+                                                },
+                                            ),
                                         ),
-                                    ),
-                                };
-                                self.send_lockstep_input_from(
-                                    input,
-                                    lockstep_client::InputOriginKind::OsEvent,
-                                    event_us,
-                                );
-                                log::info!(
-                                    "Tower place lockstep input submitted: kind='{}' kind_id={} pos=({}, {})",
-                                    kind, tid.0, pos.x, pos.y
-                                );
+                                    };
+                                    self.send_lockstep_input_from(
+                                        input,
+                                        lockstep_client::InputOriginKind::OsEvent,
+                                        event_us,
+                                    );
+                                    log::info!(
+                                        "Tower place lockstep input submitted: kind='{}' kind_id={} pos=({}, {})",
+                                        kind, tid.0, pos.x, pos.y
+                                    );
+                                    if !self.ctrl_held {
+                                        self.selected_tower_kind = None;
+                                    }
+                                }
+                                None => {
+                                    log::warn!(
+                                        "Tower place: unknown kind name '{}' (no template_ids match) — skipped",
+                                        kind
+                                    );
+                                }
                             }
-                            None => {
-                                log::warn!(
-                                    "Tower place: unknown kind name '{}' (no template_ids match) — skipped",
-                                    kind
-                                );
-                            }
-                        }
-                        if !self.ctrl_held {
-                            self.selected_tower_kind = None;
+                        } else {
+                            log::info!(
+                                "Tower place skipped by local placement validation: kind='{}'",
+                                kind
+                            );
                         }
                         hit_ui = true;
                     }
@@ -5792,6 +5755,51 @@ impl Game {
 
     fn set_td_shop_scroll_offset(&mut self, offset: f32) {
         self.td_shop_scroll_offset = offset.clamp(0.0, self.td_shop_max_scroll.max(0.0));
+    }
+
+    fn can_place_tower_at(&self, tpl: &TdTemplate, pos: Vector2<f32>) -> bool {
+        if self.hero_state.gold < tpl.cost {
+            return false;
+        }
+
+        let placement_radius_render = tower_placement_radius_render(tpl);
+        let clear_render =
+            (tpl.placement_radius_backend + TD_PATH_HALF_WIDTH_BACKEND) * WORLD_SCALE;
+        let clear_sq = clear_render * clear_render;
+
+        for path in &self.td_paths_render {
+            for i in 0..path.len().saturating_sub(1) {
+                if point_segment_dist_sq(pos, path[i], path[i + 1]) < clear_sq {
+                    return false;
+                }
+            }
+        }
+
+        for poly in &self.td_regions_render {
+            if circle_hits_polygon(pos, placement_radius_render, poly) {
+                return false;
+            }
+        }
+
+        for ent in self.network_entities.values() {
+            if ent.entity_type != "tower" {
+                continue;
+            }
+            let Some(existing_radius) = ent
+                .tower_kind
+                .as_ref()
+                .and_then(|kind| self.td_templates.get(kind))
+                .map(tower_placement_radius_render)
+            else {
+                return false;
+            };
+            let min_d = existing_radius + placement_radius_render;
+            if (ent.position - pos).norm_squared() < min_d * min_d {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn selected_tower_screen_x(&self) -> Option<f32> {
