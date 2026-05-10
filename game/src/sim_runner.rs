@@ -241,6 +241,7 @@ pub struct TowerTemplateSnapshot {
     pub render_mode: String,
     pub base_image: String,
     pub barrel_image: String,
+    pub size: f32,
     pub barrel_frames: Vec<String>,
     pub body_frames: Vec<String>,
     pub barrel_animation: TowerRenderAnimationSnapshot,
@@ -706,6 +707,7 @@ fn run_sim_loop(
                             render_mode: t.render.render_mode.clone(),
                             base_image: t.render.base.clone(),
                             barrel_image: t.render.barrel.clone(),
+                            size: t.render.size,
                             barrel_frames: t.render.barrel_frames.clone(),
                             body_frames: t.render.body_frames.clone(),
                             barrel_animation: TowerRenderAnimationSnapshot {
@@ -1351,6 +1353,7 @@ mod tests {
             render_mode: "base_barrel".to_string(),
             base_image: "assets/towers/tower_dart_base.png".to_string(),
             barrel_image: "assets/towers/tower_dart_barrel.png".to_string(),
+            size: 180.0,
             barrel_frames: vec!["assets/towers/tower_dart_barrel_frame_01.png".to_string()],
             body_frames: Vec::new(),
             barrel_animation: TowerRenderAnimationSnapshot {

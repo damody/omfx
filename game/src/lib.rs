@@ -274,7 +274,6 @@ const GRID_ORIGIN_Y: f32 = -4.0;
 
 // 後端→渲染座標比例（後端使用800等大單位）
 const WORLD_SCALE: f32 = 0.01; // 800 backend → 8.0 render
-const TD_TOWER_VISUAL_SCALE: f32 = 2.0;
 const UI_HIDDEN_POS: f32 = -9999.0;
 const TD_UI_MAX_UPGRADE_LEVEL: u8 = 4;
 const TD_SHOP_LAYOUT_DEBUG_MIN_CARDS: usize = 20;
@@ -503,6 +502,7 @@ struct TdTemplate {
     render_mode: String,
     base_image: String,
     barrel_image: String,
+    render_size_backend: f32,
     barrel_frames: Vec<String>,
     body_frames: Vec<String>,
     barrel_animation: sim_runner::TowerRenderAnimationSnapshot,
@@ -691,7 +691,16 @@ fn texture_material(texture: TextureResource) -> MaterialResource {
 }
 
 fn tower_visual_size(tpl: &TdTemplate) -> f32 {
-    (tpl.footprint_backend * WORLD_SCALE * 4.5).clamp(0.34, 0.72) * TD_TOWER_VISUAL_SCALE
+    let size_backend = if tpl.render_size_backend > 0.0 {
+        tpl.render_size_backend
+    } else {
+        tpl.footprint_backend
+    };
+    size_backend * WORLD_SCALE
+}
+
+fn tower_placement_radius_render(tpl: &TdTemplate) -> f32 {
+    (tower_visual_size(tpl) * 0.5).max(tpl.footprint_backend * WORLD_SCALE)
 }
 
 fn tower_render_offset(point: &sim_runner::TowerRenderPointSnapshot, scale: f32) -> Vector2<f32> {
@@ -2714,6 +2723,7 @@ impl Plugin for Game {
                                 render_mode: t.render_mode.clone(),
                                 base_image: t.base_image.clone(),
                                 barrel_image: t.barrel_image.clone(),
+                                render_size_backend: t.size,
                                 barrel_frames: t.barrel_frames.clone(),
                                 body_frames: t.body_frames.clone(),
                                 barrel_animation: t.barrel_animation.clone(),
@@ -3271,14 +3281,14 @@ impl Plugin for Game {
         {
             if let Some(kind) = self.selected_tower_kind.clone() {
                 if let Some(tpl) = self.td_templates.get(&kind).cloned() {
-                    let footprint_backend = tpl.footprint_backend;
+                    let placement_radius_render = tower_placement_radius_render(&tpl);
+                    let placement_radius_backend = placement_radius_render / WORLD_SCALE;
                     let range_backend = tpl.range_backend;
                     let cost = tpl.cost;
                     let mwp = self.mouse_world_pos;
                     // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
                     const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
-                    let footprint_render = footprint_backend * WORLD_SCALE;
-                    let clear_render = (footprint_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
+                    let clear_render = (placement_radius_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
                     let clear_sq = clear_render * clear_render;
                     let mut can_place = self.hero_state.gold >= cost;
                     if can_place {
@@ -3295,7 +3305,7 @@ impl Plugin for Game {
                     if can_place {
                         // 壓到 region？
                         for poly in &self.td_regions_render {
-                            if circle_hits_polygon(mwp, footprint_render, poly) {
+                            if circle_hits_polygon(mwp, placement_radius_render, poly) {
                                 can_place = false;
                                 break;
                             }
@@ -3310,7 +3320,13 @@ impl Plugin for Game {
                             if ent.tower_kind.is_none() {
                                 continue;
                             }
-                            let min_d = ent.collision_radius_render + footprint_render;
+                            let existing_radius = ent
+                                .tower_kind
+                                .as_ref()
+                                .and_then(|kind| self.td_templates.get(kind))
+                                .map(tower_placement_radius_render)
+                                .unwrap_or(ent.collision_radius_render);
+                            let min_d = existing_radius + placement_radius_render;
                             if (ent.position - mwp).norm_squared() < min_d * min_d {
                                 can_place = false;
                                 break;
@@ -3334,7 +3350,7 @@ impl Plugin for Game {
                     add_circle_lines(
                         scene,
                         mwp,
-                        footprint_render,
+                        placement_radius_render,
                         24,
                         foot_color,
                         Z_REGION - 0.0002,
