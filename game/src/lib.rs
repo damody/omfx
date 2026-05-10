@@ -6171,9 +6171,10 @@ impl Game {
                 }
             }
 
-            // HP 條（背景 + 目標）。惰性分配 — 彈體 + 不含馬力的實體
-            // 跳過分配以保留實際單元的容量。
-            if e.max_hp > 0 {
+            // HP 條（背景 + 目標）。塔滿血時隱藏，避免畫面被不必要的血條佔滿。
+            let tower_full_hp = matches!(e.kind, sim_runner::EntityKind::Tower) && e.hp >= e.max_hp;
+            let wants_hp_bar = e.max_hp > 0 && !tower_full_hp;
+            if wants_hp_bar {
                 if slots.hp_bg_slot.is_none() {
                     if let Some(batch) = self.hp_batch.as_mut() {
                         slots.hp_bg_slot = Some(batch.alloc());
@@ -6224,6 +6225,18 @@ impl Game {
                             },
                         );
                     }
+                }
+            } else if slots.hp_bg_slot.is_some() || slots.hp_fg_slot.is_some() {
+                if let Some(batch) = self.hp_batch.as_mut() {
+                    if let Some(bg) = slots.hp_bg_slot.take() {
+                        batch.free(bg);
+                    }
+                    if let Some(fg) = slots.hp_fg_slot.take() {
+                        batch.free(fg);
+                    }
+                } else {
+                    slots.hp_bg_slot = None;
+                    slots.hp_fg_slot = None;
                 }
             }
 
