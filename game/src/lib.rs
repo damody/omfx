@@ -1,7 +1,7 @@
 //! omfx - 2D 塔防網路渲染器 (Fyrox 1.0)
 //!
-//! Pure network renderer: all game state driven by omb backend via gRPC.
-//! No local game logic — entities are created/moved/deleted by server events.
+//! 純網路 renderer：所有 game state 都由 omb backend 透過 gRPC 驅動。
+//! 不包含本地 game logic；entities 的 create/move/delete 都由 server events 決定。
 #![allow(warnings)]
 
 use fyrox::graph::prelude::*;
@@ -280,7 +280,7 @@ fn ability_key_index(key: fyrox::keyboard::KeyCode) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// Constants
+// 常數
 // ---------------------------------------------------------------------------
 
 const GRID_COLS: usize = 12;
@@ -804,10 +804,10 @@ struct ActiveExplosion {
 /// 後端僅發送帶有 `target_id` + `flight_time_ms` 的單一 C 事件；
 /// 子彈的位置在每幀作為追蹤 lerp 進行本地計算
 /// 從“start_pos”到目標實體的目前客戶端位置。
-/// P7 layered prediction entry (per projectile id). Tracks「server 已經宣告
+/// P7 layered prediction entry（per projectile id）。追蹤「server 已經宣告
 /// 但 server 還沒送 hp_snapshot 反映」這段視窗內，client 想本地視覺上扣多少血。
 ///
-/// Lifecycle:
+/// 生命週期：
 /// PC 到達→插入（已套用=假）
 ///   visual t≥1.0 hit  → applied=true（命中時刻才從 display HP 扣下去）
 ///   D event           → remove（projectile 死了：可能命中、可能 timeout/取消）

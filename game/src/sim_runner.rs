@@ -170,7 +170,7 @@ pub struct SimWorldSnapshot {
     pub attack_phase_fx: Vec<AttackPhaseFx>,
     /// 用於輸入到渲染延遲配對的僅限 omfx 元資料； sim ECS 不讀取它。
     pub applied_input_ids: Vec<u32>,
-    /// Per-input phase metadata mirrored from wire-edge state; sim ECS does not read it.
+    /// 從 wire-edge state 鏡像的 per-input phase metadata；sim ECS 不會讀取它。
     pub applied_input_meta: Vec<AppliedInputMeta>,
 }
 
@@ -637,13 +637,13 @@ fn run_sim_loop(
         omobab::comp::GameProcessor::drain_pending_item_uses(&mut world);
         world.maintain();
 
-        // AbilityUpgrade: spend skill point + queue SkillLearn before script
-        // dispatch, same boundary as omb's `state::core::tick`.
+        // AbilityUpgrade：消耗 skill point 並在 script dispatch 前排入 SkillLearn，
+        // 與 omb 的 `state::core::tick` 使用相同 boundary。
         omobab::comp::GameProcessor::drain_pending_ability_upgrades(&mut world);
         world.maintain();
 
-        // AbilityCast: queue SkillCast before script dispatch. Keep this after
-        // upgrades so same-tick learn+cast behavior matches the host.
+        // AbilityCast：在 script dispatch 前排入 SkillCast。保留在 upgrades 後面，
+        // 讓同 tick learn+cast 行為與 host 相符。
         omobab::comp::GameProcessor::drain_pending_ability_casts(&mut world);
         world.maintain();
 
