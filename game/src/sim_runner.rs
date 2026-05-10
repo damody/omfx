@@ -69,7 +69,7 @@ pub struct AppliedInputMeta {
 /// 爆炸發生；渲染線程使用 omfx 掛鐘
 /// 了解實際的環老化生命週期（請參閱 lib.rs `active_explosions`）。
 pub use omobab::comp::ExplosionFx;
-pub use omobab::comp::{AttackPhaseFx, TowerFireFx};
+pub use omobab::comp::{AttackCancelFx, AttackPhaseFx, TowerFireFx};
 
 const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 const PERMANENT_BUFF_REMAINING_RAW_THRESHOLD: i64 = (i32::MAX as i64) / 2;
@@ -81,6 +81,57 @@ fn buff_remaining_secs_for_snapshot(remaining: omoba_sim::Fixed64) -> f32 {
     } else {
         remaining.to_f32_for_render()
     }
+}
+
+fn hero_render_snapshot_for_unit_id(
+    unit_id: &str,
+    is_moving: bool,
+    sniper_mode: bool,
+) -> Option<Box<HeroRenderSnapshot>> {
+    let hero_name = unit_id.strip_prefix("hero_")?;
+    let hero_id = omoba_template_ids::hero_by_name(hero_name)?;
+    let render = omoba_template_ids::hero_render_metadata(hero_id)?;
+    let render_mode = match render.render_mode {
+        omoba_template_ids::HeroRenderModeC::Model3d => "model_3d",
+    };
+
+    Some(Box::new(HeroRenderSnapshot {
+        render_mode: render_mode.to_string(),
+        model: render.model.to_string(),
+        texture: render.texture.to_string(),
+        scale: render.scale.to_f32_for_render(),
+        pitch_offset_deg: render.pitch_offset_deg.to_f32_for_render(),
+        roll_offset_deg: render.roll_offset_deg.to_f32_for_render(),
+        yaw_offset_deg: render.yaw_offset_deg.to_f32_for_render(),
+        z_offset: render.z_offset.to_f32_for_render(),
+        animation_sources: render
+            .animation_sources
+            .iter()
+            .map(|source| HeroAnimationSourceSnapshot {
+                key: source.key.to_string(),
+                model: source.model.to_string(),
+                animation: source.animation.to_string(),
+                duration_ticks: source.duration_ticks.to_f32_for_render(),
+                ticks_per_second: source.ticks_per_second.to_f32_for_render(),
+            })
+            .collect(),
+        animations: render
+            .animations
+            .iter()
+            .map(|binding| HeroAnimationBindingSnapshot {
+                action: binding.action.to_string(),
+                source: binding.source.to_string(),
+                start_tick: binding.start_tick.to_f32_for_render(),
+                end_tick: binding.end_tick.to_f32_for_render(),
+                impact_tick: binding
+                    .has_impact_tick
+                    .then(|| binding.impact_tick.to_f32_for_render()),
+                loop_animation: binding.loop_animation,
+            })
+            .collect(),
+        is_moving,
+        sniper_mode,
+    }))
 }
 
 fn retain_recent_render_fx<T: Clone>(
@@ -168,6 +219,7 @@ pub struct SimWorldSnapshot {
     pub explosions: Vec<ExplosionFx>,
     pub tower_fire_fx: Vec<TowerFireFx>,
     pub attack_phase_fx: Vec<AttackPhaseFx>,
+    pub attack_cancel_fx: Vec<AttackCancelFx>,
     /// 用於輸入到渲染延遲配對的僅限 omfx 元資料； sim ECS 不讀取它。
     pub applied_input_ids: Vec<u32>,
     /// 從 wire-edge state 鏡像的 per-input phase metadata；sim ECS 不會讀取它。
@@ -277,6 +329,41 @@ pub struct TowerTemplateSnapshot {
     pub attack_backswing: u16,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HeroAnimationSourceSnapshot {
+    pub key: String,
+    pub model: String,
+    pub animation: String,
+    pub duration_ticks: f32,
+    pub ticks_per_second: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HeroAnimationBindingSnapshot {
+    pub action: String,
+    pub source: String,
+    pub start_tick: f32,
+    pub end_tick: f32,
+    pub impact_tick: Option<f32>,
+    pub loop_animation: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HeroRenderSnapshot {
+    pub render_mode: String,
+    pub model: String,
+    pub texture: String,
+    pub scale: f32,
+    pub pitch_offset_deg: f32,
+    pub roll_offset_deg: f32,
+    pub yaw_offset_deg: f32,
+    pub z_offset: f32,
+    pub animation_sources: Vec<HeroAnimationSourceSnapshot>,
+    pub animations: Vec<HeroAnimationBindingSnapshot>,
+    pub is_moving: bool,
+    pub sniper_mode: bool,
+}
+
 /// 最後從 ECS World 中提取的每個實體渲染數據
 /// 每一個刻度。已經映射到邊界處的 `f32` (Fixed64 →
 /// `to_f32_for_render`);渲染線程不需要知道
@@ -292,7 +379,7 @@ pub struct EntityRenderData {
     pub hp: i32,
     pub max_hp: i32,
     /// `ScriptUnitTag.unit_id` 如果存在（例如“tower_dart_monkey”，
-    /// 「creep_balloon_red」、「hero_saika_magoichi」）。實體為空
+    /// 「creep_balloon_red」、「hero_<id>」）。實體為空
     /// 沒有腳本標籤（罕見 - 大多數產生的單位都有一個）。
     pub unit_id: String,
     /// 僅限英雄的元資料。當實體不是英雄時為空/0。
@@ -314,6 +401,7 @@ pub struct EntityRenderData {
     /// 小路。裝箱，因此英雄手臂支付堆分配，但塔/蠕動
     /// rows 只支付一個 None 指標。
     pub hero_ext: Option<Box<HeroStatsExt>>,
+    pub hero_render: Option<Box<HeroRenderSnapshot>>,
     /// 階段 4.3：每條路徑的塔升級等級點（3 條路徑 × 0-4 級）。
     /// 對於非 Tower 實體為「無」。源自“Tower.upgrade_levels”
     /// 組件欄位；現有的 TD 出售/升級面板已顯示
@@ -538,6 +626,7 @@ fn run_sim_loop(
     let mut recent_applied_inputs: VecDeque<(u32, AppliedInputMeta)> = VecDeque::new();
     let mut recent_tower_fire_fx: VecDeque<TowerFireFx> = VecDeque::new();
     let mut recent_attack_phase_fx: VecDeque<AttackPhaseFx> = VecDeque::new();
+    let mut recent_attack_cancel_fx: VecDeque<AttackCancelFx> = VecDeque::new();
     loop {
         // 使用recv_timeout而不是recv()，因此線路停頓會出現在
         // 記錄為「1.0 秒內沒有 TickBatch — 上游鎖步用戶端是
@@ -843,6 +932,13 @@ fn run_sim_loop(
             batch.tick,
             |fx| fx.spawn_tick,
         );
+        let attack_cancel_fx = std::mem::take(&mut snapshot.attack_cancel_fx);
+        snapshot.attack_cancel_fx = retain_recent_render_fx(
+            &mut recent_attack_cancel_fx,
+            attack_cancel_fx,
+            batch.tick,
+            |fx| fx.spawn_tick,
+        );
         let sim_publish_us = wall_clock_us();
         for meta in &mut snapshot.applied_input_meta {
             meta.sim_publish_us = sim_publish_us;
@@ -930,7 +1026,9 @@ fn extract_snapshot(
     use omobab::comp::hero::AttributeType;
     use omobab::comp::inventory::Inventory;
     use omobab::scripting::ScriptUnitTag;
-    use omobab::{CProperty, Creep, Facing, Hero, IsBuilding, Pos, Projectile, TAttack, Tower};
+    use omobab::{
+        CProperty, Creep, Facing, Hero, IsBuilding, MoveTarget, Pos, Projectile, TAttack, Tower,
+    };
 
     let entities = world.entities();
     let pos_storage = world.read_storage::<Pos>();
@@ -941,6 +1039,7 @@ fn extract_snapshot(
     let proj_storage = world.read_storage::<Projectile>();
     let creep_storage = world.read_storage::<Creep>();
     let unit_tag_storage = world.read_storage::<ScriptUnitTag>();
+    let move_target_storage = world.read_storage::<MoveTarget>();
     let gold_storage = world.read_storage::<Gold>();
     // 階段 3.3：TAtack + BuffStore 用於英雄統計數據聚合
     // 小路。 BuffStore 是一個「World」資源； UnitStats 借用了它
@@ -994,6 +1093,15 @@ fn extract_snapshot(
             .get(entity)
             .map(|t| t.unit_id.clone())
             .unwrap_or_default();
+        let hero_render = if matches!(kind, EntityKind::Hero) {
+            hero_render_snapshot_for_unit_id(
+                &unit_id,
+                move_target_storage.get(entity).is_some(),
+                buff_store.has(entity, "sniper_mode"),
+            )
+        } else {
+            None
+        };
         let gold = gold_storage.get(entity).map(|g| g.0).unwrap_or(0);
         let stats = UnitStats::from_refs(&*buff_store, is_building_storage.get(entity).is_some());
         let attack_range = tatk_storage
@@ -1192,6 +1300,7 @@ fn extract_snapshot(
             hero_intelligence,
             gold,
             hero_ext,
+            hero_render,
             upgrade_levels,
             attack_range,
         });
@@ -1322,6 +1431,10 @@ fn extract_snapshot(
         let mut q = world.write_resource::<omobab::comp::AttackPhaseFxQueue>();
         std::mem::take(&mut q.pending)
     };
+    let attack_cancel_fx: Vec<AttackCancelFx> = {
+        let mut q = world.write_resource::<omobab::comp::AttackCancelFxQueue>();
+        std::mem::take(&mut q.pending)
+    };
 
     SimWorldSnapshot {
         tick,
@@ -1339,6 +1452,7 @@ fn extract_snapshot(
         explosions,
         tower_fire_fx,
         attack_phase_fx,
+        attack_cancel_fx,
         applied_input_ids,
         applied_input_meta,
     }
@@ -1431,6 +1545,123 @@ mod tests {
         assert_eq!(dart.barrel_image, "assets/towers/tower_dart_barrel.png");
         assert_eq!(dart.rotation_mode, "targeted");
         assert_eq!(dart.recoil.mode, "directional");
+    }
+
+    #[test]
+    fn saika_hero_render_snapshot_uses_generated_metadata() {
+        let render = hero_render_snapshot_for_unit_id("hero_saika_magoichi", true, true)
+            .expect("saika render snapshot");
+        let generated = omoba_template_ids::hero_render_metadata(
+            omoba_template_ids::HERO_SAIKA_MAGOICHI,
+        )
+        .expect("generated metadata");
+
+        assert_eq!(render.render_mode, "model_3d");
+        assert_eq!(render.model, generated.model);
+        assert_eq!(render.texture, generated.texture);
+        assert_eq!(render.scale, generated.scale.to_f32_for_render());
+        assert!(render.is_moving);
+        assert!(render.sniper_mode);
+
+        for required in ["move", "attack", "critical", "sniper"] {
+            assert!(render
+                .animation_sources
+                .iter()
+                .any(|source| source.key == required));
+            assert!(render
+                .animations
+                .iter()
+                .any(|binding| binding.action == required));
+        }
+
+        let attack_source = render
+            .animation_sources
+            .iter()
+            .find(|source| source.key == "attack")
+            .expect("attack source");
+        let generated_attack_source = generated
+            .animation_sources
+            .iter()
+            .find(|source| source.key == "attack")
+            .expect("generated attack source");
+        assert_eq!(attack_source.model, generated_attack_source.model);
+        assert_eq!(attack_source.animation, generated_attack_source.animation);
+        assert_eq!(
+            attack_source.duration_ticks,
+            generated_attack_source.duration_ticks.to_f32_for_render()
+        );
+        assert_eq!(
+            attack_source.ticks_per_second,
+            generated_attack_source.ticks_per_second.to_f32_for_render()
+        );
+
+        let critical = render
+            .animations
+            .iter()
+            .find(|binding| binding.action == "critical")
+            .expect("critical binding");
+        let generated_critical = generated
+            .animations
+            .iter()
+            .find(|binding| binding.action == "critical")
+            .expect("generated critical binding");
+        assert_eq!(critical.source, "critical");
+        assert_eq!(
+            critical.impact_tick,
+            Some(generated_critical.impact_tick.to_f32_for_render())
+        );
+        assert!(!critical.loop_animation);
+
+        let sniper = render
+            .animations
+            .iter()
+            .find(|binding| binding.action == "sniper")
+            .expect("sniper binding");
+        assert!(sniper.loop_animation);
+    }
+
+    #[test]
+    fn hero_without_render_metadata_has_no_render_snapshot() {
+        assert!(hero_render_snapshot_for_unit_id("hero_date_masamune", false, false).is_none());
+        assert!(hero_render_snapshot_for_unit_id("tower_dart", false, false).is_none());
+    }
+
+    #[test]
+    fn snapshot_carries_attack_phase_and_cancel_cues() {
+        let snapshot = SimWorldSnapshot {
+            attack_phase_fx: vec![AttackPhaseFx {
+                entity_id: 7,
+                entity_gen: 1,
+                spawn_tick: 42,
+                attack_seq: 3,
+                is_critical: true,
+                windup_ms: 120,
+                impact_at_ms: 120,
+                backswing_ms: 240,
+                dir_rad: 0.0,
+                target_entity_id: Some(9),
+                target_pos_x: None,
+                target_pos_y: None,
+            }],
+            attack_cancel_fx: vec![AttackCancelFx {
+                entity_id: 7,
+                entity_gen: 1,
+                spawn_tick: 43,
+                attack_seq: 3,
+                phase: omobab::comp::AttackCancelPhase::Windup,
+                impact_committed: false,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(snapshot.attack_phase_fx[0].attack_seq, 3);
+        assert!(snapshot.attack_phase_fx[0].is_critical);
+        assert_eq!(snapshot.attack_cancel_fx[0].attack_seq, 3);
+        assert_eq!(
+            snapshot.attack_cancel_fx[0].phase,
+            omobab::comp::AttackCancelPhase::Windup
+        );
+        assert!(!snapshot.attack_cancel_fx[0].impact_committed);
     }
 
     #[test]

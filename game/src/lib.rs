@@ -25,15 +25,21 @@ use fyrox::{
     },
     material::{Material, MaterialResource},
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
-    resource::texture::{
-        CompressionOptions, TextureImportOptions, TextureMinificationFilter, TextureResource,
-        TextureResourceExtension,
+    asset::manager::ResourceManager,
+    resource::{
+        model::{Model, ModelResource, ModelResourceExtension},
+        texture::{
+            CompressionOptions, TextureImportOptions, TextureMinificationFilter, TextureResource,
+            TextureResourceExtension,
+        },
     },
     scene::{
+        animation::{prelude::AnimationPlayerBuilder, Animation},
         base::BaseBuilder,
         camera::{CameraBuilder, OrthographicProjection, Projection},
         dim2::rectangle::{Rectangle, RectangleBuilder},
         light::{point::PointLightBuilder, BaseLightBuilder},
+        mesh::Mesh,
         node::Node,
         transform::TransformBuilder,
         EnvironmentLightingSource, Scene,
@@ -42,6 +48,7 @@ use fyrox::{
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omoba_core::{
@@ -92,12 +99,22 @@ const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
 
 type TowerFireFxKey = (u32, u32, u32);
 type AttackPhaseFxKey = (u32, u32, u32, u32);
+type AttackCancelFxKey = (u32, u32, u32, u32);
 
 fn tower_fire_fx_key(cue: &sim_runner::TowerFireFx) -> TowerFireFxKey {
     (cue.entity_id, cue.entity_gen, cue.spawn_tick)
 }
 
 fn attack_phase_fx_key(cue: &sim_runner::AttackPhaseFx) -> AttackPhaseFxKey {
+    (
+        cue.entity_id,
+        cue.entity_gen,
+        cue.spawn_tick,
+        cue.attack_seq,
+    )
+}
+
+fn attack_cancel_fx_key(cue: &sim_runner::AttackCancelFx) -> AttackCancelFxKey {
     (
         cue.entity_id,
         cue.entity_gen,
@@ -426,6 +443,7 @@ fn td_wrap_ui_text(text: &str, max_units: usize, max_lines: usize) -> String {
 const Z_BULLET: f32 = 0.5;
 const Z_HP_BAR: f32 = 1.0;
 const Z_RING: f32 = 1.5;
+const Z_HERO: f32 = 1.9;
 const Z_ENEMY: f32 = 2.0;
 const Z_TOWER: f32 = 2.5;
 const Z_REGION: f32 = 3.0;
@@ -570,6 +588,36 @@ struct TowerCompositeRender {
     recoil: Option<TowerRecoilState>,
 }
 
+#[derive(Debug)]
+struct HeroModelAsset {
+    model: ModelResource,
+    resolved_model_path: PathBuf,
+    texture_path: Option<PathBuf>,
+    failed_logged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeroAttackPlaybackPhase {
+    None,
+    Windup,
+    Backswing,
+}
+
+#[derive(Debug)]
+struct HeroModelRender {
+    root_node: Handle<Node>,
+    animation_player: Handle<Node>,
+    animations_by_source: HashMap<String, Handle<Animation>>,
+    action_resources_requested: HashSet<String>,
+    active_action: Option<String>,
+    active_attack_seq: Option<u32>,
+    attack_phase: HeroAttackPlaybackPhase,
+    attack_phase_remaining: f32,
+    attack_backswing_remaining: f32,
+    one_shot_remaining: f32,
+    texture_applied: bool,
+}
+
 #[derive(Default, Debug)]
 struct TdTowerShopCard {
     bg: Handle<UiNode>,
@@ -703,6 +751,58 @@ fn load_tower_texture(asset_path: &str) -> Option<TextureResource> {
     load_texture_from_candidate_paths(candidate_paths)
 }
 
+fn normalize_scripts_lua_data_asset_path(asset_path: &str) -> Option<String> {
+    let path = asset_path.trim().trim_start_matches('/').replace('\\', "/");
+    if path.is_empty() || path.contains("..") {
+        return None;
+    }
+    Some(
+        path.strip_prefix("scripts/lua_data/")
+            .unwrap_or(path.as_str())
+            .to_string(),
+    )
+}
+
+fn scripts_lua_data_candidate_paths(asset_path: &str) -> Vec<PathBuf> {
+    let Some(asset_key) = normalize_scripts_lua_data_asset_path(asset_path) else {
+        return Vec::new();
+    };
+    let script_rel = PathBuf::from("scripts/lua_data").join(&asset_key);
+    let mut candidates = vec![
+        script_rel.clone(),
+        PathBuf::from("..").join(&script_rel),
+        PathBuf::from("..").join("..").join(&script_rel),
+    ];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for ancestor in exe_dir.ancestors().take(8) {
+                candidates.push(ancestor.join(&script_rel));
+            }
+        }
+    }
+    candidates
+}
+
+fn resolve_scripts_lua_data_asset_path(asset_path: &str) -> Option<PathBuf> {
+    scripts_lua_data_candidate_paths(asset_path)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn load_scripts_lua_data_texture(asset_path: &str) -> Option<TextureResource> {
+    let candidates = scripts_lua_data_candidate_paths(asset_path)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    load_texture_from_candidate_paths(candidates)
+}
+
+fn texture_material_3d(texture: TextureResource) -> MaterialResource {
+    let mut material = Material::standard();
+    material.bind("diffuseTexture", Some(texture));
+    MaterialResource::new_embedded(material)
+}
+
 fn texture_material(texture: TextureResource) -> MaterialResource {
     let mut material = Material::standard_2d();
     material.bind("diffuseTexture", Some(texture));
@@ -731,6 +831,19 @@ fn rotate_vec2(v: Vector2<f32>, angle: f32) -> Vector2<f32> {
 
 fn tower_render_angle_from_facing(facing_rad: f32, default_angle_deg: f32) -> f32 {
     std::f32::consts::FRAC_PI_2 - facing_rad + default_angle_deg.to_radians()
+}
+
+fn hero_model_rotation(
+    facing_rad: f32,
+    render: &sim_runner::HeroRenderSnapshot,
+) -> UnitQuaternion<f32> {
+    let yaw = (std::f32::consts::PI - facing_rad + render.yaw_offset_deg.to_radians())
+        .rem_euclid(std::f32::consts::TAU);
+    let pitch = render.pitch_offset_deg.to_radians();
+    let roll = render.roll_offset_deg.to_radians();
+    UnitQuaternion::from_axis_angle(&Vector3::z_axis(), yaw)
+        * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pitch)
+        * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), roll)
 }
 
 fn tower_render_dir_from_world_rad(dir_rad: f32) -> Vector2<f32> {
@@ -1391,6 +1504,22 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     sim_seen_attack_phase_fx: HashSet<AttackPhaseFxKey>,
+    /// 已處理過的 attack cancel cue keys，避免 snapshot retention window 重複停止同一段動畫。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_seen_attack_cancel_fx: HashSet<AttackCancelFxKey>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hero_model_assets: HashMap<String, HeroModelAsset>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hero_action_assets: HashMap<String, HeroModelAsset>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hero_asset_failures_logged: HashSet<String>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hero_model_nodes: HashMap<u32, HeroModelRender>,
     #[visit(skip)]
     #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
@@ -2248,6 +2377,11 @@ impl Plugin for Game {
         self.tower_composites = HashMap::new();
         self.sim_seen_tower_fire_fx.clear();
         self.sim_seen_attack_phase_fx.clear();
+        self.sim_seen_attack_cancel_fx.clear();
+        self.hero_model_assets.clear();
+        self.hero_action_assets.clear();
+        self.hero_asset_failures_logged.clear();
+        self.hero_model_nodes.clear();
 
         // 商店面板（初始空字串；按 B 切換顯示內容）
         self.ui_shop_text = TextBuilder::new(
@@ -3270,7 +3404,7 @@ impl Plugin for Game {
         // 早期的 4.2 render_bridge — 每個實體曾經是單獨的場景
         // 節點 = 單獨的繪製呼叫（1000 個實體→ 3000+ 繪製）。現在的
         // 整個實體集經歷 2-3 個批次網格 = 總共 2-3 個繪製。
-        self.update_sim_batches(scene, context.dt);
+        self.update_sim_batches(scene, &context.resource_manager, context.dt);
 
         // Batched mesh flush：interp loop 寫進各 batch 的 cpu_mirror，這裡一次性
         // upload 整批 vertex buffer 到 GPU。每個 batch = 1 個 mesh = 1 個 draw call。
@@ -5904,6 +6038,475 @@ impl Game {
         }
     }
 
+    fn remove_hero_model(&mut self, scene: &mut Scene, entity_id: u32) {
+        if let Some(render) = self.hero_model_nodes.remove(&entity_id) {
+            if scene.graph.is_valid_handle(render.root_node) {
+                scene.graph.remove_node(render.root_node);
+            }
+        }
+    }
+
+    fn request_hero_model_asset(
+        &mut self,
+        resource_manager: &ResourceManager,
+        model_path: &str,
+        texture_path: &str,
+        action_source: bool,
+    ) -> Option<ModelResource> {
+        let cache = if action_source {
+            &mut self.hero_action_assets
+        } else {
+            &mut self.hero_model_assets
+        };
+        if !cache.contains_key(model_path) {
+            let Some(resolved_model_path) = resolve_scripts_lua_data_asset_path(model_path) else {
+                if self
+                    .hero_asset_failures_logged
+                    .insert(format!("model:{model_path}"))
+                {
+                    log::warn!("hero 3D model asset not found: {}", model_path);
+                }
+                return None;
+            };
+            let texture_path = (!texture_path.trim().is_empty())
+                .then(|| resolve_scripts_lua_data_asset_path(texture_path))
+                .flatten();
+            let model = resource_manager.request::<Model>(&resolved_model_path);
+            cache.insert(
+                model_path.to_string(),
+                HeroModelAsset {
+                    model,
+                    resolved_model_path,
+                    texture_path,
+                    failed_logged: false,
+                },
+            );
+        }
+
+        let asset = cache.get_mut(model_path)?;
+        if asset.model.is_failed_to_load() {
+            if !asset.failed_logged {
+                log::warn!(
+                    "hero 3D model failed to load: {} ({})",
+                    model_path,
+                    asset.resolved_model_path.display()
+                );
+                asset.failed_logged = true;
+            }
+            return None;
+        }
+        if asset.model.is_ok() {
+            Some(asset.model.clone())
+        } else {
+            None
+        }
+    }
+
+    fn apply_hero_texture_fallback(
+        &mut self,
+        scene: &mut Scene,
+        root: Handle<Node>,
+        texture_path: &str,
+    ) {
+        let Some(texture) = load_scripts_lua_data_texture(texture_path) else {
+            if self
+                .hero_asset_failures_logged
+                .insert(format!("texture:{texture_path}"))
+            {
+                log::warn!("hero 3D texture asset not found or failed to decode: {}", texture_path);
+            }
+            return;
+        };
+        let material = texture_material_3d(texture);
+        let mut stack = vec![root];
+        while let Some(handle) = stack.pop() {
+            if !scene.graph.is_valid_handle(handle) {
+                continue;
+            }
+            let children = scene.graph[handle].children().to_vec();
+            stack.extend(children);
+            if let Some(mesh) = scene.graph[handle].cast_mut::<Mesh>() {
+                for surface in mesh.surfaces_mut() {
+                    surface.set_material(material.clone());
+                }
+            }
+        }
+    }
+
+    fn retarget_hero_action_sources(
+        &mut self,
+        scene: &mut Scene,
+        resource_manager: &ResourceManager,
+        entity_id: u32,
+        render: &sim_runner::HeroRenderSnapshot,
+    ) {
+        let Some(node) = self.hero_model_nodes.get(&entity_id) else {
+            return;
+        };
+        let missing: Vec<_> = render
+            .animation_sources
+            .iter()
+            .filter(|source| !node.animations_by_source.contains_key(&source.key))
+            .cloned()
+            .collect();
+        let root = node.root_node;
+        let player = node.animation_player;
+        let _ = node;
+
+        for source in missing {
+            let Some(model) = self.request_hero_model_asset(
+                resource_manager,
+                &source.model,
+                "",
+                true,
+            ) else {
+                continue;
+            };
+            let handles = model.retarget_animations_to_player(root, player, &mut scene.graph);
+            if let Some(handle) = handles.first().copied() {
+                if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
+                    node.animations_by_source.insert(source.key.clone(), handle);
+                    node.action_resources_requested.insert(source.key.clone());
+                }
+            }
+        }
+    }
+
+    fn play_hero_animation_ticks(
+        &mut self,
+        scene: &mut Scene,
+        entity_id: u32,
+        render: &sim_runner::HeroRenderSnapshot,
+        action: &str,
+        start_tick: f32,
+        end_tick: f32,
+        loop_animation: bool,
+        desired_duration_secs: Option<f32>,
+    ) -> bool {
+        let Some(node) = self.hero_model_nodes.get_mut(&entity_id) else {
+            return false;
+        };
+        let Some(binding) = render.animations.iter().find(|b| b.action == action) else {
+            return false;
+        };
+        let Some(source) = render
+            .animation_sources
+            .iter()
+            .find(|source| source.key == binding.source)
+        else {
+            return false;
+        };
+        let Some(handle) = node.animations_by_source.get(&binding.source).copied() else {
+            return false;
+        };
+        let Some(player) = scene.graph[node.animation_player]
+            .cast_mut::<fyrox::scene::animation::AnimationPlayer>()
+        else {
+            return false;
+        };
+        let animations = player.animations_mut().get_value_mut_silent();
+        for animation in animations.iter_mut() {
+            animation.set_enabled(false);
+        }
+        let ticks_per_second = source.ticks_per_second.max(0.001);
+        let start_sec = start_tick / ticks_per_second;
+        let end_sec = end_tick / ticks_per_second;
+        let source_duration = (end_sec - start_sec).max(0.001);
+        let speed = desired_duration_secs
+            .filter(|duration| *duration > 0.001)
+            .map(|duration| source_duration / duration)
+            .unwrap_or(1.0);
+        let animation = animations.get_mut(handle);
+        animation.set_time_slice(start_sec..end_sec);
+        animation.set_time_position(start_sec);
+        animation.set_loop(loop_animation);
+        animation.set_speed(speed);
+        animation.set_enabled(true);
+        node.active_action = Some(action.to_string());
+        node.one_shot_remaining = desired_duration_secs.unwrap_or(0.0);
+        true
+    }
+
+    fn play_hero_action(
+        &mut self,
+        scene: &mut Scene,
+        entity_id: u32,
+        render: &sim_runner::HeroRenderSnapshot,
+        action: &str,
+    ) {
+        if self
+            .hero_model_nodes
+            .get(&entity_id)
+            .and_then(|node| node.active_attack_seq)
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .hero_model_nodes
+            .get(&entity_id)
+            .map(|node| node.active_action.as_deref() == Some(action))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Some(binding) = render.animations.iter().find(|b| b.action == action) else {
+            return;
+        };
+        if self.play_hero_animation_ticks(
+            scene,
+            entity_id,
+            render,
+            action,
+            binding.start_tick,
+            binding.end_tick,
+            binding.loop_animation,
+            None,
+        ) {
+            if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
+                node.active_attack_seq = None;
+                node.attack_phase = HeroAttackPlaybackPhase::None;
+                node.attack_phase_remaining = 0.0;
+                node.attack_backswing_remaining = 0.0;
+            }
+        }
+    }
+
+    fn start_hero_attack_action(
+        &mut self,
+        scene: &mut Scene,
+        entity_id: u32,
+        render: &sim_runner::HeroRenderSnapshot,
+        action: &str,
+        cue: &sim_runner::AttackPhaseFx,
+    ) {
+        if self
+            .hero_model_nodes
+            .get(&entity_id)
+            .map(|node| node.active_attack_seq == Some(cue.attack_seq))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Some(binding) = render.animations.iter().find(|b| b.action == action) else {
+            return;
+        };
+        let Some(impact_tick) = binding.impact_tick else {
+            self.play_hero_action(scene, entity_id, render, action);
+            return;
+        };
+        let windup_secs = (cue.windup_ms as f32 / 1000.0).max(0.001);
+        let backswing_secs = (cue.backswing_ms as f32 / 1000.0).max(0.001);
+        if self.play_hero_animation_ticks(
+            scene,
+            entity_id,
+            render,
+            action,
+            binding.start_tick,
+            impact_tick,
+            false,
+            Some(windup_secs),
+        ) {
+            if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
+                node.active_attack_seq = Some(cue.attack_seq);
+                node.attack_phase = HeroAttackPlaybackPhase::Windup;
+                node.attack_phase_remaining = windup_secs;
+                node.attack_backswing_remaining = backswing_secs;
+            }
+        }
+    }
+
+    fn tick_hero_attack_action(
+        &mut self,
+        scene: &mut Scene,
+        entity_id: u32,
+        render: &sim_runner::HeroRenderSnapshot,
+        dt: f32,
+    ) {
+        let transition = if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
+            match node.attack_phase {
+                HeroAttackPlaybackPhase::Windup => {
+                    node.attack_phase_remaining = (node.attack_phase_remaining - dt).max(0.0);
+                    if node.attack_phase_remaining <= 0.0 {
+                        node.active_action
+                            .clone()
+                            .map(|action| (action, node.attack_backswing_remaining))
+                    } else {
+                        None
+                    }
+                }
+                HeroAttackPlaybackPhase::Backswing => {
+                    node.attack_phase_remaining = (node.attack_phase_remaining - dt).max(0.0);
+                    if node.attack_phase_remaining <= 0.0 {
+                        node.active_attack_seq = None;
+                        node.attack_phase = HeroAttackPlaybackPhase::None;
+                        node.attack_backswing_remaining = 0.0;
+                        node.active_action = None;
+                    }
+                    None
+                }
+                HeroAttackPlaybackPhase::None => None,
+            }
+        } else {
+            None
+        };
+        let Some((action, backswing_secs)) = transition else {
+            return;
+        };
+        let Some(binding) = render.animations.iter().find(|b| b.action == action) else {
+            return;
+        };
+        let Some(impact_tick) = binding.impact_tick else {
+            return;
+        };
+        if self.play_hero_animation_ticks(
+            scene,
+            entity_id,
+            render,
+            &action,
+            impact_tick,
+            binding.end_tick,
+            false,
+            Some(backswing_secs),
+        ) {
+            if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
+                node.attack_phase = HeroAttackPlaybackPhase::Backswing;
+                node.attack_phase_remaining = backswing_secs;
+                node.attack_backswing_remaining = 0.0;
+            }
+        }
+    }
+
+    fn cancel_hero_attack_action(
+        &mut self,
+        scene: &mut Scene,
+        entity_id: u32,
+        cue: &sim_runner::AttackCancelFx,
+    ) {
+        let should_stop = self
+            .hero_model_nodes
+            .get(&entity_id)
+            .map(|node| node.active_attack_seq == Some(cue.attack_seq))
+            .unwrap_or(false);
+        if should_stop {
+            self.stop_hero_action(scene, entity_id);
+        }
+    }
+
+    fn stop_hero_action(&mut self, scene: &mut Scene, entity_id: u32) {
+        let Some(node) = self.hero_model_nodes.get_mut(&entity_id) else {
+            return;
+        };
+        if let Some(player) = scene.graph[node.animation_player]
+            .cast_mut::<fyrox::scene::animation::AnimationPlayer>()
+        {
+            for animation in player.animations_mut().get_value_mut_silent().iter_mut() {
+                animation.set_enabled(false);
+            }
+        }
+        node.active_action = None;
+        node.active_attack_seq = None;
+        node.attack_phase = HeroAttackPlaybackPhase::None;
+        node.attack_phase_remaining = 0.0;
+        node.attack_backswing_remaining = 0.0;
+        node.one_shot_remaining = 0.0;
+    }
+
+    fn update_hero_model(
+        &mut self,
+        scene: &mut Scene,
+        resource_manager: &ResourceManager,
+        entity: &sim_runner::EntityRenderData,
+        render: &sim_runner::HeroRenderSnapshot,
+        pos: Vector2<f32>,
+        dt: f32,
+        attack_cue: Option<&sim_runner::AttackPhaseFx>,
+        cancel_cue: Option<&sim_runner::AttackCancelFx>,
+    ) -> bool {
+        if render.render_mode != "model_3d" {
+            return false;
+        }
+        let Some(model) = self.request_hero_model_asset(
+            resource_manager,
+            &render.model,
+            &render.texture,
+            false,
+        ) else {
+            return false;
+        };
+        if !self.hero_model_nodes.contains_key(&entity.entity_id) {
+            let rotation = hero_model_rotation(entity.facing_rad, render);
+            let root = model
+                .begin_instantiation(scene)
+                .with_position(Vector3::new(pos.x, pos.y, Z_HERO + render.z_offset))
+                .with_rotation(rotation)
+                .with_scale(Vector3::new(render.scale, render.scale, render.scale))
+                .finish();
+            let player = AnimationPlayerBuilder::new(
+                BaseBuilder::new().with_name("Hero Animation Player"),
+            )
+            .build(&mut scene.graph);
+            scene.graph.link_nodes(player, root);
+            self.apply_hero_texture_fallback(scene, root, &render.texture);
+            self.hero_model_nodes.insert(
+                entity.entity_id,
+                HeroModelRender {
+                    root_node: root,
+                    animation_player: player,
+                    animations_by_source: HashMap::new(),
+                    action_resources_requested: HashSet::new(),
+                    active_action: None,
+                    active_attack_seq: None,
+                    attack_phase: HeroAttackPlaybackPhase::None,
+                    attack_phase_remaining: 0.0,
+                    attack_backswing_remaining: 0.0,
+                    one_shot_remaining: 0.0,
+                    texture_applied: true,
+                },
+            );
+        }
+
+        if let Some(node) = self.hero_model_nodes.get_mut(&entity.entity_id) {
+            if scene.graph.is_valid_handle(node.root_node) {
+                let rotation = hero_model_rotation(entity.facing_rad, render);
+                scene.graph[node.root_node]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(pos.x, pos.y, Z_HERO + render.z_offset))
+                    .set_rotation(rotation)
+                    .set_scale(Vector3::new(render.scale, render.scale, render.scale));
+                node.one_shot_remaining = (node.one_shot_remaining - dt).max(0.0);
+            }
+        }
+
+        self.retarget_hero_action_sources(scene, resource_manager, entity.entity_id, render);
+        self.tick_hero_attack_action(scene, entity.entity_id, render, dt);
+
+        if let Some(cue) = cancel_cue {
+            self.cancel_hero_attack_action(scene, entity.entity_id, cue);
+        } else if let Some(cue) = attack_cue {
+            let action = if cue.is_critical { "critical" } else { "attack" };
+            self.start_hero_attack_action(scene, entity.entity_id, render, action, cue);
+        } else {
+            let keep_one_shot = self
+                .hero_model_nodes
+                .get(&entity.entity_id)
+                .map(|node| node.active_attack_seq.is_some() || node.one_shot_remaining > 0.0)
+                .unwrap_or(false);
+            if !keep_one_shot {
+                let action = if render.sniper_mode {
+                    "sniper"
+                } else if render.is_moving {
+                    "move"
+                } else {
+                    "sniper"
+                };
+                self.play_hero_action(scene, entity.entity_id, render, action);
+            }
+        }
+
+        true
+    }
+
     fn start_tower_animation(
         &mut self,
         entity_id: u32,
@@ -6270,7 +6873,12 @@ impl Game {
     /// 共享 body_batch + hp_batch CPU 映像。為每個實體分配一個插槽
     /// 第一次見到時；釋放輟學時的插槽。 EntityKind::其他是
     /// 已跳過（不應呈現 RegionBlocker 等內部 ECS 行）。
-    fn update_sim_batches(&mut self, scene: &mut Scene, dt: f32) {
+    fn update_sim_batches(
+        &mut self,
+        scene: &mut Scene,
+        resource_manager: &ResourceManager,
+        dt: f32,
+    ) {
         let Some(sim_state) = self.sim_runner_handle.as_ref().map(|sim| sim.state.clone()) else {
             return;
         };
@@ -6281,6 +6889,8 @@ impl Game {
         self.sim_seen_attack_phase_fx
             .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
         self.sim_seen_tower_fire_fx
+            .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
+        self.sim_seen_attack_cancel_fx
             .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
 
         let mut attack_cues: HashMap<u32, &sim_runner::AttackPhaseFx> = HashMap::new();
@@ -6296,6 +6906,15 @@ impl Game {
         for cue in &snapshot.tower_fire_fx {
             if self.sim_seen_tower_fire_fx.insert(tower_fire_fx_key(cue)) {
                 fire_cues.insert(cue.entity_id, cue);
+            }
+        }
+        let mut cancel_cues: HashMap<u32, &sim_runner::AttackCancelFx> = HashMap::new();
+        for cue in &snapshot.attack_cancel_fx {
+            if self
+                .sim_seen_attack_cancel_fx
+                .insert(attack_cancel_fx_key(cue))
+            {
+                cancel_cues.insert(cue.entity_id, cue);
             }
         }
 
@@ -6329,6 +6948,21 @@ impl Game {
                     fire_cues.get(&e.entity_id).copied(),
                 );
             }
+            let hero_model_active = if let Some(render) = e.hero_render.as_deref() {
+                self.update_hero_model(
+                    scene,
+                    resource_manager,
+                    e,
+                    render,
+                    pos,
+                    dt,
+                    attack_cues.get(&e.entity_id).copied(),
+                    cancel_cues.get(&e.entity_id).copied(),
+                )
+            } else {
+                self.remove_hero_model(scene, e.entity_id);
+                false
+            };
 
             // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
             let slots_entry = self.sim_entity_slots.entry(e.entity_id);
@@ -6383,7 +7017,7 @@ impl Game {
                     );
                 }
             } else if let Some(batch) = self.body_batch.as_mut() {
-                if uses_composite_tower {
+                if uses_composite_tower || hero_model_active {
                     batch.write_quad(
                         slots.body_slot,
                         &sprite_resources::QuadParams {
@@ -6488,6 +7122,7 @@ impl Game {
                 sim_runner::EntityKind::Hero | sim_runner::EntityKind::Creep,
             ) || (matches!(e.kind, sim_runner::EntityKind::Tower)
                 && !uses_composite_tower);
+            let wants_turret = wants_turret && !hero_model_active;
             if wants_turret {
                 if slots.turret_slot.is_none() {
                     if let Some(batch) = self.facing_batch.as_mut() {
@@ -6536,6 +7171,7 @@ impl Game {
         // 對早於第一個 prev_alive 集的早期幀 eids 的防禦。
         for &eid in &snapshot.removed_entity_ids {
             self.remove_tower_composite(scene, eid);
+            self.remove_hero_model(scene, eid);
             if let Some(slots) = self.sim_entity_slots.remove(&eid) {
                 if let Some(batch) = self.body_batch.as_mut() {
                     batch.free(slots.body_slot);
@@ -6565,6 +7201,7 @@ impl Game {
             .collect();
         for id in to_remove {
             self.remove_tower_composite(scene, id);
+            self.remove_hero_model(scene, id);
             if let Some(slots) = self.sim_entity_slots.remove(&id) {
                 if let Some(batch) = self.body_batch.as_mut() {
                     batch.free(slots.body_slot);
