@@ -73,6 +73,7 @@ pub use omobab::comp::{AttackPhaseFx, TowerFireFx};
 
 const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 const PERMANENT_BUFF_REMAINING_RAW_THRESHOLD: i64 = (i32::MAX as i64) / 2;
+const RENDER_FX_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
 
 fn buff_remaining_secs_for_snapshot(remaining: omoba_sim::Fixed64) -> f32 {
     if remaining.raw() >= PERMANENT_BUFF_REMAINING_RAW_THRESHOLD {
@@ -80,6 +81,23 @@ fn buff_remaining_secs_for_snapshot(remaining: omoba_sim::Fixed64) -> f32 {
     } else {
         remaining.to_f32_for_render()
     }
+}
+
+fn retain_recent_render_fx<T: Clone>(
+    retained: &mut VecDeque<T>,
+    current: Vec<T>,
+    tick: u32,
+    spawn_tick: impl Fn(&T) -> u32,
+) -> Vec<T> {
+    retained.extend(current);
+    while retained
+        .front()
+        .map(|fx| tick.saturating_sub(spawn_tick(fx)) > RENDER_FX_RETENTION_TICKS)
+        .unwrap_or(false)
+    {
+        retained.pop_front();
+    }
+    retained.iter().cloned().collect()
 }
 
 /// 最新 sim 刻度狀態的渲染執行緒可讀快照。
@@ -233,6 +251,7 @@ pub struct TowerTemplateSnapshot {
     pub label: String,
     pub cost: i32,
     pub footprint: f32,
+    pub placement_radius: f32,
     pub range: f32,
     pub splash_radius: f32,
     pub hit_radius: f32,
@@ -241,7 +260,7 @@ pub struct TowerTemplateSnapshot {
     pub render_mode: String,
     pub base_image: String,
     pub barrel_image: String,
-    pub size: f32,
+    pub render_visual_size: f32,
     pub barrel_frames: Vec<String>,
     pub body_frames: Vec<String>,
     pub barrel_animation: TowerRenderAnimationSnapshot,
@@ -517,6 +536,8 @@ fn run_sim_loop(
     let mut tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
     let mut recent_applied_inputs: VecDeque<(u32, AppliedInputMeta)> = VecDeque::new();
+    let mut recent_tower_fire_fx: VecDeque<TowerFireFx> = VecDeque::new();
+    let mut recent_attack_phase_fx: VecDeque<AttackPhaseFx> = VecDeque::new();
     loop {
         // 使用recv_timeout而不是recv()，因此線路停頓會出現在
         // 記錄為「1.0 秒內沒有 TickBatch — 上游鎖步用戶端是
@@ -699,6 +720,7 @@ fn run_sim_loop(
                             label: t.label.clone(),
                             cost: t.cost,
                             footprint: t.footprint,
+                            placement_radius: t.placement_radius,
                             range: t.range,
                             splash_radius: t.splash_radius,
                             hit_radius: t.hit_radius,
@@ -707,7 +729,7 @@ fn run_sim_loop(
                             render_mode: t.render.render_mode.clone(),
                             base_image: t.render.base.clone(),
                             barrel_image: t.render.barrel.clone(),
-                            size: t.render.size,
+                            render_visual_size: t.render.visual_size,
                             barrel_frames: t.render.barrel_frames.clone(),
                             body_frames: t.render.body_frames.clone(),
                             barrel_animation: TowerRenderAnimationSnapshot {
@@ -808,6 +830,18 @@ fn run_sim_loop(
             tower_upgrades_arc.clone(),
             applied_input_ids,
             applied_input_meta,
+        );
+        let tower_fire_fx = std::mem::take(&mut snapshot.tower_fire_fx);
+        snapshot.tower_fire_fx =
+            retain_recent_render_fx(&mut recent_tower_fire_fx, tower_fire_fx, batch.tick, |fx| {
+                fx.spawn_tick
+            });
+        let attack_phase_fx = std::mem::take(&mut snapshot.attack_phase_fx);
+        snapshot.attack_phase_fx = retain_recent_render_fx(
+            &mut recent_attack_phase_fx,
+            attack_phase_fx,
+            batch.tick,
+            |fx| fx.spawn_tick,
         );
         let sim_publish_us = wall_clock_us();
         for meta in &mut snapshot.applied_input_meta {
@@ -1345,6 +1379,7 @@ mod tests {
             label: "Dart".to_string(),
             cost: 200,
             footprint: 10.0,
+            placement_radius: 90.0,
             range: 350.0,
             splash_radius: 0.0,
             hit_radius: 0.0,
@@ -1353,7 +1388,7 @@ mod tests {
             render_mode: "base_barrel".to_string(),
             base_image: "assets/towers/tower_dart_base.png".to_string(),
             barrel_image: "assets/towers/tower_dart_barrel.png".to_string(),
-            size: 180.0,
+            render_visual_size: 180.0,
             barrel_frames: vec!["assets/towers/tower_dart_barrel_frame_01.png".to_string()],
             body_frames: Vec::new(),
             barrel_animation: TowerRenderAnimationSnapshot {

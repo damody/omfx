@@ -41,7 +41,7 @@ use fyrox::{
 };
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omoba_core::{
@@ -88,6 +88,23 @@ const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
+const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
+
+type TowerFireFxKey = (u32, u32, u32);
+type AttackPhaseFxKey = (u32, u32, u32, u32);
+
+fn tower_fire_fx_key(cue: &sim_runner::TowerFireFx) -> TowerFireFxKey {
+    (cue.entity_id, cue.entity_gen, cue.spawn_tick)
+}
+
+fn attack_phase_fx_key(cue: &sim_runner::AttackPhaseFx) -> AttackPhaseFxKey {
+    (
+        cue.entity_id,
+        cue.entity_gen,
+        cue.spawn_tick,
+        cue.attack_seq,
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputActionKind {
@@ -494,6 +511,7 @@ struct TdTemplate {
     label: String,
     cost: i32,
     footprint_backend: f32,
+    placement_radius_backend: f32,
     range_backend: f32,
     splash_radius_backend: f32,
     hit_radius_backend: f32,
@@ -502,7 +520,7 @@ struct TdTemplate {
     render_mode: String,
     base_image: String,
     barrel_image: String,
-    render_size_backend: f32,
+    render_visual_size_backend: f32,
     barrel_frames: Vec<String>,
     body_frames: Vec<String>,
     barrel_animation: sim_runner::TowerRenderAnimationSnapshot,
@@ -691,16 +709,11 @@ fn texture_material(texture: TextureResource) -> MaterialResource {
 }
 
 fn tower_visual_size(tpl: &TdTemplate) -> f32 {
-    let size_backend = if tpl.render_size_backend > 0.0 {
-        tpl.render_size_backend
-    } else {
-        tpl.footprint_backend
-    };
-    size_backend * WORLD_SCALE
+    tpl.render_visual_size_backend * WORLD_SCALE
 }
 
 fn tower_placement_radius_render(tpl: &TdTemplate) -> f32 {
-    (tower_visual_size(tpl) * 0.5).max(tpl.footprint_backend * WORLD_SCALE)
+    tpl.placement_radius_backend * WORLD_SCALE
 }
 
 fn tower_render_offset(point: &sim_runner::TowerRenderPointSnapshot, scale: f32) -> Vector2<f32> {
@@ -1368,12 +1381,15 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     tower_composites: HashMap<u32, TowerCompositeRender>,
+    /// 已處理過的 render-only tower fire cue keys。sim snapshot 會短暫保留 FX，
+    /// 所以必須以 cue identity 去重，不能只看 snapshot tick。
     #[visit(skip)]
     #[reflect(hidden)]
-    sim_last_tower_fire_tick: Option<u32>,
+    sim_seen_tower_fire_fx: HashSet<TowerFireFxKey>,
+    /// 已處理過的 attack phase cue keys，避免保留 window 內重複啟動同一段動畫。
     #[visit(skip)]
     #[reflect(hidden)]
-    sim_last_attack_phase_tick: Option<u32>,
+    sim_seen_attack_phase_fx: HashSet<AttackPhaseFxKey>,
     #[visit(skip)]
     #[reflect(hidden)]
     client_projectiles: HashMap<u32, ClientProjectile>,
@@ -2229,8 +2245,8 @@ impl Plugin for Game {
         self.tower_texture_cache = HashMap::new();
         self.tower_material_cache = HashMap::new();
         self.tower_composites = HashMap::new();
-        self.sim_last_tower_fire_tick = None;
-        self.sim_last_attack_phase_tick = None;
+        self.sim_seen_tower_fire_fx.clear();
+        self.sim_seen_attack_phase_fx.clear();
 
         // 商店面板（初始空字串；按 B 切換顯示內容）
         self.ui_shop_text = TextBuilder::new(
@@ -2715,6 +2731,7 @@ impl Plugin for Game {
                                 label: t.label.clone(),
                                 cost: t.cost,
                                 footprint_backend: t.footprint,
+                                placement_radius_backend: t.placement_radius,
                                 range_backend: t.range,
                                 splash_radius_backend: t.splash_radius,
                                 hit_radius_backend: t.hit_radius,
@@ -2723,7 +2740,7 @@ impl Plugin for Game {
                                 render_mode: t.render_mode.clone(),
                                 base_image: t.base_image.clone(),
                                 barrel_image: t.barrel_image.clone(),
-                                render_size_backend: t.size,
+                                render_visual_size_backend: t.render_visual_size,
                                 barrel_frames: t.barrel_frames.clone(),
                                 body_frames: t.body_frames.clone(),
                                 barrel_animation: t.barrel_animation.clone(),
@@ -3282,13 +3299,13 @@ impl Plugin for Game {
             if let Some(kind) = self.selected_tower_kind.clone() {
                 if let Some(tpl) = self.td_templates.get(&kind).cloned() {
                     let placement_radius_render = tower_placement_radius_render(&tpl);
-                    let placement_radius_backend = placement_radius_render / WORLD_SCALE;
                     let range_backend = tpl.range_backend;
                     let cost = tpl.cost;
                     let mwp = self.mouse_world_pos;
                     // ===== 本地 placement 驗證（前端即時預覽；後端下最終決定）=====
                     const PATH_HALF_WIDTH: f32 = 64.0; // 與後端 PATH_HALF_WIDTH 同步
-                    let clear_render = (placement_radius_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
+                    let clear_render =
+                        (tpl.placement_radius_backend + PATH_HALF_WIDTH) * WORLD_SCALE;
                     let clear_sq = clear_render * clear_render;
                     let mut can_place = self.hero_state.gold >= cost;
                     if can_place {
@@ -3320,12 +3337,15 @@ impl Plugin for Game {
                             if ent.tower_kind.is_none() {
                                 continue;
                             }
-                            let existing_radius = ent
+                            let Some(existing_radius) = ent
                                 .tower_kind
                                 .as_ref()
                                 .and_then(|kind| self.td_templates.get(kind))
                                 .map(tower_placement_radius_render)
-                                .unwrap_or(ent.collision_radius_render);
+                            else {
+                                can_place = false;
+                                break;
+                            };
                             let min_d = existing_radius + placement_radius_render;
                             if (ent.position - mwp).norm_squared() < min_d * min_d {
                                 can_place = false;
@@ -3346,7 +3366,7 @@ impl Plugin for Game {
                             Color::from_rgba(230, 80, 80, 160),
                         )
                     };
-                    // 內圈：footprint
+                    // 內圈：script-owned placement radius
                     add_circle_lines(
                         scene,
                         mwp,
@@ -6250,23 +6270,25 @@ impl Game {
             return;
         };
 
+        self.sim_seen_attack_phase_fx
+            .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
+        self.sim_seen_tower_fire_fx
+            .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
+
         let mut attack_cues: HashMap<u32, &sim_runner::AttackPhaseFx> = HashMap::new();
-        if !snapshot.attack_phase_fx.is_empty()
-            && self.sim_last_attack_phase_tick != Some(snapshot.tick)
-        {
-            for cue in &snapshot.attack_phase_fx {
-                attack_cues.entry(cue.entity_id).or_insert(cue);
+        for cue in &snapshot.attack_phase_fx {
+            if self
+                .sim_seen_attack_phase_fx
+                .insert(attack_phase_fx_key(cue))
+            {
+                attack_cues.insert(cue.entity_id, cue);
             }
-            self.sim_last_attack_phase_tick = Some(snapshot.tick);
         }
         let mut fire_cues: HashMap<u32, &sim_runner::TowerFireFx> = HashMap::new();
-        if !snapshot.tower_fire_fx.is_empty()
-            && self.sim_last_tower_fire_tick != Some(snapshot.tick)
-        {
-            for cue in &snapshot.tower_fire_fx {
-                fire_cues.entry(cue.entity_id).or_insert(cue);
+        for cue in &snapshot.tower_fire_fx {
+            if self.sim_seen_tower_fire_fx.insert(tower_fire_fx_key(cue)) {
+                fire_cues.insert(cue.entity_id, cue);
             }
-            self.sim_last_tower_fire_tick = Some(snapshot.tick);
         }
 
         let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
