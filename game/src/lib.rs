@@ -614,6 +614,8 @@ struct HeroModelRender {
     root_node: Handle<Node>,
     animation_player: Handle<Node>,
     muzzle_node: Option<Handle<Node>>,
+    last_pos: Vector2<f32>,
+    render_moving: bool,
     animations_by_source: HashMap<String, Handle<Animation>>,
     action_resources_requested: HashSet<String>,
     active_action: Option<String>,
@@ -870,6 +872,98 @@ fn find_descendant_by_name(scene: &Scene, root: Handle<Node>, name: &str) -> Opt
         stack.extend(node.children().iter().copied());
     }
     None
+}
+
+fn find_descendant_animation_player(scene: &Scene, root: Handle<Node>) -> Option<Handle<Node>> {
+    if !scene.graph.is_valid_handle(root) {
+        return None;
+    }
+    let mut stack = vec![root];
+    while let Some(handle) = stack.pop() {
+        if !scene.graph.is_valid_handle(handle) {
+            continue;
+        }
+        let node = &scene.graph[handle];
+        if node
+            .cast::<fyrox::scene::animation::AnimationPlayer>()
+            .is_some()
+        {
+            return Some(handle);
+        }
+        stack.extend(node.children().iter().copied());
+    }
+    None
+}
+
+fn descendant_animation_players(scene: &Scene, root: Handle<Node>) -> Vec<Handle<Node>> {
+    if !scene.graph.is_valid_handle(root) {
+        return Vec::new();
+    }
+    let mut players = Vec::new();
+    let mut stack = vec![root];
+    while let Some(handle) = stack.pop() {
+        if !scene.graph.is_valid_handle(handle) {
+            continue;
+        }
+        let node = &scene.graph[handle];
+        if node
+            .cast::<fyrox::scene::animation::AnimationPlayer>()
+            .is_some()
+        {
+            players.push(handle);
+        }
+        stack.extend(node.children().iter().copied());
+    }
+    players
+}
+
+fn disable_animation_player(scene: &mut Scene, player: Handle<Node>) {
+    if !scene.graph.is_valid_handle(player) {
+        return;
+    }
+    if let Some(player) = scene.graph[player]
+        .cast_mut::<fyrox::scene::animation::AnimationPlayer>()
+    {
+        for animation in player.animations_mut().get_value_mut_silent().iter_mut() {
+            animation.set_enabled(false);
+        }
+    }
+}
+
+fn disable_other_animation_players(
+    scene: &mut Scene,
+    root: Handle<Node>,
+    active_player: Handle<Node>,
+) {
+    for player in descendant_animation_players(scene, root) {
+        if player != active_player {
+            disable_animation_player(scene, player);
+        }
+    }
+}
+
+fn select_retargeted_animation_by_duration(
+    scene: &Scene,
+    player: Handle<Node>,
+    handles: &[Handle<Animation>],
+    expected_duration_secs: f32,
+) -> Option<Handle<Animation>> {
+    let player = scene.graph[player]
+        .cast::<fyrox::scene::animation::AnimationPlayer>()?;
+    let animations = player.animations().get_value_ref();
+    handles.iter().copied().min_by(|a, b| {
+        let a_delta = animations
+            .try_get(*a)
+            .map(|animation| (animation.length() - expected_duration_secs).abs())
+            .unwrap_or(f32::INFINITY);
+        let b_delta = animations
+            .try_get(*b)
+            .map(|animation| (animation.length() - expected_duration_secs).abs())
+            .unwrap_or(f32::INFINITY);
+        a_delta
+            .partial_cmp(&b_delta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 fn tower_render_dir_from_world_rad(dir_rad: f32) -> Vector2<f32> {
@@ -6199,11 +6293,27 @@ impl Game {
                 continue;
             };
             let handles = model.retarget_animations_to_player(root, player, &mut scene.graph);
-            if let Some(handle) = handles.first().copied() {
+            let expected_duration_secs =
+                source.duration_ticks / source.ticks_per_second.max(0.001);
+            if let Some(handle) = select_retargeted_animation_by_duration(
+                scene,
+                player,
+                &handles,
+                expected_duration_secs,
+            ) {
                 if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
                     node.animations_by_source.insert(source.key.clone(), handle);
                     node.action_resources_requested.insert(source.key.clone());
                 }
+            } else if self
+                .hero_asset_failures_logged
+                .insert(format!("animation:{}:{}", source.key, source.model))
+            {
+                log::warn!(
+                    "hero 3D animation source '{}' produced no usable animations from {}",
+                    source.key,
+                    source.model
+                );
             }
         }
     }
@@ -6235,6 +6345,7 @@ impl Game {
         let Some(handle) = node.animations_by_source.get(&binding.source).copied() else {
             return false;
         };
+        disable_other_animation_players(scene, node.root_node, node.animation_player);
         let Some(player) = scene.graph[node.animation_player]
             .cast_mut::<fyrox::scene::animation::AnimationPlayer>()
         else {
@@ -6245,8 +6356,8 @@ impl Game {
             animation.set_enabled(false);
         }
         let ticks_per_second = source.ticks_per_second.max(0.001);
-        let start_sec = start_tick / ticks_per_second;
-        let end_sec = end_tick / ticks_per_second;
+        let start_sec = (source.timeline_offset_ticks + start_tick) / ticks_per_second;
+        let end_sec = (source.timeline_offset_ticks + end_tick) / ticks_per_second;
         let source_duration = (end_sec - start_sec).max(0.001);
         let speed = desired_duration_secs
             .filter(|duration| *duration > 0.001)
@@ -6522,11 +6633,14 @@ impl Game {
                 .with_rotation(rotation)
                 .with_scale(Vector3::new(render.scale, render.scale, render.scale))
                 .finish();
-            let player = AnimationPlayerBuilder::new(
-                BaseBuilder::new().with_name("Hero Animation Player"),
-            )
-            .build(&mut scene.graph);
-            scene.graph.link_nodes(player, root);
+            let player = find_descendant_animation_player(scene, root).unwrap_or_else(|| {
+                let player = AnimationPlayerBuilder::new(
+                    BaseBuilder::new().with_name("Hero Animation Player"),
+                )
+                .build(&mut scene.graph);
+                scene.graph.link_nodes(player, root);
+                player
+            });
             self.apply_hero_texture_fallback(scene, root, &render.texture);
             let muzzle_node = find_descendant_by_name(scene, root, &render.muzzle_bone);
             if !render.muzzle_bone.trim().is_empty() && muzzle_node.is_none() {
@@ -6545,6 +6659,8 @@ impl Game {
                     root_node: root,
                     animation_player: player,
                     muzzle_node,
+                    last_pos: pos,
+                    render_moving: render.is_moving,
                     animations_by_source: HashMap::new(),
                     action_resources_requested: HashSet::new(),
                     active_action: None,
@@ -6561,6 +6677,10 @@ impl Game {
 
         if let Some(node) = self.hero_model_nodes.get_mut(&entity.entity_id) {
             if scene.graph.is_valid_handle(node.root_node) {
+                let dx = pos.x - node.last_pos.x;
+                let dy = pos.y - node.last_pos.y;
+                node.render_moving = render.is_moving || dx * dx + dy * dy > 0.000001;
+                node.last_pos = pos;
                 let rotation = hero_model_rotation(entity.facing_rad, render);
                 scene.graph[node.root_node]
                     .local_transform_mut()
@@ -6622,10 +6742,15 @@ impl Game {
                 .map(|node| node.active_attack_seq.is_some() || node.one_shot_remaining > 0.0)
                 .unwrap_or(false);
             if !keep_one_shot {
-                let action = if render.sniper_mode {
-                    "sniper"
-                } else if render.is_moving {
+                let render_moving = self
+                    .hero_model_nodes
+                    .get(&entity.entity_id)
+                    .map(|node| node.render_moving)
+                    .unwrap_or(render.is_moving);
+                let action = if render_moving {
                     "move"
+                } else if render.sniper_mode {
+                    "sniper"
                 } else {
                     "sniper"
                 };

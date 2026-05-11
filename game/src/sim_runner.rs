@@ -114,6 +114,7 @@ fn hero_render_snapshot_for_unit_id(
                 animation: source.animation.to_string(),
                 duration_ticks: source.duration_ticks.to_f32_for_render(),
                 ticks_per_second: source.ticks_per_second.to_f32_for_render(),
+                timeline_offset_ticks: source.timeline_offset_ticks.to_f32_for_render(),
             })
             .collect(),
         animations: render
@@ -337,6 +338,7 @@ pub struct HeroAnimationSourceSnapshot {
     pub animation: String,
     pub duration_ticks: f32,
     pub ticks_per_second: f32,
+    pub timeline_offset_ticks: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1598,6 +1600,10 @@ mod tests {
         assert_eq!(
             attack_source.ticks_per_second,
             generated_attack_source.ticks_per_second.to_f32_for_render()
+        );
+        assert_eq!(
+            attack_source.timeline_offset_ticks,
+            generated_attack_source.timeline_offset_ticks.to_f32_for_render()
         );
 
         let critical = render
