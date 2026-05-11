@@ -92,7 +92,7 @@ impl WebClientStatus {
 
 struct WebSocketClient {
     _socket: WebSocket,
-    _on_open: Closure<dyn FnMut(Event)>,
+    _on_open: Closure<dyn FnMut(WebEvent)>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(ErrorEvent)>,
     _on_close: Closure<dyn FnMut(CloseEvent)>,
