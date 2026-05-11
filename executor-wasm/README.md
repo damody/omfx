@@ -1,14 +1,62 @@
-# # 建構指令
+# omfx Web/WASM executor
 
-1. Make sure you have `wasm32-unknown-unknown` target installed in rustup (if not, do: `rustup target add wasm32-unknown-unknown`)
-2. Make sure you have `wasm-pack` installed (if not, do: `cargo install wasm-pack`)
-3. To build the executor, do: `wasm-pack build --target web --release`
+## Prerequisites
 
-# # 如何在本機上運行遊戲
+```powershell
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+cargo install basic-http-server
+```
 
-1. Make sure you have `basic-http-server` installed (if not, do: `cargo install basic-http-server`). 
-2. Clone assets to the `executor-wasm` directory. Alternatively, clone everything except `Cargo.toml` and `src` directory
-to the root of your project (`../`).
-3. Execute `basic-http-server` in `executor-wasm` directory (or in root folder if you you've used alternative path).
+## Build, stage, and run
 
-If everything has succeeded, open a web browser at http://localhost:4000/, click "Start" button and your game shoud load.
+From repo root:
+
+```powershell
+.\run_web.bat
+```
+
+This builds the script DLL, native backend, WebSocket bridge, and WASM executor; stages a static web root; starts `omobab`, `omb-ws-bridge`, and a static HTTP server; then opens the browser.
+
+To build and stage without starting processes:
+
+```powershell
+.\run_web.bat --build-only
+```
+
+The staged static web root is:
+
+```text
+omfx/executor-wasm/web-root
+```
+
+The staged root contains `index.html`, `main.js`, `pkg/`, and `data/` copied from `omfx/data`.
+
+## Manual backend and WebSocket bridge
+
+The browser cannot connect to the native KCP/UDP server directly. Start the native `omb` backend, then start the bridge:
+
+```powershell
+cargo run --manifest-path omb-ws-bridge/Cargo.toml -- 127.0.0.1:50062 127.0.0.1:50061
+```
+
+The bridge exposes `ws://127.0.0.1:50062` and forwards raw `[tag][len][payload]` protobuf frames to the existing KCP server at `127.0.0.1:50061`.
+
+## Manual static server
+
+```powershell
+basic-http-server omfx/executor-wasm/web-root
+```
+
+Open:
+
+```text
+http://localhost:4000/?omoba_ws=ws://127.0.0.1:50062&player=web-player
+```
+
+The current Web client is a WASM-safe diagnostic renderer. It initializes Fyrox, displays connection status, sends `SubscribeRequest` and `JoinRequest`, and reports `GameStart`, `TickBatch`, `GameEvent`, `StateHash`, and bridge/decode errors.
+
+## Endpoint configuration
+
+- `omoba_ws`: WebSocket endpoint, default `ws://127.0.0.1:50062`
+- `player`: player name sent in `SubscribeRequest` / `JoinRequest`, default `web-player`

@@ -6,12 +6,14 @@ edition = "2021"
 
 [dependencies]
 fyrox = {workspace = true}
+log = "0.4"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uuid = { version = "1", features = ["v4"] }
 omoba-core = { path = "../../omoba-core", features = ["kcp"] }
 crossbeam-channel = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-log = "0.4"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 
 # 第 3 階段鎖步模擬器相依性：
@@ -29,6 +31,25 @@ failure = "0.1.8"
 # 階段 3.3：需透過 omoba_core / 重新編碼 PlayerInput
 # omobab 原型邊界位於鎖步 → sim_runner 橋。
 prost = "0.13"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+omoba-core = { path = "../../omoba-core", default-features = false, features = ["game-proto"] }
+prost = "0.13"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "Location",
+    "MessageEvent",
+    "Response",
+    "UrlSearchParams",
+    "WebSocket",
+    "Window",
+    "console",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -4032,6 +4032,7 @@ dependencies = [
  "crossbeam-channel",
  "failure",
  "fyrox",
+ "js-sys",
  "log",
  "omoba-core",
  "omoba-sim",
@@ -4043,6 +4044,8 @@ dependencies = [
  "specs",
  "tokio",
  "uuid",
+ "wasm-bindgen-futures",
+ "web-sys",
  "windows",
 ]
 
