@@ -146,7 +146,7 @@ fn run_sim_loop(
 
     let script_registry = load_script_registry(&dll_path);
 
-    let mut world = match init_world(&scene_path, master_seed, script_registry) {
+    let (mut world, creep_wave_data) = match init_world(&scene_path, master_seed, script_registry) {
         Ok(w) => w,
         Err(e) => {
             error!("sim_runner: init_world failed: {}", e);
@@ -222,6 +222,20 @@ fn run_sim_loop(
                 break;
             }
         };
+
+        if let Err(err) = ensure_dev_lua_content_for_batch(
+            &mut world,
+            &script_registry,
+            &creep_wave_data,
+            &mut abilities_arc,
+            &mut tower_templates_arc,
+            &mut tower_upgrades_arc,
+            &batch,
+        ) {
+            error!("sim_runner: DEV Lua reload failed before tick {}: {}", batch.tick, err);
+            publish_dev_lua_reload_error(&state_out, &batch, err);
+            break;
+        }
 
         for input in batch.inputs.iter().filter(|input| input.input_id != 0) {
             recent_applied_inputs.push_back((
@@ -459,9 +473,22 @@ fn init_world(
     scene_path: &Path,
     master_seed: u64,
     script_registry: omoba_core::runtime::ScriptRegistry,
-) -> Result<World, failure::Error> {
-    let mut world = omoba_core::runtime::create_world_for_scene_with_content(
-        scene_path,
+) -> Result<(World, omoba_core::ue4::import_map::CreepWaveData), failure::Error> {
+    use failure::err_msg;
+
+    let story_id = scene_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| err_msg("scene_path does not end in a valid story id"))?;
+    let campaign_data = omoba_core::ue4::import_campaign::load_generated(story_id).map_err(|e| {
+        err_msg(format!(
+            "CampaignData::load_generated({}) failed: {}",
+            story_id, e
+        ))
+    })?;
+    let creep_wave_data = campaign_data.map.clone();
+    let mut world = omoba_core::runtime::create_world_from_loaded_content(
+        campaign_data,
         omoba_core::runtime::ItemRegistry::default(),
         script_registry,
     )?;
@@ -470,7 +497,130 @@ fn init_world(
     world
         .write_resource::<omoba_core::comp::resources::MasterSeed>()
         .0 = master_seed;
-    Ok(world)
+    Ok((world, creep_wave_data))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevLuaReloadAction {
+    Noop,
+    Reload,
+}
+
+fn dev_lua_reload_action(
+    current_generation: Option<u64>,
+    current_hash: Option<&str>,
+    target_generation: u64,
+    target_hash: &str,
+) -> Result<DevLuaReloadAction, String> {
+    if target_generation == 0 && target_hash.is_empty() {
+        return Ok(DevLuaReloadAction::Noop);
+    }
+    if target_hash.is_empty() {
+        return Err(format!(
+            "target DEV Lua generation {} is missing content hash",
+            target_generation
+        ));
+    }
+    match (current_generation, current_hash) {
+        (Some(generation), Some(hash)) if generation == target_generation && hash == target_hash => {
+            Ok(DevLuaReloadAction::Noop)
+        }
+        (Some(generation), Some(hash)) if generation == target_generation => Err(format!(
+            "runtime Lua content hash mismatch at generation {}: expected {}, got {}",
+            target_generation, target_hash, hash
+        )),
+        (Some(generation), _) if generation > target_generation => Err(format!(
+            "local runtime Lua generation {} is ahead of backend target {}",
+            generation, target_generation
+        )),
+        _ => Ok(DevLuaReloadAction::Reload),
+    }
+}
+
+fn ensure_dev_lua_content_for_batch(
+    world: &mut World,
+    script_registry: &omoba_core::runtime::ScriptRegistry,
+    creep_wave_data: &omoba_core::ue4::import_map::CreepWaveData,
+    abilities_arc: &mut std::sync::Arc<Vec<AbilityDefSnapshot>>,
+    tower_templates_arc: &mut std::sync::Arc<Vec<TowerTemplateSnapshot>>,
+    tower_upgrades_arc: &mut std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
+    batch: &TickBatchPayload,
+) -> Result<(), String> {
+    let current_generation = omoba_template_ids::runtime_lua_content_generation()?;
+    let current_hash = omoba_template_ids::runtime_lua_content_hash()?;
+    let action = dev_lua_reload_action(
+        current_generation,
+        current_hash.as_deref(),
+        batch.lua_content_generation,
+        batch.lua_content_hash.as_str(),
+    )?;
+    if action == DevLuaReloadAction::Noop {
+        return Ok(());
+    }
+
+    let expected_hash = batch.lua_content_hash.as_str();
+    let modules = script_registry.reload_runtime_lua_content_dev(expected_hash)?;
+    let (committed_generation, committed_hash) = commit_runtime_lua_content_reload(expected_hash)?;
+    if committed_generation != batch.lua_content_generation || committed_hash != expected_hash {
+        return Err(format!(
+            "runtime Lua reload committed generation/hash mismatch: backend target {} {}, local committed {} {}",
+            batch.lua_content_generation, expected_hash, committed_generation, committed_hash
+        ));
+    }
+
+    omoba_core::runtime::StateInitializer::refresh_dev_lua_gameplay_content(
+        world,
+        creep_wave_data,
+        script_registry,
+    );
+    rebuild_metadata_arcs(world, abilities_arc, tower_templates_arc, tower_upgrades_arc);
+    info!(
+        "sim_runner: DEV Lua content reloaded generation={} hash={} script_modules={}",
+        committed_generation,
+        committed_hash,
+        modules.len()
+    );
+    Ok(())
+}
+
+fn commit_runtime_lua_content_reload(expected_hash: &str) -> Result<(u64, String), String> {
+    #[cfg(feature = "runtime-lua-content")]
+    {
+        let committed = omoba_template_ids::reload_runtime_lua_content_dev(Some(expected_hash))?
+            .ok_or_else(|| "runtime Lua content became inactive during omfx reload".to_string())?;
+        return Ok((committed.generation, committed.hash));
+    }
+    #[cfg(not(feature = "runtime-lua-content"))]
+    {
+        let _ = expected_hash;
+        Err("omfx was built without runtime-lua-content; cannot apply DEV Lua reload".into())
+    }
+}
+
+fn rebuild_metadata_arcs(
+    world: &World,
+    abilities_arc: &mut std::sync::Arc<Vec<AbilityDefSnapshot>>,
+    tower_templates_arc: &mut std::sync::Arc<Vec<TowerTemplateSnapshot>>,
+    tower_upgrades_arc: &mut std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
+) {
+    let ability_reg = world.read_resource::<omoba_core::ability_runtime::AbilityRegistry>();
+    *abilities_arc = std::sync::Arc::new(build_ability_def_snapshots(&ability_reg));
+    let tower_reg = world.read_resource::<omoba_core::comp::tower_registry::TowerTemplateRegistry>();
+    *tower_templates_arc = std::sync::Arc::new(build_tower_template_snapshots(&tower_reg));
+    let upgrade_reg = world
+        .read_resource::<omoba_core::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
+    *tower_upgrades_arc = std::sync::Arc::new(build_tower_upgrade_def_snapshots(&upgrade_reg));
+}
+
+fn publish_dev_lua_reload_error(
+    state_out: &Arc<Mutex<SimWorldSnapshot>>,
+    batch: &TickBatchPayload,
+    err: String,
+) {
+    if let Ok(mut snapshot) = state_out.lock() {
+        snapshot.tick = batch.tick;
+        snapshot.dev_lua_reload_error = Some(err);
+    }
 }
 
 fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<TickBatchInput>) {
@@ -512,6 +662,28 @@ mod tests {
     #[test]
     fn smoke_links() {
         assert_eq!(smoke(), "omoba-core runtime linked");
+    }
+
+    #[test]
+    fn dev_lua_reload_action_detects_matching_generation() {
+        assert_eq!(
+            dev_lua_reload_action(Some(2), Some("abc"), 2, "abc").unwrap(),
+            DevLuaReloadAction::Noop
+        );
+    }
+
+    #[test]
+    fn dev_lua_reload_action_requests_reload_for_new_generation() {
+        assert_eq!(
+            dev_lua_reload_action(Some(1), Some("old"), 2, "new").unwrap(),
+            DevLuaReloadAction::Reload
+        );
+    }
+
+    #[test]
+    fn dev_lua_reload_action_rejects_hash_mismatch() {
+        let err = dev_lua_reload_action(Some(2), Some("local"), 2, "backend").unwrap_err();
+        assert!(err.contains("hash mismatch"));
     }
 
     #[test]

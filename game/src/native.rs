@@ -539,6 +539,38 @@ struct TdTemplate {
     attack_backswing: u16,
 }
 
+fn td_template_from_snapshot(t: &sim_runner::TowerTemplateSnapshot) -> TdTemplate {
+    TdTemplate {
+        label: t.label.clone(),
+        cost: t.cost,
+        footprint_backend: t.footprint,
+        placement_radius_backend: t.placement_radius,
+        range_backend: t.range,
+        splash_radius_backend: t.splash_radius,
+        hit_radius_backend: t.hit_radius,
+        slow_factor: t.slow_factor,
+        slow_duration: t.slow_duration,
+        render_mode: t.render_mode.clone(),
+        base_image: t.base_image.clone(),
+        barrel_image: t.barrel_image.clone(),
+        render_visual_size_backend: t.render_visual_size,
+        barrel_frames: t.barrel_frames.clone(),
+        body_frames: t.body_frames.clone(),
+        barrel_animation: t.barrel_animation.clone(),
+        body_animation: t.body_animation.clone(),
+        rotation_mode: t.rotation_mode.clone(),
+        barrel_layout: t.barrel_layout.clone(),
+        barrel_variants: t.barrel_variants.clone(),
+        barrel_offset: t.barrel_offset.clone(),
+        barrel_pivot: t.barrel_pivot.clone(),
+        muzzle_offset: t.muzzle_offset.clone(),
+        default_angle_deg: t.default_angle_deg,
+        recoil: t.recoil.clone(),
+        attack_windup: t.attack_windup,
+        attack_backswing: t.attack_backswing,
+    }
+}
+
 #[derive(Debug)]
 struct TowerAnimationState {
     frames: Vec<String>,
@@ -1277,6 +1309,17 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
+    /// 最近一次 frontend 已套用的 Lua content generation/hash。
+    /// 變更時清除 Lua-derived UI/asset caches，讓下一份 snapshot 重新 seed。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_lua_content_generation: u64,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_lua_content_hash: String,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_dev_lua_reload_error: Option<String>,
     /// 階段 3.4 渲染橋：每個畫面讀取 `SimWorldSnapshot` 並
     /// （第 4 階段）為每個實體產生/更新/消失 Fyrox sprite。
     /// 目前是記錄實體渲染資料的存根。始終分配
@@ -2730,6 +2773,26 @@ impl Plugin for Game {
         if let Some(ref sim) = self.sim_runner_handle {
             self.wait_for_applied_input_snapshot(sim, &forwarded_pending_input_ids);
             if let Ok(snapshot) = sim.state.try_lock() {
+                if self.sim_dev_lua_reload_error != snapshot.dev_lua_reload_error {
+                    self.sim_dev_lua_reload_error = snapshot.dev_lua_reload_error.clone();
+                    if let Some(err) = &self.sim_dev_lua_reload_error {
+                        log::error!("DEV Lua reload error surfaced to frontend: {}", err);
+                    }
+                }
+
+                let content_changed = self.sim_lua_content_generation
+                    != snapshot.lua_content_generation
+                    || self.sim_lua_content_hash != snapshot.lua_content_hash;
+                if content_changed {
+                    self.invalidate_lua_content_caches(
+                        scene,
+                        snapshot.lua_content_generation,
+                        &snapshot.lua_content_hash,
+                    );
+                    self.sim_lua_content_generation = snapshot.lua_content_generation;
+                    self.sim_lua_content_hash = snapshot.lua_content_hash.clone();
+                }
+
                 self.render_bridge.update(&*snapshot, scene);
                 applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
 
@@ -5813,6 +5876,43 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    fn clear_lua_metadata_caches(&mut self) {
+        self.td_templates.clear();
+        self.td_template_order.clear();
+        self.td_upgrade_defs.clear();
+        self.ability_info_map.clear();
+        self.ability_icon_texture_cache.clear();
+        self.ability_textures = [None, None, None, None];
+        self.ability_icon_paths = std::array::from_fn(|_| String::new());
+        self.tower_texture_cache.clear();
+        self.tower_material_cache.clear();
+        self.hero_model_assets.clear();
+        self.hero_action_assets.clear();
+        self.hero_asset_failures_logged.clear();
+    }
+
+    fn invalidate_lua_content_caches(
+        &mut self,
+        scene: &mut Scene,
+        generation: u64,
+        hash: &str,
+    ) {
+        self.clear_lua_metadata_caches();
+        let tower_ids: Vec<u32> = self.tower_composites.keys().copied().collect();
+        for id in tower_ids {
+            self.remove_tower_composite(scene, id);
+        }
+        let hero_ids: Vec<u32> = self.hero_model_nodes.keys().copied().collect();
+        for id in hero_ids {
+            self.remove_hero_model(scene, id);
+        }
+        log::info!(
+            "frontend Lua content caches invalidated for generation={} hash={}",
+            generation,
+            hash
+        );
+    }
+
     fn td_ui_texture(&mut self, asset_name: &str) -> Option<TextureResource> {
         if let Some(cached) = self.td_ui_texture_cache.get(asset_name) {
             return cached.clone();
