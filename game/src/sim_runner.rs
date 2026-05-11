@@ -90,7 +90,7 @@ fn hero_render_snapshot_for_unit_id(
 ) -> Option<Box<HeroRenderSnapshot>> {
     let hero_name = unit_id.strip_prefix("hero_")?;
     let hero_id = omoba_template_ids::hero_by_name(hero_name)?;
-    let render = omoba_template_ids::hero_render_metadata(hero_id)?;
+    let render = omoba_template_ids::active_hero_render_metadata(hero_id)?;
     let render_mode = match render.render_mode {
         omoba_template_ids::HeroRenderModeC::Model3d => "model_3d",
     };
@@ -1560,7 +1560,7 @@ mod tests {
     fn saika_hero_render_snapshot_uses_generated_metadata() {
         let render = hero_render_snapshot_for_unit_id("hero_saika_magoichi", true, true)
             .expect("saika render snapshot");
-        let generated = omoba_template_ids::hero_render_metadata(
+        let generated = omoba_template_ids::active_hero_render_metadata(
             omoba_template_ids::HERO_SAIKA_MAGOICHI,
         )
         .expect("generated metadata");

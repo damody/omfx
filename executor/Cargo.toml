@@ -13,3 +13,4 @@ simplelog = "0.12"
 [features]
 default = ["omfx"]
 dylib = ["fyrox/dylib"]
+runtime-lua-content = ["omfx/runtime-lua-content"]
