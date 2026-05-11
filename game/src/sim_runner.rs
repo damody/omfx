@@ -104,6 +104,7 @@ fn hero_render_snapshot_for_unit_id(
         roll_offset_deg: render.roll_offset_deg.to_f32_for_render(),
         yaw_offset_deg: render.yaw_offset_deg.to_f32_for_render(),
         z_offset: render.z_offset.to_f32_for_render(),
+        muzzle_bone: render.muzzle_bone.to_string(),
         animation_sources: render
             .animation_sources
             .iter()
@@ -358,6 +359,7 @@ pub struct HeroRenderSnapshot {
     pub roll_offset_deg: f32,
     pub yaw_offset_deg: f32,
     pub z_offset: f32,
+    pub muzzle_bone: String,
     pub animation_sources: Vec<HeroAnimationSourceSnapshot>,
     pub animations: Vec<HeroAnimationBindingSnapshot>,
     pub is_moving: bool,
@@ -402,6 +404,7 @@ pub struct EntityRenderData {
     /// rows 只支付一個 None 指標。
     pub hero_ext: Option<Box<HeroStatsExt>>,
     pub hero_render: Option<Box<HeroRenderSnapshot>>,
+    pub projectile_owner_entity_id: Option<u32>,
     /// 階段 4.3：每條路徑的塔升級等級點（3 條路徑 × 0-4 級）。
     /// 對於非 Tower 實體為「無」。源自“Tower.upgrade_levels”
     /// 組件欄位；現有的 TD 出售/升級面板已顯示
@@ -1102,6 +1105,7 @@ fn extract_snapshot(
         } else {
             None
         };
+        let projectile_owner_entity_id = proj_storage.get(entity).map(|p| p.owner.id());
         let gold = gold_storage.get(entity).map(|g| g.0).unwrap_or(0);
         let stats = UnitStats::from_refs(&*buff_store, is_building_storage.get(entity).is_some());
         let attack_range = tatk_storage
@@ -1301,6 +1305,7 @@ fn extract_snapshot(
             gold,
             hero_ext,
             hero_render,
+            projectile_owner_entity_id,
             upgrade_levels,
             attack_range,
         });

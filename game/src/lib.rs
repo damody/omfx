@@ -603,14 +603,22 @@ enum HeroAttackPlaybackPhase {
     Backswing,
 }
 
+#[derive(Debug, Clone)]
+struct HeroPendingAttackCue {
+    cue: sim_runner::AttackPhaseFx,
+    action: String,
+}
+
 #[derive(Debug)]
 struct HeroModelRender {
     root_node: Handle<Node>,
     animation_player: Handle<Node>,
+    muzzle_node: Option<Handle<Node>>,
     animations_by_source: HashMap<String, Handle<Animation>>,
     action_resources_requested: HashSet<String>,
     active_action: Option<String>,
     active_attack_seq: Option<u32>,
+    pending_attack: Option<HeroPendingAttackCue>,
     attack_phase: HeroAttackPlaybackPhase,
     attack_phase_remaining: f32,
     attack_backswing_remaining: f32,
@@ -844,6 +852,24 @@ fn hero_model_rotation(
     UnitQuaternion::from_axis_angle(&Vector3::z_axis(), yaw)
         * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pitch)
         * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), roll)
+}
+
+fn find_descendant_by_name(scene: &Scene, root: Handle<Node>, name: &str) -> Option<Handle<Node>> {
+    if name.trim().is_empty() || !scene.graph.is_valid_handle(root) {
+        return None;
+    }
+    let mut stack = vec![root];
+    while let Some(handle) = stack.pop() {
+        if !scene.graph.is_valid_handle(handle) {
+            continue;
+        }
+        let node = &scene.graph[handle];
+        if node.name() == name {
+            return Some(handle);
+        }
+        stack.extend(node.children().iter().copied());
+    }
+    None
 }
 
 fn tower_render_dir_from_world_rad(dir_rad: f32) -> Vector2<f32> {
@@ -6046,6 +6072,16 @@ impl Game {
         }
     }
 
+    fn hero_muzzle_render_pos(&self, scene: &Scene, entity_id: u32) -> Option<Vector2<f32>> {
+        let render = self.hero_model_nodes.get(&entity_id)?;
+        let handle = render.muzzle_node?;
+        if !scene.graph.is_valid_handle(handle) {
+            return None;
+        }
+        let pos = scene.graph[handle].global_position();
+        Some(Vector2::new(pos.x, pos.y))
+    }
+
     fn request_hero_model_asset(
         &mut self,
         resource_manager: &ResourceManager,
@@ -6279,40 +6315,72 @@ impl Game {
         render: &sim_runner::HeroRenderSnapshot,
         action: &str,
         cue: &sim_runner::AttackPhaseFx,
-    ) {
+        cue_age_secs: f32,
+    ) -> bool {
         if self
             .hero_model_nodes
             .get(&entity_id)
             .map(|node| node.active_attack_seq == Some(cue.attack_seq))
             .unwrap_or(false)
         {
-            return;
+            return true;
         }
         let Some(binding) = render.animations.iter().find(|b| b.action == action) else {
-            return;
+            return true;
         };
         let Some(impact_tick) = binding.impact_tick else {
             self.play_hero_action(scene, entity_id, render, action);
-            return;
+            return true;
         };
         let windup_secs = (cue.windup_ms as f32 / 1000.0).max(0.001);
         let backswing_secs = (cue.backswing_ms as f32 / 1000.0).max(0.001);
+        let cue_age_secs = cue_age_secs.max(0.0);
+        let (phase, start_tick, end_tick, duration_secs, backswing_remaining) =
+            if cue_age_secs < windup_secs {
+                let t = (cue_age_secs / windup_secs).clamp(0.0, 1.0);
+                let start_tick = binding.start_tick + (impact_tick - binding.start_tick) * t;
+                (
+                    HeroAttackPlaybackPhase::Windup,
+                    start_tick,
+                    impact_tick,
+                    (windup_secs - cue_age_secs).max(0.001),
+                    backswing_secs,
+                )
+            } else {
+                let backswing_age = cue_age_secs - windup_secs;
+                if backswing_age >= backswing_secs {
+                    return true;
+                }
+                let t = (backswing_age / backswing_secs).clamp(0.0, 1.0);
+                let start_tick = impact_tick + (binding.end_tick - impact_tick) * t;
+                (
+                    HeroAttackPlaybackPhase::Backswing,
+                    start_tick,
+                    binding.end_tick,
+                    (backswing_secs - backswing_age).max(0.001),
+                    0.0,
+                )
+            };
         if self.play_hero_animation_ticks(
             scene,
             entity_id,
             render,
             action,
-            binding.start_tick,
-            impact_tick,
+            start_tick,
+            end_tick,
             false,
-            Some(windup_secs),
+            Some(duration_secs),
         ) {
             if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
                 node.active_attack_seq = Some(cue.attack_seq);
-                node.attack_phase = HeroAttackPlaybackPhase::Windup;
-                node.attack_phase_remaining = windup_secs;
-                node.attack_backswing_remaining = backswing_secs;
+                node.pending_attack = None;
+                node.attack_phase = phase;
+                node.attack_phase_remaining = duration_secs;
+                node.attack_backswing_remaining = backswing_remaining;
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -6383,6 +6451,16 @@ impl Game {
         entity_id: u32,
         cue: &sim_runner::AttackCancelFx,
     ) {
+        if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
+            if node
+                .pending_attack
+                .as_ref()
+                .map(|pending| pending.cue.attack_seq == cue.attack_seq)
+                .unwrap_or(false)
+            {
+                node.pending_attack = None;
+            }
+        }
         let should_stop = self
             .hero_model_nodes
             .get(&entity_id)
@@ -6406,6 +6484,7 @@ impl Game {
         }
         node.active_action = None;
         node.active_attack_seq = None;
+        node.pending_attack = None;
         node.attack_phase = HeroAttackPlaybackPhase::None;
         node.attack_phase_remaining = 0.0;
         node.attack_backswing_remaining = 0.0;
@@ -6419,6 +6498,7 @@ impl Game {
         entity: &sim_runner::EntityRenderData,
         render: &sim_runner::HeroRenderSnapshot,
         pos: Vector2<f32>,
+        snapshot_tick: u32,
         dt: f32,
         attack_cue: Option<&sim_runner::AttackPhaseFx>,
         cancel_cue: Option<&sim_runner::AttackCancelFx>,
@@ -6448,15 +6528,28 @@ impl Game {
             .build(&mut scene.graph);
             scene.graph.link_nodes(player, root);
             self.apply_hero_texture_fallback(scene, root, &render.texture);
+            let muzzle_node = find_descendant_by_name(scene, root, &render.muzzle_bone);
+            if !render.muzzle_bone.trim().is_empty() && muzzle_node.is_none() {
+                let key = format!("muzzle:{}:{}", render.model, render.muzzle_bone);
+                if self.hero_asset_failures_logged.insert(key) {
+                    log::warn!(
+                        "hero 3D muzzle bone '{}' not found in model {}",
+                        render.muzzle_bone,
+                        render.model
+                    );
+                }
+            }
             self.hero_model_nodes.insert(
                 entity.entity_id,
                 HeroModelRender {
                     root_node: root,
                     animation_player: player,
+                    muzzle_node,
                     animations_by_source: HashMap::new(),
                     action_resources_requested: HashSet::new(),
                     active_action: None,
                     active_attack_seq: None,
+                    pending_attack: None,
                     attack_phase: HeroAttackPlaybackPhase::None,
                     attack_phase_remaining: 0.0,
                     attack_backswing_remaining: 0.0,
@@ -6485,8 +6578,44 @@ impl Game {
             self.cancel_hero_attack_action(scene, entity.entity_id, cue);
         } else if let Some(cue) = attack_cue {
             let action = if cue.is_critical { "critical" } else { "attack" };
-            self.start_hero_attack_action(scene, entity.entity_id, render, action, cue);
+            let cue_age_secs = ticks_to_seconds_f64(snapshot_tick.saturating_sub(cue.spawn_tick)) as f32;
+            if !self.start_hero_attack_action(
+                scene,
+                entity.entity_id,
+                render,
+                action,
+                cue,
+                cue_age_secs,
+            ) {
+                if let Some(node) = self.hero_model_nodes.get_mut(&entity.entity_id) {
+                    node.pending_attack = Some(HeroPendingAttackCue {
+                        cue: cue.clone(),
+                        action: action.to_string(),
+                    });
+                }
+            }
         } else {
+            let pending = self
+                .hero_model_nodes
+                .get(&entity.entity_id)
+                .and_then(|node| node.pending_attack.clone());
+            if let Some(pending) = pending {
+                let cue_age_secs = ticks_to_seconds_f64(
+                    snapshot_tick.saturating_sub(pending.cue.spawn_tick),
+                ) as f32;
+                if self.start_hero_attack_action(
+                    scene,
+                    entity.entity_id,
+                    render,
+                    &pending.action,
+                    &pending.cue,
+                    cue_age_secs,
+                ) {
+                    if let Some(node) = self.hero_model_nodes.get_mut(&entity.entity_id) {
+                        node.pending_attack = None;
+                    }
+                }
+            }
             let keep_one_shot = self
                 .hero_model_nodes
                 .get(&entity.entity_id)
@@ -6955,6 +7084,7 @@ impl Game {
                     e,
                     render,
                     pos,
+                    snapshot.tick,
                     dt,
                     attack_cues.get(&e.entity_id).copied(),
                     cancel_cues.get(&e.entity_id).copied(),
@@ -6962,6 +7092,13 @@ impl Game {
             } else {
                 self.remove_hero_model(scene, e.entity_id);
                 false
+            };
+            let projectile_initial_spawn_pos = if matches!(e.kind, sim_runner::EntityKind::Projectile) {
+                e.projectile_owner_entity_id
+                    .and_then(|owner_id| self.hero_muzzle_render_pos(scene, owner_id))
+                    .unwrap_or(pos)
+            } else {
+                pos
             };
 
             // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
@@ -6979,7 +7116,10 @@ impl Game {
             if matches!(e.kind, sim_runner::EntityKind::Projectile) {
                 // 子彈：從發射點到當前位置畫一條暖色拖尾矩形（不是中央小方塊）。
                 // 第一次看到該 eid 時把 spawn_pos 鎖定為當前 render pos。
-                let spawn_pos = *self.projectile_spawn_pos.entry(e.entity_id).or_insert(pos);
+                let spawn_pos = *self
+                    .projectile_spawn_pos
+                    .entry(e.entity_id)
+                    .or_insert(projectile_initial_spawn_pos);
                 let dx = pos.x - spawn_pos.x;
                 let dy = pos.y - spawn_pos.y;
                 let trail_len = (dx * dx + dy * dy).sqrt();
