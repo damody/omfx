@@ -1572,7 +1572,7 @@ mod tests {
         assert!(render.is_moving);
         assert!(render.sniper_mode);
 
-        for required in ["move", "attack", "critical", "sniper"] {
+        for required in ["idle", "idle_2", "idle_3", "move", "attack", "critical", "sniper"] {
             assert!(render
                 .animation_sources
                 .iter()
@@ -1622,6 +1622,10 @@ mod tests {
         assert_eq!(
             critical.impact_tick,
             Some(generated_critical.impact_tick.to_f32_for_render())
+        );
+        assert_eq!(
+            critical.repeat_start_tick,
+            generated_critical.repeat_start_tick.to_f32_for_render()
         );
         assert!(!critical.loop_animation);
 
