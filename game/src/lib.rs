@@ -622,6 +622,8 @@ struct HeroModelRender {
     active_attack_seq: Option<u32>,
     last_attack_action: Option<String>,
     pending_attack: Option<HeroPendingAttackCue>,
+    idle_cycle_remaining: f32,
+    idle_rng_state: u32,
     attack_phase: HeroAttackPlaybackPhase,
     attack_phase_remaining: f32,
     attack_backswing_remaining: f32,
@@ -965,6 +967,18 @@ fn select_retargeted_animation_by_duration(
             .partial_cmp(&b_delta)
             .unwrap_or(std::cmp::Ordering::Equal)
     })
+}
+
+fn is_hero_idle_action(action: &str) -> bool {
+    action == "idle" || action.starts_with("idle_")
+}
+
+fn next_idle_rng_state(state: u32) -> u32 {
+    let mut x = if state == 0 { 0x9E37_79B9 } else { state };
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x
 }
 
 fn tower_render_dir_from_world_rad(dir_rad: f32) -> Vector2<f32> {
@@ -6372,6 +6386,11 @@ impl Game {
         animation.set_enabled(true);
         node.active_action = Some(action.to_string());
         node.one_shot_remaining = desired_duration_secs.unwrap_or(0.0);
+        node.idle_cycle_remaining = if is_hero_idle_action(action) {
+            source_duration / speed.max(0.001)
+        } else {
+            0.0
+        };
         true
     }
 
@@ -6413,12 +6432,59 @@ impl Game {
         ) {
             if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
                 node.active_attack_seq = None;
-                node.last_attack_action = None;
+                if action == "move" {
+                    node.last_attack_action = None;
+                }
                 node.attack_phase = HeroAttackPlaybackPhase::None;
                 node.attack_phase_remaining = 0.0;
                 node.attack_backswing_remaining = 0.0;
             }
         }
+    }
+
+    fn choose_hero_idle_action(
+        &mut self,
+        entity_id: u32,
+        render: &sim_runner::HeroRenderSnapshot,
+    ) -> String {
+        let candidates: Vec<&str> = render
+            .animations
+            .iter()
+            .filter(|binding| is_hero_idle_action(&binding.action) && binding.loop_animation)
+            .map(|binding| binding.action.as_str())
+            .collect();
+        if candidates.is_empty() {
+            return "sniper".to_string();
+        }
+
+        let current_idle = self
+            .hero_model_nodes
+            .get(&entity_id)
+            .and_then(|node| {
+                node.active_action
+                    .as_deref()
+                    .filter(|action| is_hero_idle_action(action))
+                    .map(|action| (action.to_string(), node.idle_cycle_remaining))
+            });
+        if let Some((current, remaining)) = current_idle.as_ref() {
+            if *remaining > 0.0 && candidates.iter().any(|candidate| *candidate == current) {
+                return current.clone();
+            }
+        }
+
+        let Some(node) = self.hero_model_nodes.get_mut(&entity_id) else {
+            return candidates[0].to_string();
+        };
+        node.idle_rng_state = next_idle_rng_state(node.idle_rng_state);
+        let mut index = (node.idle_rng_state as usize) % candidates.len();
+        if candidates.len() > 1 {
+            if let Some((current, _)) = current_idle.as_ref() {
+                if candidates[index] == current {
+                    index = (index + 1) % candidates.len();
+                }
+            }
+        }
+        candidates[index].to_string()
     }
 
     fn start_hero_attack_action(
@@ -6448,10 +6514,24 @@ impl Game {
         let windup_secs = (cue.windup_ms as f32 / 1000.0).max(0.001);
         let backswing_secs = (cue.backswing_ms as f32 / 1000.0).max(0.001);
         let cue_age_secs = cue_age_secs.max(0.0);
+        let repeated_attack = self
+            .hero_model_nodes
+            .get(&entity_id)
+            .and_then(|node| node.last_attack_action.as_deref())
+            .map(|previous| {
+                (previous == "attack" || previous == "critical")
+                    && binding.repeat_start_tick > binding.start_tick
+            })
+            .unwrap_or(false);
+        let visual_start_tick = if repeated_attack {
+            binding.repeat_start_tick
+        } else {
+            binding.start_tick
+        };
         let (phase, start_tick, end_tick, duration_secs, backswing_remaining) =
             if cue_age_secs < windup_secs {
                 let t = (cue_age_secs / windup_secs).clamp(0.0, 1.0);
-                let start_tick = binding.start_tick + (impact_tick - binding.start_tick) * t;
+                let start_tick = visual_start_tick + (impact_tick - visual_start_tick) * t;
                 (
                     HeroAttackPlaybackPhase::Windup,
                     start_tick,
@@ -6486,6 +6566,7 @@ impl Game {
         ) {
             if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
                 node.active_attack_seq = Some(cue.attack_seq);
+                node.last_attack_action = Some(action.to_string());
                 node.pending_attack = None;
                 node.attack_phase = phase;
                 node.attack_phase_remaining = duration_secs;
@@ -6597,7 +6678,9 @@ impl Game {
         }
         node.active_action = None;
         node.active_attack_seq = None;
+        node.last_attack_action = None;
         node.pending_attack = None;
+        node.idle_cycle_remaining = 0.0;
         node.attack_phase = HeroAttackPlaybackPhase::None;
         node.attack_phase_remaining = 0.0;
         node.attack_backswing_remaining = 0.0;
@@ -6669,6 +6752,11 @@ impl Game {
                     active_attack_seq: None,
                     last_attack_action: None,
                     pending_attack: None,
+                    idle_cycle_remaining: 0.0,
+                    idle_rng_state: entity
+                        .entity_id
+                        .wrapping_mul(747_796_405)
+                        .wrapping_add(snapshot_tick),
                     attack_phase: HeroAttackPlaybackPhase::None,
                     attack_phase_remaining: 0.0,
                     attack_backswing_remaining: 0.0,
@@ -6691,6 +6779,16 @@ impl Game {
                     .set_rotation(rotation)
                     .set_scale(Vector3::new(render.scale, render.scale, render.scale));
                 node.one_shot_remaining = (node.one_shot_remaining - dt).max(0.0);
+                if node
+                    .active_action
+                    .as_deref()
+                    .map(is_hero_idle_action)
+                    .unwrap_or(false)
+                {
+                    node.idle_cycle_remaining = (node.idle_cycle_remaining - dt).max(0.0);
+                } else {
+                    node.idle_cycle_remaining = 0.0;
+                }
             }
         }
 
@@ -6751,13 +6849,13 @@ impl Game {
                     .map(|node| node.render_moving)
                     .unwrap_or(render.is_moving);
                 let action = if render_moving {
-                    "move"
+                    "move".to_string()
                 } else if render.sniper_mode {
-                    "sniper"
+                    "sniper".to_string()
                 } else {
-                    "sniper"
+                    self.choose_hero_idle_action(entity.entity_id, render)
                 };
-                self.play_hero_action(scene, entity.entity_id, render, action);
+                self.play_hero_action(scene, entity.entity_id, render, &action);
             }
         }
 
