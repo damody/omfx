@@ -176,8 +176,8 @@ fn run_sim_loop(
     // 字段，不在 ECS 中，正是為了避免借用衝突。更換
     // 具有“Default::default()”（空註冊表）的資源很好，因為
     // 沒有其他任何東西會查詢 ECS 駐留的 ScriptRegistry。
-    let script_registry: omoba_core::scripting::ScriptRegistry =
-        std::mem::take(&mut *world.write_resource::<omoba_core::scripting::ScriptRegistry>());
+    let script_registry: omoba_core::runtime::ScriptRegistry =
+        std::mem::take(&mut *world.write_resource::<omoba_core::runtime::ScriptRegistry>());
 
     info!("sim_runner: dispatcher ready, entering tick loop");
 
@@ -334,7 +334,7 @@ fn run_sim_loop(
         // backend 的 `State::tick` 在 `run_systems` 之後執行相同的操作（請參閱
         // `scripting::run_script_dispatch` 周圍的 backend tick loop
         // 稱呼）。副本需要相同的呼叫來保持 sim 等效。
-        omoba_core::scripting::run_script_dispatch(
+        omoba_core::runtime::run_script_dispatch(
             &mut world,
             &script_registry,
             batch.tick as u64,
