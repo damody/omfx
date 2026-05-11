@@ -2598,12 +2598,8 @@ impl Plugin for Game {
 
         // 階段 3.3：排出鎖定事件並轉送至 sim_runner。
         // - 連線→推送master_seed（解鎖worker的阻塞recv）
-        // - TickBatch → 轉換輸入（omoba_core 原型類型 → omobab 原型
-        // 類型）並作為 TickBatchPayload 推送，以便工作人員推進其
-        // ECS 調度程序一記。兩個板條箱產生相同的
-        // `proto/game.proto` 獨立，所以我們透過 prost 往返
-        // 在邊界處進行編碼/解碼，而不是手動映射每個
-        // 玩家輸入變體。
+        // - TickBatch → 轉換 transport payload 並推送給 sim_runner，
+        // 讓本地 ECS replica 推進一個批次。
         // - StateHash → 僅記錄（階段 3.4 將與
         // sim_runner 用於非同步偵測的本地雜湊）。
         // - 斷開連接 → 記錄。
@@ -8115,7 +8111,7 @@ fn world_to_screen_approx(
     Vector2::new(sx, sy)
 }
 
-/// Ray-casting 點在多邊形內判定（凹/凸皆可）。與 omb/src/util/geometry.rs 同演算法。
+/// Ray-casting 點在多邊形內判定（凹/凸皆可）。與 `omoba-core` geometry helper 同演算法。
 fn point_in_polygon(p: Vector2<f32>, poly: &[Vector2<f32>]) -> bool {
     if poly.len() < 3 {
         return false;
