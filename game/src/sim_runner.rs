@@ -278,6 +278,10 @@ fn run_sim_loop(
 
         dispatcher.dispatch(&world);
         world.maintain();
+        {
+            let mut events = world.write_resource::<omoba_core::runtime::RuntimeEvents>();
+            events.clear();
+        }
 
         // 階段 2.1：drain `PendingTowerSpawnQueue`，與 authoritative runtime
         // 使用相同 tick boundary，讓 TowerPlace input deterministic 地建立 TD tower。
@@ -317,10 +321,6 @@ fn run_sim_loop(
         // GameProcessor::process_outcomes。如果沒有這個，`creep_wave`會產生
         // `Outcome::Creep { cd }` 行堆積在 `Vec<Outcome>` 中，但沒有
         // 實體在本機 sim 中產生 → snapshot.creep 保持 0。
-        // mqtx 是一個接收器（空 Vec）：結果處理程序 `try_send` 並且默默地
-        // 丟棄訊息，它與確定性模擬合約（主機
-        // 擁有電線發射；副本僅用於渲染）。
-        let (sink_tx, _sink_rx) = crossbeam_channel::unbounded::<omoba_core::transport::OutboundMsg>();
         let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
         if let Err(e) = omoba_core::runtime::process_outcomes(&mut world, &mut event_sink) {
             log::warn!("sim_runner: process_outcomes failed: {}", e);
@@ -339,7 +339,6 @@ fn run_sim_loop(
             &script_registry,
             batch.tick as u64,
             omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64)),
-            sink_tx.clone(),
         );
         // 處理推送的任何結果腳本（投射物/損壞/等）。
         let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
