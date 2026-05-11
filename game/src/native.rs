@@ -1095,166 +1095,6 @@ enum ConnectionStatus {
     Failed(String),
 }
 
-/// 嘗試將 omb 後端作為子進程產生。
-/// 擁有後端「Child」和（在 Windows 上）作業物件句柄的 RAII 防護。
-///
-/// 殺死語意：
-/// - **優雅退出**（視窗關閉，Ok 返回，恐慌解除）： `Drop` 運行，調用
-/// `child.kill()` + `child.wait()`。
-/// - **硬殺**（工作管理員、登出、父親崩潰）：Windows 關閉我們所有的
-/// 手柄。因為後端位於 Job 物件中
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，作業系統自動終止它
-/// 當我們的進程結束並且作業句柄隱式關閉時。
-#[derive(Debug)]
-struct BackendGuard {
-    child: Option<std::process::Child>,
-    #[cfg(windows)]
-    job: Option<windows::Win32::Foundation::HANDLE>,
-}
-
-impl Drop for BackendGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            log::info!(
-                "BackendGuard dropping — killing backend (PID: {})",
-                child.id()
-            );
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        #[cfg(windows)]
-        {
-            if let Some(job) = self.job.take() {
-                // 關閉作業的最後一個句柄會觸發 KILL_ON_JOB_CLOSE，
-                // 這會殺死內部任何仍然活動的進程。
-                use windows::Win32::Foundation::CloseHandle;
-                unsafe {
-                    let _ = CloseHandle(job);
-                }
-            }
-        }
-    }
-}
-
-/// 將後端產生為子進程，與目前進程的生命週期相關聯。
-/// 如果我們找不到 omb 目錄或生成失敗，則傳回「None」。
-fn spawn_backend() -> Option<BackendGuard> {
-    use std::path::PathBuf;
-    use std::process::{Command, Stdio};
-
-    // 找到相對於cwd的omb目錄
-    let candidates = [
-        PathBuf::from("omb"),       // cwd = D:\omoba
-        PathBuf::from("../omb"),    // cwd = D:\omoba\omfx
-        PathBuf::from("../../omb"), // cwd = D:\omoba\omfx\executor
-    ];
-
-    let omb_dir = candidates.iter().find(|p| p.join("game.toml").exists());
-    let omb_dir = match omb_dir {
-        Some(d) => d.clone(),
-        None => {
-            log::warn!("Cannot find omb directory (no game.toml found), skipping backend spawn");
-            return None;
-        }
-    };
-
-    log::info!("Auto-starting backend from {:?}...", omb_dir);
-
-    // 首先嘗試預先建置的二進位文件
-    let exe_path = omb_dir.join("target/debug/omobab.exe");
-    let result = if exe_path.exists() {
-        Command::new(&exe_path)
-            .current_dir(&omb_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-    } else {
-        log::info!("Pre-built binary not found, falling back to cargo run...");
-        Command::new("cargo")
-            .args(["run", "--features", "kcp"])
-            .current_dir(&omb_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-    };
-
-    let child = match result {
-        Ok(c) => {
-            log::info!("Backend process spawned (PID: {})", c.id());
-            c
-        }
-        Err(e) => {
-            log::error!("Failed to spawn backend: {}", e);
-            return None;
-        }
-    };
-
-    #[cfg(windows)]
-    let job = create_job_and_attach(&child);
-    #[cfg(windows)]
-    {
-        Some(BackendGuard {
-            child: Some(child),
-            job,
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        Some(BackendGuard { child: Some(child) })
-    }
-}
-
-/// 使用 KILL_ON_JOB_CLOSE 建立一個 Windows 作業對象，附加給定的子對象，
-/// 並傳回作業句柄。失敗時，返回“None”——“BackendGuard”
-/// 僅退回到“Drop”時殺死。
-#[cfg(windows)]
-fn create_job_and_attach(
-    child: &std::process::Child,
-) -> Option<windows::Win32::Foundation::HANDLE> {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-
-    unsafe {
-        let job = match CreateJobObjectW(None, None) {
-            Ok(h) if !h.is_invalid() => h,
-            _ => {
-                log::warn!("CreateJobObjectW failed; falling back to Drop-only cleanup");
-                return None;
-            }
-        };
-
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-        if SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .is_err()
-        {
-            log::warn!("SetInformationJobObject failed; job won't auto-kill children");
-        }
-
-        let child_handle = HANDLE(child.as_raw_handle());
-        if AssignProcessToJobObject(job, child_handle).is_err() {
-            log::warn!("AssignProcessToJobObject failed; backend not tied to our lifetime");
-        } else {
-            log::info!("Backend process attached to Job Object (auto-kill on exit)");
-        }
-
-        Some(job)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 遊戲插件
 // ---------------------------------------------------------------------------
@@ -1654,14 +1494,6 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     frame_profile: FrameProfile,
-
-    // --- 後端流程 ---
-    /// 掉落 → 殺死後端。在整個遊戲生命週期內保持，以便任何退出
-    /// 路徑（在 Windows 上透過作業對象正常、緊急、強制關閉）帶來
-    /// 後端與我們一起關閉。
-    #[visit(skip)]
-    #[reflect(hidden)]
-    backend_guard: Option<BackendGuard>,
 
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2524,9 +2356,6 @@ impl Plugin for Game {
         // Inventory 初始 6 格
         self.hero_state.inventory = vec![None; 6];
 
-        // 自動啟動後端（透過 BackendGuard + Job 物件與我們的生命週期綁定）
-        self.backend_guard = spawn_backend();
-
         // 網路初始化
         let server_addr =
             std::env::var("OMB_KCP_ADDR").unwrap_or_else(|_| "127.0.0.1:50061".to_string());
@@ -2562,9 +2391,9 @@ impl Plugin for Game {
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("D:/omoba/omb/scripts/base_content.dll"));
-            // omobab::ServerSetting::default 透過相對路徑讀取“game.toml”
-            // （適用於帶有 cwd=omb 的 omobab.exe）。 omfx 進程 cwd 在其他地方，
-            // 所以將lazy_static指向絕對路徑。
+            // Runtime config loader reads `game.toml` through the shared
+            // `OMB_GAME_TOML` override; omfx usually has a different cwd than
+            // the backend launcher.
             if std::env::var("OMB_GAME_TOML").is_err() {
                 std::env::set_var("OMB_GAME_TOML", "D:/omoba/omb/game.toml");
             }
@@ -2632,11 +2461,6 @@ impl Plugin for Game {
         // 退出（是否仍被 master_seed_rx.recv() 或
         // 在 tick_input_rx.recv() 上循環。
         self.sim_runner_handle = None;
-
-        // 刪除後端防護 — 它的 Drop impl 會殺死子程序並關閉作業物件。
-        // （如果 Drop 不運行，例如在硬終止時，作業系統仍會終止後端
-        // 感謝 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE。 ）
-        self.backend_guard = None;
 
         Ok(())
     }
