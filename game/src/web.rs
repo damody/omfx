@@ -12,6 +12,7 @@ use fyrox::{
         reflect::prelude::*,
         visitor::prelude::*,
     },
+    event::{ElementState, Event as FyroxEvent, WindowEvent},
     gui::{
         brush::Brush,
         text::{TextBuilder, TextMessage},
@@ -28,10 +29,13 @@ use fyrox::{
     },
 };
 use js_sys::{ArrayBuffer, Uint8Array};
-use omoba_core::game_proto::{GameStart, JoinRequest, JoinRole, StateHash, SubscribeRequest, TickBatch};
+use fyrox::keyboard::{KeyCode, PhysicalKey};
+use omoba_core::game_proto::{
+    GameStart, InputSubmit, JoinRequest, JoinRole, StateHash, SubscribeRequest, TickBatch,
+};
 use prost::Message;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, Response, WebSocket};
+use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event as WebEvent, MessageEvent, Response, WebSocket};
 
 pub use fyrox;
 
@@ -108,6 +112,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ws_client: Option<WebSocketClient>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    input_id_counter: u32,
 }
 
 impl Default for Game {
@@ -118,6 +125,7 @@ impl Default for Game {
             status: Rc::new(RefCell::new(WebClientStatus::default())),
             last_status_text: String::new(),
             ws_client: None,
+            input_id_counter: 1,
         }
     }
 }
@@ -214,6 +222,54 @@ impl Plugin for Game {
         }
         Ok(())
     }
+
+    fn on_os_event(&mut self, event: &FyroxEvent<()>, _context: PluginContext) -> GameResult {
+        let FyroxEvent::WindowEvent {
+            event:
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                },
+            ..
+        } = event else {
+            return Ok(());
+        };
+        if key_event.state != ElementState::Pressed {
+            return Ok(());
+        }
+        let PhysicalKey::Code(KeyCode::Space) = key_event.physical_key else {
+            return Ok(());
+        };
+
+        let (player_id, latest_tick) = {
+            let state = self.status.borrow();
+            let Some(player_id) = state.player_id else {
+                drop(state);
+                set_status(&self.status, "press Space ignored: not joined yet");
+                return Ok(());
+            };
+            (player_id, state.latest_tick)
+        };
+        let input_id = self.input_id_counter;
+        self.input_id_counter = self.input_id_counter.wrapping_add(1).max(1);
+        let target_tick = latest_tick.saturating_add(2);
+        match self
+            .ws_client
+            .as_ref()
+            .map(|client| client.send_input_submit(player_id, target_tick, input_id))
+        {
+            Some(Ok(())) => set_status(
+                &self.status,
+                format!("sent Space InputSubmit id={input_id} target_tick={target_tick}"),
+            ),
+            Some(Err(message)) => {
+                let mut state = self.status.borrow_mut();
+                state.errors += 1;
+                state.line = format!("InputSubmit failed: {message}");
+            }
+            None => set_status(&self.status, "press Space ignored: WebSocket unavailable"),
+        }
+        Ok(())
+    }
 }
 
 impl WebSocketClient {
@@ -226,7 +282,7 @@ impl WebSocketClient {
         let player_name = configured_player_name();
         let on_open_socket = socket.clone();
         let on_open_status = status.clone();
-        let on_open = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let on_open = Closure::<dyn FnMut(WebEvent)>::new(move |_event: WebEvent| {
             set_status(&on_open_status, "WebSocket open; sending SubscribeRequest + JoinRequest");
             if let Err(message) = send_initial_join(&on_open_socket, &player_name) {
                 let mut state = on_open_status.borrow_mut();
@@ -278,6 +334,19 @@ impl WebSocketClient {
             _on_error: on_error,
             _on_close: on_close,
         })
+    }
+
+    fn send_input_submit(&self, player_id: u32, target_tick: u32, input_id: u32) -> Result<(), String> {
+        send_proto(
+            &self._socket,
+            TAG_INPUT_SUBMIT,
+            &InputSubmit {
+                player_id,
+                target_tick,
+                input: None,
+                input_id,
+            },
+        )
     }
 }
 
