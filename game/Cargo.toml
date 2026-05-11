@@ -28,9 +28,6 @@ omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }
 # u32 通過 `omoba_template_ids::tower_by_name`。
 omoba-template-ids = { path = "../../omoba-template-ids" }
 failure = "0.1.8"
-# 階段 3.3：需透過 omoba_core / 重新編碼 PlayerInput
-# omobab 原型邊界位於鎖步 → sim_runner 橋。
-prost = "0.13"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 omoba-core = { path = "../../omoba-core", default-features = false, features = ["game-proto"] }

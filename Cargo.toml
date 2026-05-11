@@ -20,6 +20,15 @@ fyrox-impl = { path = "../third_party/fyrox-impl-1.0.1" }
 # linking.
 [profile.dev-hot-reload]
 inherits = "dev"
+
+[profile.release]
+# Release artifacts should not emit Windows PDB / split debug files.
+debug = "none"
+split-debuginfo = "off"
+
+[profile.release.build-override]
+debug = "none"
+
 [profile.release-hot-reload]
 inherits = "release"
 

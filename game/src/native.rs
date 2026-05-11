@@ -71,30 +71,6 @@ pub(crate) mod sprite_resources;
 
 const ABILITY_ICON_FALLBACK_PATH: &str = "data/ability_icons/ability_default_placeholder.png";
 
-/// 兩種不同的「PlayerInput」 Rust 類型之間的橋樑：omoba_core's
-/// kcp 用戶端使用自己的 prost 產生的 `proto/game.proto` 副本，
-/// 而 omobab (omb-as-lib) 將相同的原型產生為單獨的
-/// 板條箱本地模組。它們的線路格式相同，因此我們可以往返
-/// 透過邊界處的 prost 編碼/解碼，而不是手動映射每個
-/// 玩家輸入其中一個變體。
-fn convert_player_input(
-    src: &omoba_core::kcp::game_proto::PlayerInput,
-) -> Option<sim_runner::PlayerInput> {
-    use prost::Message;
-    let mut buf = Vec::with_capacity(src.encoded_len());
-    if let Err(e) = src.encode(&mut buf) {
-        log::error!("[lockstep] convert_player_input encode failed: {}", e);
-        return None;
-    }
-    match sim_runner::PlayerInput::decode(buf.as_slice()) {
-        Ok(out) => Some(out),
-        Err(e) => {
-            log::error!("[lockstep] convert_player_input decode failed: {}", e);
-            None
-        }
-    }
-}
-
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
@@ -2855,24 +2831,19 @@ impl Plugin for Game {
                                 forwarded_pending_input_ids.push(input.input_id);
                             }
                         }
-                        // 橋接 omoba_core 的 PlayerInput 類型 → omobab 的
-                        // 透過 prost 重新編碼的 PlayerInput 類型。他們是
-                        // 相同的電線格式但不同的 Rust 類型。
                         let converted: Vec<sim_runner::TickBatchInput> = inputs
                             .into_iter()
-                            .filter_map(|input| {
-                                convert_player_input(&input.input).map(|out| {
-                                    sim_runner::TickBatchInput {
-                                        player_id: input.player_id,
-                                        input: out,
-                                        input_id: input.input_id,
-                                        server_receive_tick: input.server_receive_tick,
-                                        server_drain_tick: input.server_drain_tick,
-                                        server_queue_us: input.server_queue_us,
-                                        client_receive_us: input.client_receive_us,
-                                        game_forward_us,
-                                    }
-                                })
+                            .map(|input| {
+                                sim_runner::TickBatchInput {
+                                    player_id: input.player_id,
+                                    input: input.input,
+                                    input_id: input.input_id,
+                                    server_receive_tick: input.server_receive_tick,
+                                    server_drain_tick: input.server_drain_tick,
+                                    server_queue_us: input.server_queue_us,
+                                    client_receive_us: input.client_receive_us,
+                                    game_forward_us,
+                                }
                             })
                             .collect();
                         let payload = sim_runner::TickBatchPayload {

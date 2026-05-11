@@ -26,11 +26,7 @@ use omoba_core::lockstep_timing::{
 
 use specs::{Join, World, WorldExt};
 
-// 從 omobab so feeders 重新匯出第 2 階段 PlayerInput 原型類型
-// （階段3.3中的lockstep_client.rs）和sim_runner共享相同的
-// 具體類型。 omobab 從 prost 產生的模組重新匯出它
-// 在“lockstep::PlayerInput”下。
-pub use omobab::lockstep::PlayerInput;
+pub use omoba_core::runtime::PlayerInput;
 
 fn wall_clock_us() -> u64 {
     SystemTime::now()
@@ -707,34 +703,28 @@ fn run_sim_loop(
         dispatcher.dispatch(&world);
         world.maintain();
 
-        // 階段 2.1：耗盡 `PendingTowerSpawnQueue` 填充
-        // 上述調度期間的`player_input_tick::Sys`。鏡子都一樣
-        // 呼叫 omb 的 `state::core::tick` 以便主機 + 副本產生 TD 塔
-        // 確定性地來自“PlayerInputEnum::TowerPlace”輸入。
+        // 階段 2.1：drain `PendingTowerSpawnQueue`，與 authoritative runtime
+        // 使用相同 tick boundary，讓 TowerPlace input deterministic 地建立 TD tower。
         omobab::comp::GameProcessor::drain_pending_tower_spawns(&mut world);
         world.maintain();
 
-        // 階段 2.2：從 TowerSell 輸入中排出「PendingTowerSellQueue」。
-        // 鏡像 omb 的 `state::core::tick`。退款+實體刪除完成於
-        // 在主機和副本上同步，以便快照保持一致。
+        // 階段 2.2：drain TowerSell input queue。退款與 entity removal 必須在
+        // authoritative/local replica 同步執行，讓 snapshots 保持一致。
         omobab::comp::GameProcessor::drain_pending_tower_sells(&mut world);
         world.maintain();
 
-        // 階段 2.3：從 TowerUpgrade 排出 `PendingTowerUpgradeQueue`
-        // 輸入。鏡像 omb 的 `state::core::tick`。金扣+
-        // Upgrade_levels 增量 + BuffStore stat-mod 添加需要運行
-        // 主機和副本同步，因此快照保持一致。
+        // 階段 2.3：drain TowerUpgrade input queue。扣金、upgrade_levels 增量與
+        // BuffStore stat-mod 必須在 authoritative/local replica 同步執行。
         omobab::comp::GameProcessor::drain_pending_tower_upgrades(&mut world);
         world.maintain();
 
-        // 階段 2.4：從 ItemUse 輸入排出「PendingItemUseQueue」。
-        // 鏡像 omb 的 `state::core::tick`。庫存冷卻時間+C屬性
-        // (HP / msd) 突變需要在主機和副本上同步運作。
+        // 階段 2.4：drain ItemUse input queue。庫存冷卻與 CProperty
+        // (HP / msd) mutation 需在 authoritative/local replica 同步執行。
         omobab::comp::GameProcessor::drain_pending_item_uses(&mut world);
         world.maintain();
 
         // AbilityUpgrade：消耗 skill point 並在 script dispatch 前排入 SkillLearn，
-        // 與 omb 的 `state::core::tick` 使用相同 boundary。
+        // 與 authoritative runtime 使用相同 boundary。
         omobab::comp::GameProcessor::drain_pending_ability_upgrades(&mut world);
         world.maintain();
 
@@ -743,8 +733,7 @@ fn run_sim_loop(
         omobab::comp::GameProcessor::drain_pending_ability_casts(&mut world);
         world.maintain();
 
-        // MoveTo (右鍵移動): drain `PendingMoveQueue` — writes MoveTarget on
-        // 玩家英雄。鏡像 omb 的 `state::core::tick`。
+        // MoveTo (右鍵移動): drain `PendingMoveQueue`，在玩家英雄寫入 MoveTarget。
         omobab::comp::GameProcessor::drain_pending_moves(&mut world);
         world.maintain();
 
@@ -996,8 +985,8 @@ fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Err
 }
 
 fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<TickBatchInput>) {
-    // 階段 3.4：將鎖步 TickBatch 輸入寫入主機的
-    // `PendingPlayerInputs` 資源，所以 omb 的 `tick::player_input_tick::Sys`
+    // 階段 3.4：將鎖步 TickBatch 輸入寫入 shared runtime 的
+    // `PendingPlayerInputs` 資源，所以 `tick::player_input_tick::Sys`
     // 可以在調度程序運行開始時耗盡它們。
     //
     // 替換資源圖批發（鎖步合約：最多一個
