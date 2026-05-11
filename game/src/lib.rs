@@ -620,6 +620,7 @@ struct HeroModelRender {
     action_resources_requested: HashSet<String>,
     active_action: Option<String>,
     active_attack_seq: Option<u32>,
+    last_attack_action: Option<String>,
     pending_attack: Option<HeroPendingAttackCue>,
     attack_phase: HeroAttackPlaybackPhase,
     attack_phase_remaining: f32,
@@ -6412,6 +6413,7 @@ impl Game {
         ) {
             if let Some(node) = self.hero_model_nodes.get_mut(&entity_id) {
                 node.active_attack_seq = None;
+                node.last_attack_action = None;
                 node.attack_phase = HeroAttackPlaybackPhase::None;
                 node.attack_phase_remaining = 0.0;
                 node.attack_backswing_remaining = 0.0;
@@ -6665,6 +6667,7 @@ impl Game {
                     action_resources_requested: HashSet::new(),
                     active_action: None,
                     active_attack_seq: None,
+                    last_attack_action: None,
                     pending_attack: None,
                     attack_phase: HeroAttackPlaybackPhase::None,
                     attack_phase_remaining: 0.0,

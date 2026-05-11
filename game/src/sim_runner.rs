@@ -125,6 +125,7 @@ fn hero_render_snapshot_for_unit_id(
                 source: binding.source.to_string(),
                 start_tick: binding.start_tick.to_f32_for_render(),
                 end_tick: binding.end_tick.to_f32_for_render(),
+                repeat_start_tick: binding.repeat_start_tick.to_f32_for_render(),
                 impact_tick: binding
                     .has_impact_tick
                     .then(|| binding.impact_tick.to_f32_for_render()),
@@ -347,6 +348,7 @@ pub struct HeroAnimationBindingSnapshot {
     pub source: String,
     pub start_tick: f32,
     pub end_tick: f32,
+    pub repeat_start_tick: f32,
     pub impact_tick: Option<f32>,
     pub loop_animation: bool,
 }
