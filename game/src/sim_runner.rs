@@ -48,13 +48,12 @@ pub struct TickBatchInput {
 }
 
 pub use omoba_core::runtime::{
-    buff_remaining_secs_for_snapshot, build_ability_def_snapshots,
-    build_tower_template_snapshots, build_tower_upgrade_def_snapshots, extract_snapshot,
-    hero_render_snapshot_for_unit_id, retain_recent_render_fx, AbilityDefSnapshot,
-    AppliedInputMeta, AttackCancelFx, AttackPhaseFx, BlockedRegionSnapshot, BuffSnapshot,
-    EntityKind, EntityRenderData, ExplosionFx, HeroRenderSnapshot, HeroStatsExt,
-    HeroAnimationBindingSnapshot, HeroAnimationSourceSnapshot, SimWorldSnapshot,
-    TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot,
+    buff_remaining_secs_for_snapshot, build_ability_def_snapshots, build_tower_template_snapshots,
+    build_tower_upgrade_def_snapshots, extract_snapshot, hero_render_snapshot_for_unit_id,
+    retain_recent_render_fx, AbilityDefSnapshot, AppliedInputMeta, AttackCancelFx, AttackPhaseFx,
+    BlockedRegionSnapshot, BuffSnapshot, EntityKind, EntityRenderData, ExplosionFx,
+    HeroAnimationBindingSnapshot, HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt,
+    SimWorldSnapshot, TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot,
     TowerRenderAnimationSnapshot, TowerRenderPointSnapshot, TowerTemplateSnapshot,
     TowerUpgradeDefSnapshot,
 };
@@ -232,7 +231,10 @@ fn run_sim_loop(
             &mut tower_upgrades_arc,
             &batch,
         ) {
-            error!("sim_runner: DEV Lua reload failed before tick {}: {}", batch.tick, err);
+            error!(
+                "sim_runner: DEV Lua reload failed before tick {}: {}",
+                batch.tick, err
+            );
             publish_dev_lua_reload_error(&state_out, &batch, err);
             break;
         }
@@ -272,7 +274,9 @@ fn run_sim_loop(
         // 如果沒有這些，本地 sim 會有 Tick 前進，但時間停留在 0，
         // 這使得 `creep_wave` 看到 `totaltime=0` 並且永遠不會產生 — 完全正確
         // 為什麼 Start Round 會觸發（is_running 翻轉）但沒有小兵出現。
-        world.write_resource::<omoba_core::comp::resources::Tick>().0 = batch.tick as u64;
+        world
+            .write_resource::<omoba_core::comp::resources::Tick>()
+            .0 = batch.tick as u64;
         {
             let mut t = world.write_resource::<omoba_core::comp::resources::Time>();
             t.0 = ticks_to_seconds_f64(batch.tick);
@@ -370,7 +374,8 @@ fn run_sim_loop(
         // TD 塔範本註冊表 — 相同的惰性建置模式。人口由
         // 每個塔腳本在腳本載入時的「tower_metadata()」。
         if tower_templates_arc.is_empty() {
-            let reg = world.read_resource::<omoba_core::comp::tower_registry::TowerTemplateRegistry>();
+            let reg =
+                world.read_resource::<omoba_core::comp::tower_registry::TowerTemplateRegistry>();
             if !reg.is_empty() {
                 tower_templates_arc = std::sync::Arc::new(build_tower_template_snapshots(&reg));
                 log::info!(
@@ -480,12 +485,13 @@ fn init_world(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| err_msg("scene_path does not end in a valid story id"))?;
-    let campaign_data = omoba_core::ue4::import_campaign::load_generated(story_id).map_err(|e| {
-        err_msg(format!(
-            "CampaignData::load_generated({}) failed: {}",
-            story_id, e
-        ))
-    })?;
+    let campaign_data =
+        omoba_core::ue4::import_campaign::load_generated(story_id).map_err(|e| {
+            err_msg(format!(
+                "CampaignData::load_generated({}) failed: {}",
+                story_id, e
+            ))
+        })?;
     let creep_wave_data = campaign_data.map.clone();
     let mut world = omoba_core::runtime::create_world_from_loaded_content(
         campaign_data,
@@ -522,7 +528,9 @@ fn dev_lua_reload_action(
         ));
     }
     match (current_generation, current_hash) {
-        (Some(generation), Some(hash)) if generation == target_generation && hash == target_hash => {
+        (Some(generation), Some(hash))
+            if generation == target_generation && hash == target_hash =>
+        {
             Ok(DevLuaReloadAction::Noop)
         }
         (Some(generation), Some(hash)) if generation == target_generation => Err(format!(
@@ -573,7 +581,12 @@ fn ensure_dev_lua_content_for_batch(
         creep_wave_data,
         script_registry,
     );
-    rebuild_metadata_arcs(world, abilities_arc, tower_templates_arc, tower_upgrades_arc);
+    rebuild_metadata_arcs(
+        world,
+        abilities_arc,
+        tower_templates_arc,
+        tower_upgrades_arc,
+    );
     info!(
         "sim_runner: DEV Lua content reloaded generation={} hash={} script_modules={}",
         committed_generation,
@@ -605,10 +618,11 @@ fn rebuild_metadata_arcs(
 ) {
     let ability_reg = world.read_resource::<omoba_core::ability_runtime::AbilityRegistry>();
     *abilities_arc = std::sync::Arc::new(build_ability_def_snapshots(&ability_reg));
-    let tower_reg = world.read_resource::<omoba_core::comp::tower_registry::TowerTemplateRegistry>();
+    let tower_reg =
+        world.read_resource::<omoba_core::comp::tower_registry::TowerTemplateRegistry>();
     *tower_templates_arc = std::sync::Arc::new(build_tower_template_snapshots(&tower_reg));
-    let upgrade_reg = world
-        .read_resource::<omoba_core::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
+    let upgrade_reg =
+        world.read_resource::<omoba_core::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
     *tower_upgrades_arc = std::sync::Arc::new(build_tower_upgrade_def_snapshots(&upgrade_reg));
 }
 
@@ -770,7 +784,9 @@ mod tests {
         assert!(render.is_moving);
         assert!(render.sniper_mode);
 
-        for required in ["idle", "idle_2", "idle_3", "move", "attack", "critical", "sniper"] {
+        for required in [
+            "idle", "idle_2", "idle_3", "move", "attack", "critical", "sniper",
+        ] {
             assert!(render
                 .animation_sources
                 .iter()
@@ -803,7 +819,9 @@ mod tests {
         );
         assert_eq!(
             attack_source.timeline_offset_ticks,
-            generated_attack_source.timeline_offset_ticks.to_f32_for_render()
+            generated_attack_source
+                .timeline_offset_ticks
+                .to_f32_for_render()
         );
 
         let critical = render

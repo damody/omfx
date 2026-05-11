@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use fyrox::core::wasm_bindgen::{closure::Closure, JsCast};
+use fyrox::keyboard::{KeyCode, PhysicalKey};
 use fyrox::{
     core::{
         algebra::{Vector2, Vector3},
@@ -29,13 +30,14 @@ use fyrox::{
     },
 };
 use js_sys::{ArrayBuffer, Uint8Array};
-use fyrox::keyboard::{KeyCode, PhysicalKey};
 use omoba_core::game_proto::{
     GameStart, InputSubmit, JoinRequest, JoinRole, StateHash, SubscribeRequest, TickBatch,
 };
 use prost::Message;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event as WebEvent, MessageEvent, Response, WebSocket};
+use web_sys::{
+    BinaryType, CloseEvent, ErrorEvent, Event as WebEvent, MessageEvent, Response, WebSocket,
+};
 
 pub use fyrox;
 
@@ -148,15 +150,15 @@ impl Plugin for Game {
     fn init(&mut self, _scene_path: Option<&str>, context: PluginContext) -> GameResult {
         let mut scene = Scene::new();
         scene.set_skybox(None);
-        scene.rendering_options.set_value_and_mark_modified(
-            fyrox::scene::SceneRenderingOptions {
+        scene
+            .rendering_options
+            .set_value_and_mark_modified(fyrox::scene::SceneRenderingOptions {
                 clear_color: Some(Color::from_rgba(18, 28, 38, 255)),
                 ambient_lighting_color: Color::WHITE,
                 environment_lighting_source: EnvironmentLightingSource::AmbientColor,
                 environment_lighting_brightness: 1.0,
                 ..Default::default()
-            },
-        );
+            });
 
         CameraBuilder::new(
             BaseBuilder::new().with_local_transform(
@@ -226,12 +228,12 @@ impl Plugin for Game {
 
     fn on_os_event(&mut self, event: &FyroxEvent<()>, _context: PluginContext) -> GameResult {
         let FyroxEvent::WindowEvent {
-            event:
-                WindowEvent::KeyboardInput {
-                    event: key_event, ..
-                },
+            event: WindowEvent::KeyboardInput {
+                event: key_event, ..
+            },
             ..
-        } = event else {
+        } = event
+        else {
             return Ok(());
         };
         if key_event.state != ElementState::Pressed {
@@ -284,7 +286,10 @@ impl WebSocketClient {
         let on_open_socket = socket.clone();
         let on_open_status = status.clone();
         let on_open = Closure::<dyn FnMut(WebEvent)>::new(move |_event: WebEvent| {
-            set_status(&on_open_status, "WebSocket open; sending SubscribeRequest + JoinRequest");
+            set_status(
+                &on_open_status,
+                "WebSocket open; sending SubscribeRequest + JoinRequest",
+            );
             if let Err(message) = send_initial_join(&on_open_socket, &player_name) {
                 let mut state = on_open_status.borrow_mut();
                 state.errors += 1;
@@ -323,7 +328,11 @@ impl WebSocketClient {
         let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
             let mut state = on_close_status.borrow_mut();
             state.connected = false;
-            state.line = format!("WebSocket closed: code={} reason={}", event.code(), event.reason());
+            state.line = format!(
+                "WebSocket closed: code={} reason={}",
+                event.code(),
+                event.reason()
+            );
             console_log(&state.line);
         });
         socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -337,7 +346,12 @@ impl WebSocketClient {
         })
     }
 
-    fn send_input_submit(&self, player_id: u32, target_tick: u32, input_id: u32) -> Result<(), String> {
+    fn send_input_submit(
+        &self,
+        player_id: u32,
+        target_tick: u32,
+        input_id: u32,
+    ) -> Result<(), String> {
         send_proto(
             &self._socket,
             TAG_INPUT_SUBMIT,
@@ -403,7 +417,10 @@ fn handle_frame(status: &Rc<RefCell<WebClientStatus>>, tag: u8, payload: &[u8]) 
                 let mut state = status.borrow_mut();
                 state.connected = true;
                 state.state_hashes += 1;
-                state.line = format!("received StateHash tick={} hash=0x{:016x}", hash.tick, hash.hash);
+                state.line = format!(
+                    "received StateHash tick={} hash=0x{:016x}",
+                    hash.tick, hash.hash
+                );
             }
             Err(e) => record_decode_error(status, "StateHash", e),
         },
@@ -452,7 +469,9 @@ fn record_decode_error(status: &Rc<RefCell<WebClientStatus>>, ty: &str, e: prost
 
 fn send_proto<M: Message>(socket: &WebSocket, tag: u8, msg: &M) -> Result<(), String> {
     let frame = build_frame(tag, &msg.encode_to_vec());
-    socket.send_with_u8_array(&frame).map_err(js_error_to_string)
+    socket
+        .send_with_u8_array(&frame)
+        .map_err(js_error_to_string)
 }
 
 fn build_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
@@ -505,10 +524,7 @@ fn probe_required_asset(path: &'static str, status: Rc<RefCell<WebClientStatus>>
                 Ok(response) => {
                     let mut state = status.borrow_mut();
                     state.errors += 1;
-                    state.asset_status = format!(
-                        "missing: {path} (HTTP {})",
-                        response.status()
-                    );
+                    state.asset_status = format!("missing: {path} (HTTP {})", response.status());
                 }
                 Err(_) => {
                     let mut state = status.borrow_mut();

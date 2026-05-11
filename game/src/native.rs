@@ -6,6 +6,7 @@
 
 use fyrox::graph::prelude::*;
 use fyrox::{
+    asset::manager::ResourceManager,
     core::{
         algebra::{UnitQuaternion, Vector2, Vector3},
         color::Color,
@@ -25,7 +26,6 @@ use fyrox::{
     },
     material::{Material, MaterialResource},
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
-    asset::manager::ResourceManager,
     resource::{
         model::{Model, ModelResource, ModelResourceExtension},
         texture::{
@@ -940,8 +940,7 @@ fn disable_animation_player(scene: &mut Scene, player: Handle<Node>) {
     if !scene.graph.is_valid_handle(player) {
         return;
     }
-    if let Some(player) = scene.graph[player]
-        .cast_mut::<fyrox::scene::animation::AnimationPlayer>()
+    if let Some(player) = scene.graph[player].cast_mut::<fyrox::scene::animation::AnimationPlayer>()
     {
         for animation in player.animations_mut().get_value_mut_silent().iter_mut() {
             animation.set_enabled(false);
@@ -967,8 +966,7 @@ fn select_retargeted_animation_by_duration(
     handles: &[Handle<Animation>],
     expected_duration_secs: f32,
 ) -> Option<Handle<Animation>> {
-    let player = scene.graph[player]
-        .cast::<fyrox::scene::animation::AnimationPlayer>()?;
+    let player = scene.graph[player].cast::<fyrox::scene::animation::AnimationPlayer>()?;
     let animations = player.animations().get_value_ref();
     handles.iter().copied().min_by(|a, b| {
         let a_delta = animations
@@ -2705,17 +2703,15 @@ impl Plugin for Game {
                         }
                         let converted: Vec<sim_runner::TickBatchInput> = inputs
                             .into_iter()
-                            .map(|input| {
-                                sim_runner::TickBatchInput {
-                                    player_id: input.player_id,
-                                    input: input.input,
-                                    input_id: input.input_id,
-                                    server_receive_tick: input.server_receive_tick,
-                                    server_drain_tick: input.server_drain_tick,
-                                    server_queue_us: input.server_queue_us,
-                                    client_receive_us: input.client_receive_us,
-                                    game_forward_us,
-                                }
+                            .map(|input| sim_runner::TickBatchInput {
+                                player_id: input.player_id,
+                                input: input.input,
+                                input_id: input.input_id,
+                                server_receive_tick: input.server_receive_tick,
+                                server_drain_tick: input.server_drain_tick,
+                                server_queue_us: input.server_queue_us,
+                                client_receive_us: input.client_receive_us,
+                                game_forward_us,
                             })
                             .collect();
                         let payload = sim_runner::TickBatchPayload {
@@ -2770,9 +2766,14 @@ impl Plugin for Game {
         // despawn，退休 NetworkBridge GameEvent → sprite pipeline
         // 下面是 SIM 權威擁有的實體。
         let mut applied_inputs_to_pair: Option<Vec<sim_runner::AppliedInputMeta>> = None;
-        if let Some(ref sim) = self.sim_runner_handle {
+        let sim_state_for_frame = if let Some(ref sim) = self.sim_runner_handle {
             self.wait_for_applied_input_snapshot(sim, &forwarded_pending_input_ids);
-            if let Ok(snapshot) = sim.state.try_lock() {
+            Some(sim.state.clone())
+        } else {
+            None
+        };
+        if let Some(sim_state) = sim_state_for_frame {
+            if let Ok(snapshot) = sim_state.try_lock() {
                 if self.sim_dev_lua_reload_error != snapshot.dev_lua_reload_error {
                     self.sim_dev_lua_reload_error = snapshot.dev_lua_reload_error.clone();
                     if let Some(err) = &self.sim_dev_lua_reload_error {
@@ -5866,12 +5867,7 @@ impl Game {
         self.hero_asset_failures_logged.clear();
     }
 
-    fn invalidate_lua_content_caches(
-        &mut self,
-        scene: &mut Scene,
-        generation: u64,
-        hash: &str,
-    ) {
+    fn invalidate_lua_content_caches(&mut self, scene: &mut Scene, generation: u64, hash: &str) {
         self.clear_lua_metadata_caches();
         let tower_ids: Vec<u32> = self.tower_composites.keys().copied().collect();
         for id in tower_ids {
@@ -6140,7 +6136,10 @@ impl Game {
                 .hero_asset_failures_logged
                 .insert(format!("texture:{texture_path}"))
             {
-                log::warn!("hero 3D texture asset not found or failed to decode: {}", texture_path);
+                log::warn!(
+                    "hero 3D texture asset not found or failed to decode: {}",
+                    texture_path
+                );
             }
             return;
         };
@@ -6181,17 +6180,13 @@ impl Game {
         let _ = node;
 
         for source in missing {
-            let Some(model) = self.request_hero_model_asset(
-                resource_manager,
-                &source.model,
-                "",
-                true,
-            ) else {
+            let Some(model) =
+                self.request_hero_model_asset(resource_manager, &source.model, "", true)
+            else {
                 continue;
             };
             let handles = model.retarget_animations_to_player(root, player, &mut scene.graph);
-            let expected_duration_secs =
-                source.duration_ticks / source.ticks_per_second.max(0.001);
+            let expected_duration_secs = source.duration_ticks / source.ticks_per_second.max(0.001);
             if let Some(handle) = select_retargeted_animation_by_duration(
                 scene,
                 player,
@@ -6340,15 +6335,12 @@ impl Game {
             return "sniper".to_string();
         }
 
-        let current_idle = self
-            .hero_model_nodes
-            .get(&entity_id)
-            .and_then(|node| {
-                node.active_action
-                    .as_deref()
-                    .filter(|action| is_hero_idle_action(action))
-                    .map(|action| (action.to_string(), node.idle_cycle_remaining))
-            });
+        let current_idle = self.hero_model_nodes.get(&entity_id).and_then(|node| {
+            node.active_action
+                .as_deref()
+                .filter(|action| is_hero_idle_action(action))
+                .map(|action| (action.to_string(), node.idle_cycle_remaining))
+        });
         if let Some((current, remaining)) = current_idle.as_ref() {
             if *remaining > 0.0 && candidates.iter().any(|candidate| *candidate == current) {
                 return current.clone();
@@ -6586,12 +6578,9 @@ impl Game {
         if render.render_mode != "model_3d" {
             return false;
         }
-        let Some(model) = self.request_hero_model_asset(
-            resource_manager,
-            &render.model,
-            &render.texture,
-            false,
-        ) else {
+        let Some(model) =
+            self.request_hero_model_asset(resource_manager, &render.model, &render.texture, false)
+        else {
             return false;
         };
         if !self.hero_model_nodes.contains_key(&entity.entity_id) {
@@ -6683,8 +6672,13 @@ impl Game {
         if let Some(cue) = cancel_cue {
             self.cancel_hero_attack_action(scene, entity.entity_id, cue);
         } else if let Some(cue) = attack_cue {
-            let action = if cue.is_critical { "critical" } else { "attack" };
-            let cue_age_secs = ticks_to_seconds_f64(snapshot_tick.saturating_sub(cue.spawn_tick)) as f32;
+            let action = if cue.is_critical {
+                "critical"
+            } else {
+                "attack"
+            };
+            let cue_age_secs =
+                ticks_to_seconds_f64(snapshot_tick.saturating_sub(cue.spawn_tick)) as f32;
             if !self.start_hero_attack_action(
                 scene,
                 entity.entity_id,
@@ -6706,9 +6700,9 @@ impl Game {
                 .get(&entity.entity_id)
                 .and_then(|node| node.pending_attack.clone());
             if let Some(pending) = pending {
-                let cue_age_secs = ticks_to_seconds_f64(
-                    snapshot_tick.saturating_sub(pending.cue.spawn_tick),
-                ) as f32;
+                let cue_age_secs =
+                    ticks_to_seconds_f64(snapshot_tick.saturating_sub(pending.cue.spawn_tick))
+                        as f32;
                 if self.start_hero_attack_action(
                     scene,
                     entity.entity_id,
@@ -7204,13 +7198,14 @@ impl Game {
                 self.remove_hero_model(scene, e.entity_id);
                 false
             };
-            let projectile_initial_spawn_pos = if matches!(e.kind, sim_runner::EntityKind::Projectile) {
-                e.projectile_owner_entity_id
-                    .and_then(|owner_id| self.hero_muzzle_render_pos(scene, owner_id))
-                    .unwrap_or(pos)
-            } else {
-                pos
-            };
+            let projectile_initial_spawn_pos =
+                if matches!(e.kind, sim_runner::EntityKind::Projectile) {
+                    e.projectile_owner_entity_id
+                        .and_then(|owner_id| self.hero_muzzle_render_pos(scene, owner_id))
+                        .unwrap_or(pos)
+                } else {
+                    pos
+                };
 
             // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
             let slots_entry = self.sim_entity_slots.entry(e.entity_id);
@@ -8267,7 +8262,11 @@ mod input_latency_tests {
         }
     }
 
-    fn sample_tower_template(cost: i32, range: f32, base_image: &str) -> sim_runner::TowerTemplateSnapshot {
+    fn sample_tower_template(
+        cost: i32,
+        range: f32,
+        base_image: &str,
+    ) -> sim_runner::TowerTemplateSnapshot {
         sim_runner::TowerTemplateSnapshot {
             unit_id: "tower_dart".to_string(),
             label: "Dart".to_string(),
@@ -8314,8 +8313,10 @@ mod input_latency_tests {
     fn clear_lua_metadata_caches_drops_frontend_asset_keys() {
         let mut game = Game::default();
         let snapshot = sample_tower_template(200, 350.0, "assets/towers/old_base.png");
-        game.td_templates
-            .insert(snapshot.unit_id.clone(), td_template_from_snapshot(&snapshot));
+        game.td_templates.insert(
+            snapshot.unit_id.clone(),
+            td_template_from_snapshot(&snapshot),
+        );
         game.td_template_order.push(snapshot.unit_id.clone());
         game.td_upgrade_defs.insert(
             (snapshot.unit_id.clone(), 1, 1),
