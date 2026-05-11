@@ -90,6 +90,8 @@ pub enum LockstepEvent {
         tick: u32,
         inputs: Vec<LockstepTickInput>,
         server_events: Vec<ServerEvent>,
+        lua_content_generation: u64,
+        lua_content_hash: String,
     },
     InputSubmitted {
         input_id: u32,
@@ -325,6 +327,8 @@ async fn run_client(
                     tick: b.tick,
                     inputs,
                     server_events,
+                    lua_content_generation: b.lua_content_generation,
+                    lua_content_hash: b.lua_content_hash,
                 });
             }
             Ok(Some(LockstepInbound::StateHash {

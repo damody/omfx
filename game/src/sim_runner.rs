@@ -65,6 +65,8 @@ const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 pub struct TickBatchPayload {
     pub tick: u32,
     pub inputs: Vec<TickBatchInput>,
+    pub lua_content_generation: u64,
+    pub lua_content_hash: String,
 }
 
 /// 返回 omfx 遊戲的句柄，以便渲染線程可以讀取快照

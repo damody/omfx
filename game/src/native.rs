@@ -2400,42 +2400,46 @@ impl Plugin for Game {
             if std::env::var("OMB_GAME_TOML").is_err() {
                 std::env::set_var("OMB_GAME_TOML", DEFAULT_GAME_TOML_PATH);
             }
-            // 透過解析同一場景中的 STORY 將 sim_runner 的場景與 omb 的場景同步
-            // 遊戲.toml。否則 sim_runner 載入 MVP_1，而 omb 載入 TD_1
-            // （根據 game.toml STORY）以及兩個 ECS 世界的分歧 — sim_runner
+            // 透過 OMB_STORY/同一份 game.toml 的 STORY 將 sim_runner 的場景與 omb 同步。
+            // 否則 sim_runner 載入 MVP_1，而 omb 載入 TD_1，兩個 ECS 世界分歧，sim_runner
             // 最終以 MVP_1 的訓練敵人/阻擋者結束（~410 個幽靈
             // 實體），而蠕變路徑/波與 omb 不符。
             let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
-                    let toml_path = std::env::var("OMB_GAME_TOML")
-                        .unwrap_or_else(|_| DEFAULT_GAME_TOML_PATH.to_string());
-                    let story = std::fs::read_to_string(&toml_path)
+                    let story = std::env::var("OMB_STORY")
                         .ok()
-                        .and_then(|s| {
-                            s.lines()
-                                .map(str::trim)
-                                .filter(|l| !l.starts_with('#'))
-                                .find_map(|l| {
-                                    let mut parts = l.splitn(2, '=');
-                                    let key = parts.next()?.trim();
-                                    if key != "STORY" {
-                                        return None;
-                                    }
-                                    let val = parts
-                                        .next()?
-                                        .trim()
-                                        .trim_start_matches('"')
-                                        .trim_end_matches('"')
-                                        .to_string();
-                                    Some(val)
-                                })
-                        })
+                        .filter(|s| !s.trim().is_empty())
                         .unwrap_or_else(|| {
-                            log::warn!("game.toml missing STORY; falling back to MVP_1");
-                            "MVP_1".to_string()
+                            let toml_path = std::env::var("OMB_GAME_TOML")
+                                .unwrap_or_else(|_| DEFAULT_GAME_TOML_PATH.to_string());
+                            std::fs::read_to_string(&toml_path)
+                                .ok()
+                                .and_then(|s| {
+                                    s.lines()
+                                        .map(str::trim)
+                                        .filter(|l| !l.starts_with('#'))
+                                        .find_map(|l| {
+                                            let mut parts = l.splitn(2, '=');
+                                            let key = parts.next()?.trim();
+                                            if key != "STORY" {
+                                                return None;
+                                            }
+                                            let val = parts
+                                                .next()?
+                                                .trim()
+                                                .trim_start_matches('"')
+                                                .trim_end_matches('"')
+                                                .to_string();
+                                            Some(val)
+                                        })
+                                })
+                                .unwrap_or_else(|| {
+                                    log::warn!("game.toml missing STORY; falling back to MVP_1");
+                                    "MVP_1".to_string()
+                                })
                         });
-                    log::info!("sim_runner: scene STORY={} (from game.toml)", story);
+                    log::info!("sim_runner: scene STORY={}", story);
                     let data_root = std::env::var("OMB_STORY_DATA_DIR")
                         .unwrap_or_else(|_| DEFAULT_STORY_DATA_DIR.to_string());
                     PathBuf::from(data_root).join(story)
@@ -2628,6 +2632,8 @@ impl Plugin for Game {
                         tick,
                         inputs,
                         server_events,
+                        lua_content_generation,
+                        lua_content_hash,
                     } => {
                         // 階段 4.3：追蹤輸入 target_tick 數學的最新 sim 刻度。
                         self.current_sim_tick = tick;
@@ -2672,6 +2678,8 @@ impl Plugin for Game {
                         let payload = sim_runner::TickBatchPayload {
                             tick,
                             inputs: converted,
+                            lua_content_generation,
+                            lua_content_hash,
                         };
                         if let Err(e) = sim.tick_input_tx.send(payload) {
                             log::error!("[lockstep] failed to forward tick batch: {}", e);
