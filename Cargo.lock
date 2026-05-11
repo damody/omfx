@@ -1985,8 +1985,6 @@ dependencies = [
 [[package]]
 name = "fyrox-impl"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7291a70cf26e78133aeee099958a75e328975359b200070c90a3e806afa74902"
 dependencies = [
  "approx",
  "base64",

@@ -40,6 +40,8 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "BinaryType",
     "CloseEvent",
+    "Document",
+    "Element",
     "ErrorEvent",
     "Event",
     "Location",

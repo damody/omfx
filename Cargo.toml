@@ -12,6 +12,9 @@ default-features = false
 [workspace.dependencies.fyrox-build-tools]
 version = " 1.0.1"
 
+[patch.crates-io]
+fyrox-impl = { path = "../third_party/fyrox-impl-1.0.1" }
+
 # 用於熱重載的單獨建置設定檔。這些設定檔確保建置工件
 # 熱重載將被放入自己的資料夾中並且不會幹擾標準（靜態）
 # linking.

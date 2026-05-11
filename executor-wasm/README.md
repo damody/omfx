@@ -18,10 +18,24 @@ From repo root:
 
 This builds the script DLL, native backend, WebSocket bridge, and WASM executor; stages a static web root; starts `omobab`, `omb-ws-bridge`, and a static HTTP server; then opens the browser.
 
+By default this uses a fast dev WASM build (`wasm-pack build --target web --dev --no-opt`) and does not run `wasm-opt`.
+
+For an optimized release WASM build, use:
+
+```powershell
+.\run_web.bat --release
+```
+
 To build and stage without starting processes:
 
 ```powershell
 .\run_web.bat --build-only
+```
+
+Options can be combined:
+
+```powershell
+.\run_web.bat --build-only --release
 ```
 
 The staged static web root is:

@@ -25,9 +25,11 @@ const moduleGame = import('./pkg/executor_wasm.js').then(({ default: init, main 
 )
 const elementTargetButton = document.querySelector('#button-start')
 const elementMain = document.querySelector('#main')
+const elementStatus = document.querySelector('#omoba-status')
 
 const run = async () => {
   elementTargetButton.removeEventListener('click', run)
+  elementStatus.textContent = 'omfx Web/WASM loading...'
   elementMain.remove()
 
   const context = new AudioContext()

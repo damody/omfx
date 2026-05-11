@@ -218,6 +218,7 @@ impl Plugin for Game {
                 .user_interfaces
                 .first_mut()
                 .send(self.status_text, TextMessage::Text(status_text.clone()));
+            update_dom_status(&status_text);
             self.last_status_text = status_text;
         }
         Ok(())
@@ -539,6 +540,15 @@ fn set_status(status: &Rc<RefCell<WebClientStatus>>, line: impl Into<String>) {
     let line = line.into();
     status.borrow_mut().line = line.clone();
     console_log(&line);
+}
+
+fn update_dom_status(text: &str) {
+    if let Some(element) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("omoba-status"))
+    {
+        element.set_text_content(Some(text));
+    }
 }
 
 fn console_log(message: &str) {
