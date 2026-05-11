@@ -142,19 +142,9 @@ fn run_sim_loop(
     };
     info!("sim_runner: got master_seed=0x{:016x}", master_seed);
 
-    // 將 omb 的腳本載入器指向包含 DLL 的目錄。
-    // `load_scripts_dir` 讀取 `OMB_SCRIPTS_DIR` 環境變數；榮譽來電者
-    // 覆蓋但以其他方式從 DLL 路徑的父級推斷。
-    if std::env::var_os("OMB_SCRIPTS_DIR").is_none() {
-        if let Some(parent) = dll_path.parent() {
-            if let Some(parent_str) = parent.to_str() {
-                std::env::set_var("OMB_SCRIPTS_DIR", parent_str);
-                info!("sim_runner: set OMB_SCRIPTS_DIR={}", parent_str);
-            }
-        }
-    }
+    let script_registry = load_script_registry(&dll_path);
 
-    let mut world = match init_world(&scene_path, master_seed) {
+    let mut world = match init_world(&scene_path, master_seed, script_registry) {
         Ok(w) => w,
         Err(e) => {
             error!("sim_runner: init_world failed: {}", e);
@@ -457,8 +447,22 @@ fn run_sim_loop(
     }
 }
 
-fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Error> {
-    let mut world = omoba_core::runtime::create_world_for_scene(scene_path)?;
+fn load_script_registry(dll_path: &Path) -> omoba_core::runtime::ScriptRegistry {
+    let script_dir = dll_path.parent().unwrap_or_else(|| Path::new("."));
+    info!("sim_runner: loading scripts from {:?}", script_dir);
+    omoba_core::scripting::loader::load_scripts_dir(script_dir)
+}
+
+fn init_world(
+    scene_path: &Path,
+    master_seed: u64,
+    script_registry: omoba_core::runtime::ScriptRegistry,
+) -> Result<World, failure::Error> {
+    let mut world = omoba_core::runtime::create_world_for_scene_with_content(
+        scene_path,
+        omoba_core::runtime::ItemRegistry::default(),
+        script_registry,
+    )?;
     // 使用權威的 MasterSeed 覆蓋預設的 MasterSeed
     // 遊戲開始。必須在第一次調度之前發生。
     world
