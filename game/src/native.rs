@@ -70,6 +70,9 @@ pub(crate) mod sim_runner;
 pub(crate) mod sprite_resources;
 
 const ABILITY_ICON_FALLBACK_PATH: &str = "data/ability_icons/ability_default_placeholder.png";
+const DEFAULT_DLL_PATH: &str = "omb/scripts/base_content.dll";
+const DEFAULT_GAME_TOML_PATH: &str = "omb/game.toml";
+const DEFAULT_STORY_DATA_DIR: &str = "scripts/lua_data";
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
@@ -2390,12 +2393,12 @@ impl Plugin for Game {
             // 取得父目錄並掃描 .dll，因此這對兩者都適用。
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("D:/omoba/omb/scripts/base_content.dll"));
+                .unwrap_or_else(|_| PathBuf::from(DEFAULT_DLL_PATH));
             // Runtime config loader reads `game.toml` through the shared
             // `OMB_GAME_TOML` override; omfx usually has a different cwd than
             // the backend launcher.
             if std::env::var("OMB_GAME_TOML").is_err() {
-                std::env::set_var("OMB_GAME_TOML", "D:/omoba/omb/game.toml");
+                std::env::set_var("OMB_GAME_TOML", DEFAULT_GAME_TOML_PATH);
             }
             // 透過解析同一場景中的 STORY 將 sim_runner 的場景與 omb 的場景同步
             // 遊戲.toml。否則 sim_runner 載入 MVP_1，而 omb 載入 TD_1
@@ -2406,7 +2409,7 @@ impl Plugin for Game {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     let toml_path = std::env::var("OMB_GAME_TOML")
-                        .unwrap_or_else(|_| "D:/omoba/omb/game.toml".to_string());
+                        .unwrap_or_else(|_| DEFAULT_GAME_TOML_PATH.to_string());
                     let story = std::fs::read_to_string(&toml_path)
                         .ok()
                         .and_then(|s| {
@@ -2434,7 +2437,7 @@ impl Plugin for Game {
                         });
                     log::info!("sim_runner: scene STORY={} (from game.toml)", story);
                     let data_root = std::env::var("OMB_STORY_DATA_DIR")
-                        .unwrap_or_else(|_| "D:/omoba/scripts/lua_data".to_string());
+                        .unwrap_or_else(|_| DEFAULT_STORY_DATA_DIR.to_string());
                     PathBuf::from(data_root).join(story)
                 });
             log::info!(
