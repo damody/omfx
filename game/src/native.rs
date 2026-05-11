@@ -2865,38 +2865,8 @@ impl Plugin for Game {
                 if self.td_template_order.is_empty() && !snapshot.tower_templates.is_empty() {
                     for t in snapshot.tower_templates.iter() {
                         self.td_template_order.push(t.unit_id.clone());
-                        self.td_templates.insert(
-                            t.unit_id.clone(),
-                            TdTemplate {
-                                label: t.label.clone(),
-                                cost: t.cost,
-                                footprint_backend: t.footprint,
-                                placement_radius_backend: t.placement_radius,
-                                range_backend: t.range,
-                                splash_radius_backend: t.splash_radius,
-                                hit_radius_backend: t.hit_radius,
-                                slow_factor: t.slow_factor,
-                                slow_duration: t.slow_duration,
-                                render_mode: t.render_mode.clone(),
-                                base_image: t.base_image.clone(),
-                                barrel_image: t.barrel_image.clone(),
-                                render_visual_size_backend: t.render_visual_size,
-                                barrel_frames: t.barrel_frames.clone(),
-                                body_frames: t.body_frames.clone(),
-                                barrel_animation: t.barrel_animation.clone(),
-                                body_animation: t.body_animation.clone(),
-                                rotation_mode: t.rotation_mode.clone(),
-                                barrel_layout: t.barrel_layout.clone(),
-                                barrel_variants: t.barrel_variants.clone(),
-                                barrel_offset: t.barrel_offset.clone(),
-                                barrel_pivot: t.barrel_pivot.clone(),
-                                muzzle_offset: t.muzzle_offset.clone(),
-                                default_angle_deg: t.default_angle_deg,
-                                recoil: t.recoil.clone(),
-                                attack_windup: t.attack_windup,
-                                attack_backswing: t.attack_backswing,
-                            },
-                        );
+                        self.td_templates
+                            .insert(t.unit_id.clone(), td_template_from_snapshot(t));
                     }
                     let layout_placeholder = if self.td_templates.contains_key("tower_dart") {
                         Some("tower_dart".to_string())
@@ -3951,6 +3921,11 @@ impl Plugin for Game {
                 )
             }
             ConnectionStatus::Failed(e) => format!("Failed: {}", e),
+        };
+        let connection_part = if let Some(err) = &self.sim_dev_lua_reload_error {
+            format!("{} | DEV Lua reload error: {}", connection_part, err)
+        } else {
+            connection_part
         };
         // 前一幀的渲染統計資訊（record_render_stats() 在更新結束時運行，
         // 所以這裡的值落後 1 幀 — 對於實時讀數來說很好）。
@@ -8290,6 +8265,88 @@ mod input_latency_tests {
             server_drain_tick: None,
             phases: LatencyPhaseDurations::default(),
         }
+    }
+
+    fn sample_tower_template(cost: i32, range: f32, base_image: &str) -> sim_runner::TowerTemplateSnapshot {
+        sim_runner::TowerTemplateSnapshot {
+            unit_id: "tower_dart".to_string(),
+            label: "Dart".to_string(),
+            cost,
+            footprint: 10.0,
+            placement_radius: 90.0,
+            range,
+            splash_radius: 0.0,
+            hit_radius: 0.0,
+            slow_factor: 0.0,
+            slow_duration: 0.0,
+            render_mode: "base_barrel".to_string(),
+            base_image: base_image.to_string(),
+            barrel_image: "assets/towers/tower_dart_barrel.png".to_string(),
+            render_visual_size: 180.0,
+            barrel_frames: vec!["assets/towers/tower_dart_barrel_frame_01.png".to_string()],
+            body_frames: Vec::new(),
+            barrel_animation: sim_runner::TowerRenderAnimationSnapshot::default(),
+            body_animation: sim_runner::TowerRenderAnimationSnapshot::default(),
+            rotation_mode: "targeted".to_string(),
+            barrel_layout: "single".to_string(),
+            barrel_variants: Vec::new(),
+            barrel_offset: sim_runner::TowerRenderPointSnapshot { x: 0.0, y: -6.0 },
+            barrel_pivot: sim_runner::TowerRenderPointSnapshot { x: 0.5, y: 0.66 },
+            muzzle_offset: sim_runner::TowerRenderPointSnapshot { x: 0.0, y: -30.0 },
+            default_angle_deg: 0.0,
+            recoil: sim_runner::TowerRecoilSnapshot::default(),
+            attack_windup: 350,
+            attack_backswing: 650,
+        }
+    }
+
+    #[test]
+    fn td_template_from_snapshot_projects_reload_sensitive_fields() {
+        let snapshot = sample_tower_template(275, 420.0, "assets/towers/new_base.png");
+        let template = td_template_from_snapshot(&snapshot);
+
+        assert_eq!(template.cost, 275);
+        assert_eq!(template.range_backend, 420.0);
+        assert_eq!(template.base_image, "assets/towers/new_base.png");
+    }
+
+    #[test]
+    fn clear_lua_metadata_caches_drops_frontend_asset_keys() {
+        let mut game = Game::default();
+        let snapshot = sample_tower_template(200, 350.0, "assets/towers/old_base.png");
+        game.td_templates
+            .insert(snapshot.unit_id.clone(), td_template_from_snapshot(&snapshot));
+        game.td_template_order.push(snapshot.unit_id.clone());
+        game.td_upgrade_defs.insert(
+            (snapshot.unit_id.clone(), 1, 1),
+            ("Sharp".into(), "More damage".into(), 100),
+        );
+        game.ability_info_map.insert(
+            "ability_test".into(),
+            AbilityInfo {
+                id: "ability_test".into(),
+                icon_path: "assets/abilities/old.png".into(),
+                ..Default::default()
+            },
+        );
+        game.ability_icon_texture_cache
+            .insert("assets/abilities/old.png".into(), None);
+        game.ability_icon_paths = std::array::from_fn(|_| "assets/abilities/old.png".into());
+        game.tower_texture_cache
+            .insert("assets/towers/old_base.png".into(), None);
+        game.tower_material_cache
+            .insert("assets/towers/old_base.png".into(), None);
+
+        game.clear_lua_metadata_caches();
+
+        assert!(game.td_templates.is_empty());
+        assert!(game.td_template_order.is_empty());
+        assert!(game.td_upgrade_defs.is_empty());
+        assert!(game.ability_info_map.is_empty());
+        assert!(game.ability_icon_texture_cache.is_empty());
+        assert!(game.ability_icon_paths.iter().all(String::is_empty));
+        assert!(game.tower_texture_cache.is_empty());
+        assert!(game.tower_material_cache.is_empty());
     }
 
     #[test]
