@@ -59,13 +59,13 @@ pub struct AppliedInputMeta {
 }
 
 /// 階段 4.2：僅渲染爆炸 FX 條目，鏡像自
-/// `omobab::comp::結果::ExplosionFx`。再出口通過
+/// `omoba_core::runtime::comp::ExplosionFx`。再出口通過
 /// `SimWorldSnapshot.explosions` 因此渲染端永遠不需要
-/// 直接觸摸 omobab 類型。 `spawn_tick` 是 sim 刻度
+/// 直接觸摸 backend 類型。 `spawn_tick` 是 sim 刻度
 /// 爆炸發生；渲染線程使用 omfx 掛鐘
 /// 了解實際的環老化生命週期（請參閱 lib.rs `active_explosions`）。
-pub use omobab::comp::ExplosionFx;
-pub use omobab::comp::{AttackCancelFx, AttackPhaseFx, TowerFireFx};
+pub use omoba_core::comp::ExplosionFx;
+pub use omoba_core::comp::{AttackCancelFx, AttackPhaseFx, TowerFireFx};
 
 const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 const PERMANENT_BUFF_REMAINING_RAW_THRESHOLD: i64 = (i32::MAX as i64) / 2;
@@ -203,7 +203,7 @@ pub struct SimWorldSnapshot {
     /// `td_templates` HashMap；後續的刻度是 O(1) 弧形克隆。
     pub tower_templates: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
     /// 48 個 tower upgrade defs (4 towers × 3 paths × 4 levels). Sourced
-    /// 來自 `omobab::comp::tower_upgrade_registry::TowerUpgradeRegistry`。
+    /// 來自 `omoba_core::runtime::TowerUpgradeRegistry`。
     /// omfx 銷售/升級面板用於 (a) 計算退款 =
     /// 基礎*0.85 + Σ(升級*0.75) 和 (b) 顯示每個升級的名稱
     /// 升級按鈕文字。與延遲建構弧線模式相同
@@ -295,7 +295,7 @@ pub struct TowerRecoilSnapshot {
 /// 右側 TD 建立選單的 TowerTemplate 投影。鏡像
 /// 欄位 lib.rs 的 `TdTemplate` 快取需求（按鈕的標籤/成本
 /// + 佈局預覽的足跡/範圍）。源自
-/// `omobab::comp::tower_registry::TowerTemplateRegistry`。
+/// `omoba_core::runtime::TowerTemplateRegistry`。
 #[derive(Clone, Debug)]
 pub struct TowerTemplateSnapshot {
     pub unit_id: String,
@@ -437,7 +437,7 @@ pub struct BuffSnapshot {
 /// 階段 3.3：總結英雄統計 — omfx 側鏡像
 /// 舊版 omb `hero.stats` JSON 負載。透過同樣的計算
 /// 使用 `BuffStore` / `UnitStats` 聚合管道 omb（參見
-/// `omobab::ability_runtime::UnitStats`);針對 ECS 只讀
+/// `omoba_core::runtime::UnitStats`);針對 ECS 只讀
 /// 所以同步決定論不受影響。
 #[derive(Clone, Debug, Default)]
 pub struct HeroStatsExt {
@@ -510,7 +510,7 @@ pub struct SimRunnerHandle {
 }
 
 /// 生成模擬器工人。使用初始化規格世界
-/// `omobab::state::initialization::create_world_for_scene` 並運行
+/// `omoba_core::runtime::create_world_for_scene` 並運行
 /// 每個蜱蟲的輸入驅動的共享階段 3 調度程序
 /// `tick_input_rx`。
 pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> SimRunnerHandle {
@@ -586,7 +586,7 @@ fn run_sim_loop(
         }
     };
 
-    let mut dispatcher = match omobab::state::system_dispatcher::build_phase3_dispatcher() {
+    let mut dispatcher = match omoba_core::runtime::build_phase3_dispatcher() {
         Ok(d) => d,
         Err(e) => {
             error!("sim_runner: build_phase3_dispatcher failed: {}", e);
@@ -600,8 +600,8 @@ fn run_sim_loop(
     // 字段，不在 ECS 中，正是為了避免借用衝突。更換
     // 具有“Default::default()”（空註冊表）的資源很好，因為
     // 沒有其他任何東西會查詢 ECS 駐留的 ScriptRegistry。
-    let script_registry: omobab::scripting::ScriptRegistry =
-        std::mem::take(&mut *world.write_resource::<omobab::scripting::ScriptRegistry>());
+    let script_registry: omoba_core::scripting::ScriptRegistry =
+        std::mem::take(&mut *world.write_resource::<omoba_core::scripting::ScriptRegistry>());
 
     info!("sim_runner: dispatcher ready, entering tick loop");
 
@@ -690,13 +690,13 @@ fn run_sim_loop(
         // 如果沒有這些，本地 sim 會有 Tick 前進，但時間停留在 0，
         // 這使得 `creep_wave` 看到 `totaltime=0` 並且永遠不會產生 — 完全正確
         // 為什麼 Start Round 會觸發（is_running 翻轉）但沒有小兵出現。
-        world.write_resource::<omobab::comp::resources::Tick>().0 = batch.tick as u64;
+        world.write_resource::<omoba_core::comp::resources::Tick>().0 = batch.tick as u64;
         {
-            let mut t = world.write_resource::<omobab::comp::resources::Time>();
+            let mut t = world.write_resource::<omoba_core::comp::resources::Time>();
             t.0 = ticks_to_seconds_f64(batch.tick);
         }
         {
-            let mut dt = world.write_resource::<omobab::comp::resources::DeltaTime>();
+            let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
             dt.0 = omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64));
         }
 
@@ -705,36 +705,36 @@ fn run_sim_loop(
 
         // 階段 2.1：drain `PendingTowerSpawnQueue`，與 authoritative runtime
         // 使用相同 tick boundary，讓 TowerPlace input deterministic 地建立 TD tower。
-        omobab::comp::GameProcessor::drain_pending_tower_spawns(&mut world);
+        omoba_core::runtime::drain_pending_tower_spawns(&mut world);
         world.maintain();
 
         // 階段 2.2：drain TowerSell input queue。退款與 entity removal 必須在
         // authoritative/local replica 同步執行，讓 snapshots 保持一致。
-        omobab::comp::GameProcessor::drain_pending_tower_sells(&mut world);
+        omoba_core::runtime::drain_pending_tower_sells(&mut world);
         world.maintain();
 
         // 階段 2.3：drain TowerUpgrade input queue。扣金、upgrade_levels 增量與
         // BuffStore stat-mod 必須在 authoritative/local replica 同步執行。
-        omobab::comp::GameProcessor::drain_pending_tower_upgrades(&mut world);
+        omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
         world.maintain();
 
         // 階段 2.4：drain ItemUse input queue。庫存冷卻與 CProperty
         // (HP / msd) mutation 需在 authoritative/local replica 同步執行。
-        omobab::comp::GameProcessor::drain_pending_item_uses(&mut world);
+        omoba_core::runtime::drain_pending_item_uses(&mut world);
         world.maintain();
 
         // AbilityUpgrade：消耗 skill point 並在 script dispatch 前排入 SkillLearn，
         // 與 authoritative runtime 使用相同 boundary。
-        omobab::comp::GameProcessor::drain_pending_ability_upgrades(&mut world);
+        omoba_core::runtime::drain_pending_ability_upgrades(&mut world);
         world.maintain();
 
         // AbilityCast：在 script dispatch 前排入 SkillCast。保留在 upgrades 後面，
         // 讓同 tick learn+cast 行為與 host 相符。
-        omobab::comp::GameProcessor::drain_pending_ability_casts(&mut world);
+        omoba_core::runtime::drain_pending_ability_casts(&mut world);
         world.maintain();
 
         // MoveTo (右鍵移動): drain `PendingMoveQueue`，在玩家英雄寫入 MoveTarget。
-        omobab::comp::GameProcessor::drain_pending_moves(&mut world);
+        omoba_core::runtime::drain_pending_moves(&mut world);
         world.maintain();
 
         // 階段 3 調度程序僅調度滴答系統；它不包括
@@ -744,8 +744,9 @@ fn run_sim_loop(
         // mqtx 是一個接收器（空 Vec）：結果處理程序 `try_send` 並且默默地
         // 丟棄訊息，它與確定性模擬合約（主機
         // 擁有電線發射；副本僅用於渲染）。
-        let (sink_tx, _sink_rx) = crossbeam_channel::unbounded::<omobab::transport::OutboundMsg>();
-        if let Err(e) = omobab::comp::GameProcessor::process_outcomes(&mut world, &sink_tx) {
+        let (sink_tx, _sink_rx) = crossbeam_channel::unbounded::<omoba_core::transport::OutboundMsg>();
+        let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
+        if let Err(e) = omoba_core::runtime::process_outcomes(&mut world, &mut event_sink) {
             log::warn!("sim_runner: process_outcomes failed: {}", e);
         }
         world.maintain();
@@ -754,10 +755,10 @@ fn run_sim_loop(
         // 塔是 ScriptUnitTag 驅動的 - 沒有這個， tower_dart / tower_
         // 炸彈/ tower_ice從未決定攻擊，所以projectile_tick有
         // 沒有什麼可以提前的，damage_tick 也沒有什麼可以應用的。
-        // omb 的 `State::tick` 在 `run_systems` 之後執行相同的操作（請參閱
-        // `scripting::run_script_dispatch` 周圍的 `omb/src/state/core.rs`
+        // backend 的 `State::tick` 在 `run_systems` 之後執行相同的操作（請參閱
+        // `scripting::run_script_dispatch` 周圍的 backend tick loop
         // 稱呼）。副本需要相同的呼叫來保持 sim 等效。
-        omobab::scripting::run_script_dispatch(
+        omoba_core::scripting::run_script_dispatch(
             &mut world,
             &script_registry,
             batch.tick as u64,
@@ -765,7 +766,8 @@ fn run_sim_loop(
             sink_tx.clone(),
         );
         // 處理推送的任何結果腳本（投射物/損壞/等）。
-        if let Err(e) = omobab::comp::GameProcessor::process_outcomes(&mut world, &sink_tx) {
+        let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
+        if let Err(e) = omoba_core::runtime::process_outcomes(&mut world, &mut event_sink) {
             log::warn!("sim_runner: process_outcomes (post-script) failed: {}", e);
         }
         world.maintain();
@@ -774,7 +776,7 @@ fn run_sim_loop(
         // 註冊表已填入。在第一個非空構建之後
         // Arc 永遠不會改變（註冊表在載入後是不可變的）。
         if abilities_arc.is_empty() {
-            let reg = world.read_resource::<omobab::ability_runtime::AbilityRegistry>();
+            let reg = world.read_resource::<omoba_core::ability_runtime::AbilityRegistry>();
             if !reg.is_empty() {
                 abilities_arc = std::sync::Arc::new(
                     reg.all()
@@ -796,7 +798,7 @@ fn run_sim_loop(
         // TD 塔範本註冊表 — 相同的惰性建置模式。人口由
         // 每個塔腳本在腳本載入時的「tower_metadata()」。
         if tower_templates_arc.is_empty() {
-            let reg = world.read_resource::<omobab::comp::tower_registry::TowerTemplateRegistry>();
+            let reg = world.read_resource::<omoba_core::comp::tower_registry::TowerTemplateRegistry>();
             if !reg.is_empty() {
                 tower_templates_arc = std::sync::Arc::new(
                     reg.iter_ordered()
@@ -879,8 +881,8 @@ fn run_sim_loop(
         // 塔模板），因此 iter_all 從勾選 1 開始就非空。惰性保護
         // 鏡像其他註冊表以實現對稱。
         if tower_upgrades_arc.is_empty() {
-            let reg =
-                world.read_resource::<omobab::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
+            let reg = world
+                .read_resource::<omoba_core::comp::tower_upgrade_registry::TowerUpgradeRegistry>();
             let mut defs: Vec<TowerUpgradeDefSnapshot> = reg
                 .iter_all()
                 .map(|d| TowerUpgradeDefSnapshot {
@@ -975,11 +977,11 @@ fn run_sim_loop(
 }
 
 fn init_world(scene_path: &Path, master_seed: u64) -> Result<World, failure::Error> {
-    let mut world = omobab::state::initialization::create_world_for_scene(scene_path)?;
+    let mut world = omoba_core::runtime::create_world_for_scene(scene_path)?;
     // 使用權威的 MasterSeed 覆蓋預設的 MasterSeed
     // 遊戲開始。必須在第一次調度之前發生。
     world
-        .write_resource::<omobab::comp::resources::MasterSeed>()
+        .write_resource::<omoba_core::comp::resources::MasterSeed>()
         .0 = master_seed;
     Ok(world)
 }
@@ -991,7 +993,7 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<TickBatchInp
     //
     // 替換資源圖批發（鎖步合約：最多一個
     // 每個玩家每個刻度的輸入 — 最新的 TickBatch 是權威的）。
-    use omobab::comp::PendingPlayerInputs;
+    use omoba_core::comp::PendingPlayerInputs;
 
     let mut pending = world.write_resource::<PendingPlayerInputs>();
     pending.tick = tick;
@@ -1013,16 +1015,12 @@ fn extract_snapshot(
     applied_input_ids: Vec<u32>,
     applied_input_meta: Vec<AppliedInputMeta>,
 ) -> SimWorldSnapshot {
-    // omobab 通過 `pub use crate::comp::*;` 在
-    // 板條箱根部，因此請穿過平坦的路徑而不是
-    // 逐個模組（有些子模組如“comp::state”發生衝突
-    // 與 State 結構命名空間）。
-    use omobab::ability_runtime::{BuffStore, UnitStats};
-    use omobab::comp::gold::Gold;
-    use omobab::comp::hero::AttributeType;
-    use omobab::comp::inventory::Inventory;
-    use omobab::scripting::ScriptUnitTag;
-    use omobab::{
+    use omoba_core::ability_runtime::{BuffStore, UnitStats};
+    use omoba_core::comp::gold::Gold;
+    use omoba_core::comp::hero::AttributeType;
+    use omoba_core::comp::inventory::Inventory;
+    use omoba_core::scripting::ScriptUnitTag;
+    use omoba_core::{
         CProperty, Creep, Facing, Hero, IsBuilding, MoveTarget, Pos, Projectile, TAttack, Tower,
     };
 
@@ -1307,7 +1305,7 @@ fn extract_snapshot(
     // 蠕變檢查點路徑 - 每個快照從靜態讀取一次
     // 由「init_creep_wave」填入的「BTreeMap<String, Path>」資源。便宜的
     // (BTree iter + 小克隆);避免專用的僅初始化通道。
-    use omobab::comp::Path;
+    use omoba_core::comp::Path;
     use std::collections::BTreeMap;
     let paths: Vec<Vec<(f32, f32)>> = world
         .read_resource::<BTreeMap<String, Path>>()
@@ -1371,18 +1369,18 @@ fn extract_snapshot(
     // 不讀此 queue 所以 write 不影響 determinism。取代了原本 prev_alive
     // HashSet 跨 tick state diff 演算法。
     let removed_entity_ids: Vec<u32> = {
-        let mut q = world.write_resource::<omobab::comp::RemovedEntitiesQueue>();
+        let mut q = world.write_resource::<omoba_core::comp::RemovedEntitiesQueue>();
         std::mem::take(&mut q.pending)
     };
 
     // 階段 4.1：BlockedRegion 多邊形。靜態地圖資料 — TD_1 為空，
     // MVP_1/DEBUG_1 有一些，因此克隆每個蜱是很便宜的。這
-    // omb `BlockedRegion` 有 `name: String` + `points: Vec<Vec2<f32>>`
+    // runtime `BlockedRegion` 有 `name: String` + `points: Vec<Vec2<f32>>`
     // （無半徑）；我們從渲染端開始投影到「(f32, f32)」對
     // 已經講原始的 f32 世界座標。從今天開始，「circle」就沒有了
     // 來源沒有半徑場；為了向前相容，保留可選。
     let blocked_regions: Vec<BlockedRegionSnapshot> = world
-        .read_resource::<omobab::comp::BlockedRegions>()
+        .read_resource::<omoba_core::comp::BlockedRegions>()
         .0
         .iter()
         .map(|r| BlockedRegionSnapshot {
@@ -1401,15 +1399,15 @@ fn extract_snapshot(
     let total_rounds: u32;
     let round_is_running: bool;
     {
-        let ccw = world.read_resource::<omobab::comp::CurrentCreepWave>();
+        let ccw = world.read_resource::<omoba_core::comp::CurrentCreepWave>();
         round = ccw.wave as u32;
         round_is_running = ccw.is_running;
     }
     {
-        let waves = world.read_resource::<Vec<omobab::comp::CreepWave>>();
+        let waves = world.read_resource::<Vec<omoba_core::comp::CreepWave>>();
         total_rounds = waves.len() as u32;
     }
-    let lives = world.read_resource::<omobab::comp::PlayerLives>().0;
+    let lives = world.read_resource::<omoba_core::comp::PlayerLives>().0;
 
     // 階段 4.2：排出 `ExplosionFxQueue` — process_outcomes 推送到這裡
     // 對於每個 Outcome::Explosion (game_processor + WorldAdapter
@@ -1418,19 +1416,19 @@ fn extract_snapshot(
     // write 對於決定論來說是不可見的（同樣的原因 BlockedRegions 是
     // 在這裡可以安全閱讀）。
     let explosions: Vec<ExplosionFx> = {
-        let mut q = world.write_resource::<omobab::comp::ExplosionFxQueue>();
+        let mut q = world.write_resource::<omoba_core::comp::ExplosionFxQueue>();
         std::mem::take(&mut q.pending)
     };
     let tower_fire_fx: Vec<TowerFireFx> = {
-        let mut q = world.write_resource::<omobab::comp::TowerFireFxQueue>();
+        let mut q = world.write_resource::<omoba_core::comp::TowerFireFxQueue>();
         std::mem::take(&mut q.pending)
     };
     let attack_phase_fx: Vec<AttackPhaseFx> = {
-        let mut q = world.write_resource::<omobab::comp::AttackPhaseFxQueue>();
+        let mut q = world.write_resource::<omoba_core::comp::AttackPhaseFxQueue>();
         std::mem::take(&mut q.pending)
     };
     let attack_cancel_fx: Vec<AttackCancelFx> = {
-        let mut q = world.write_resource::<omobab::comp::AttackCancelFxQueue>();
+        let mut q = world.write_resource::<omoba_core::comp::AttackCancelFxQueue>();
         std::mem::take(&mut q.pending)
     };
 
@@ -1456,15 +1454,15 @@ fn extract_snapshot(
     }
 }
 
-/// 冒煙測試表明 omobab 作為 lib 是可以訪問的。驗證 dep 接線
+/// 冒煙測試表明 shared runtime 是可以訪問的。驗證 dep 接線
 /// 有效且階段 3.2 輔助符號解析。
 pub fn smoke() -> &'static str {
-    let _ = omobab::comp::resources::MasterSeed::default();
+    let _ = omoba_core::comp::resources::MasterSeed::default();
     // 進入第 3.2 階段新增的新酒吧助手進行確認
     // 它們可以從 omfx 中看到。
-    let _ = omobab::state::system_dispatcher::build_phase3_dispatcher
+    let _ = omoba_core::runtime::build_phase3_dispatcher
         as fn() -> Result<specs::Dispatcher<'static, 'static>, failure::Error>;
-    "omobab linked"
+    "omoba-core runtime linked"
 }
 
 #[cfg(test)]
@@ -1474,7 +1472,7 @@ mod tests {
 
     #[test]
     fn smoke_links() {
-        assert_eq!(smoke(), "omobab linked");
+        assert_eq!(smoke(), "omoba-core runtime linked");
     }
 
     #[test]
@@ -1654,7 +1652,7 @@ mod tests {
                 entity_gen: 1,
                 spawn_tick: 43,
                 attack_seq: 3,
-                phase: omobab::comp::AttackCancelPhase::Windup,
+                phase: omoba_core::comp::AttackCancelPhase::Windup,
                 impact_committed: false,
             }],
             ..Default::default()
@@ -1665,7 +1663,7 @@ mod tests {
         assert_eq!(snapshot.attack_cancel_fx[0].attack_seq, 3);
         assert_eq!(
             snapshot.attack_cancel_fx[0].phase,
-            omobab::comp::AttackCancelPhase::Windup
+            omoba_core::comp::AttackCancelPhase::Windup
         );
         assert!(!snapshot.attack_cancel_fx[0].impact_committed);
     }

@@ -16,11 +16,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 
-# 第 3 階段鎖步模擬器相依性：
-# omfx 導入 omb-as-lib 以在工作執行緒中執行完整的 ECS 調度程式。
-# 規範使用分叉路徑（匹配 omb），因此 Entity Serialize impls 和
-# 組件類型在 FFI 邊界上是統一的。
-omobab = { path = "../../omb", default-features = false, features = ["kcp"] }
 specs = { path = "../../specs", features = ["derive", "serde"] }
 omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }
 # 階段 2.1：TowerPlace UI 處理程序轉換選定的塔類型名稱
@@ -61,4 +56,4 @@ windows = { version = "0.58", features = [
 [features]
 default = ["fyrox/default"]
 dylib-engine = ["fyrox/dylib"]
-runtime-lua-content = ["omobab/runtime-lua-content", "omoba-template-ids/runtime-lua-content"]
+runtime-lua-content = ["omoba-core/runtime-lua-content", "omoba-template-ids/runtime-lua-content"]
