@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 fyrox = {workspace = true}
 log = "0.4"
+tracing = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uuid = { version = "1", features = ["v4"] }

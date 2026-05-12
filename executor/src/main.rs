@@ -1,11 +1,16 @@
 //! 使用 plugin 模式啟動的遊戲執行器。
+mod perfetto_profile;
+
 use fyrox::core::log::Log;
 use fyrox::engine::executor::Executor;
 use fyrox::event_loop::EventLoop;
+use omoba_core::lockstep_timing::LOCKSTEP_TPS;
 use simplelog::{
     ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, WriteLogger,
 };
 use std::fs::File;
+
+const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS + 10;
 
 struct LogSettings {
     level: LevelFilter,
@@ -128,6 +133,19 @@ fn main() {
         WriteLogger::new(log_settings.level, cfg, log_file),
     ]);
 
+    match perfetto_profile::init_from_env() {
+        Ok(Some(session)) => log::info!(
+            "omfx Perfetto profiling enabled: path='{}' detail='{}'; open with https://ui.perfetto.dev",
+            session.path.display(),
+            session.detail
+        ),
+        Ok(None) => {}
+        Err(err) => log::warn!(
+            "omfx Perfetto profiling requested but disabled: {}",
+            err
+        ),
+    }
+
     Log::set_file_name("omfx.log");
 
     let mut executor = Executor::from_params(
@@ -142,6 +160,9 @@ fn main() {
             named_objects: false,
         },
     );
+    // Keep authoritative lockstep at 120 TPS, but give the render/plugin loop
+    // a small cadence headroom so 120 FPS 1% lows survive Windows wakeup jitter.
+    executor.set_desired_update_rate(RENDER_UPDATE_TPS as f32);
 
     // 動態連結並啟用熱重載。
     #[cfg(feature = "dylib")]

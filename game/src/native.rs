@@ -49,6 +49,7 @@ use fyrox::{
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omoba_core::{
@@ -70,12 +71,13 @@ pub(crate) mod sim_runner;
 pub(crate) mod sprite_resources;
 
 const ABILITY_ICON_FALLBACK_PATH: &str = "data/ability_icons/ability_default_placeholder.png";
-const DEFAULT_DLL_PATH: &str = "omb/scripts/base_content.dll";
-const DEFAULT_GAME_TOML_PATH: &str = "omb/game.toml";
+const DEFAULT_DLL_PATH: &str = "scripts/base_content.dll";
+const DEFAULT_GAME_TOML_PATH: &str = "scripts/game.toml";
 const DEFAULT_STORY_DATA_DIR: &str = "scripts/lua_data";
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
+const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS + 10;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
 const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
@@ -83,6 +85,15 @@ const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
 type TowerFireFxKey = (u32, u32, u32);
 type AttackPhaseFxKey = (u32, u32, u32, u32);
 type AttackCancelFxKey = (u32, u32, u32, u32);
+
+fn perfetto_deep_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OMFX_PERFETTO_DETAIL")
+            .map(|value| value.eq_ignore_ascii_case("deep"))
+            .unwrap_or(false)
+    })
+}
 
 fn tower_fire_fx_key(cue: &sim_runner::TowerFireFx) -> TowerFireFxKey {
     (cue.entity_id, cue.entity_gen, cue.spawn_tick)
@@ -153,6 +164,23 @@ struct PendingInput {
     client_receive_tickbatch_us: Option<u64>,
     game_forward_to_sim_us: Option<u64>,
     sim_publish_snapshot_us: Option<u64>,
+    server_receive_tick: Option<u32>,
+    server_drain_tick: Option<u32>,
+    server_queue_us: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingInputDiagnostic {
+    input_id: u32,
+    action_kind: InputActionKind,
+    base_tick: u32,
+    target_tick: u32,
+    pending_age_ms: u32,
+    has_submit_start: bool,
+    has_submit_done: bool,
+    has_client_receive_tickbatch: bool,
+    has_game_forward_to_sim: bool,
+    has_sim_publish_snapshot: bool,
     server_receive_tick: Option<u32>,
     server_drain_tick: Option<u32>,
     server_queue_us: Option<u64>,
@@ -242,6 +270,66 @@ impl InputLatencyMeter {
 
     fn has_samples(&self) -> bool {
         !self.samples.is_empty()
+    }
+}
+
+fn pending_input_age_ms(pending: &PendingInput, now_us: u64) -> u32 {
+    now_us
+        .saturating_sub(pending.submit_wall_clock_us)
+        .saturating_div(1_000)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+fn oldest_pending_input_age_ms(
+    pending_inputs: &HashMap<u32, PendingInput>,
+    now_us: u64,
+) -> Option<u32> {
+    pending_inputs
+        .values()
+        .map(|pending| pending_input_age_ms(pending, now_us))
+        .max()
+}
+
+fn pending_input_diagnostic(
+    input_id: u32,
+    pending: &PendingInput,
+    now_us: u64,
+) -> PendingInputDiagnostic {
+    PendingInputDiagnostic {
+        input_id,
+        action_kind: pending.action_kind,
+        base_tick: pending.base_tick,
+        target_tick: pending.target_tick,
+        pending_age_ms: pending_input_age_ms(pending, now_us),
+        has_submit_start: pending.submit_start_us.is_some(),
+        has_submit_done: pending.submit_done_us.is_some(),
+        has_client_receive_tickbatch: pending.client_receive_tickbatch_us.is_some(),
+        has_game_forward_to_sim: pending.game_forward_to_sim_us.is_some(),
+        has_sim_publish_snapshot: pending.sim_publish_snapshot_us.is_some(),
+        server_receive_tick: pending.server_receive_tick,
+        server_drain_tick: pending.server_drain_tick,
+        server_queue_us: pending.server_queue_us,
+    }
+}
+
+fn format_input_lag_status(meter: &InputLatencyMeter, oldest_pending_ms: Option<u32>) -> String {
+    let paired = if meter.has_samples() {
+        Some(format!(
+            "p50 {} / p99 {} ms",
+            meter.cached_p50_ms, meter.cached_p99_ms
+        ))
+    } else {
+        None
+    };
+    let pending = oldest_pending_ms
+        .filter(|age_ms| !meter.has_samples() || *age_ms > meter.cached_p99_ms)
+        .map(|age_ms| format!("pending {} ms", age_ms));
+
+    match (paired, pending) {
+        (Some(paired), Some(pending)) => format!("{} | {}", paired, pending),
+        (Some(paired), None) => paired,
+        (None, Some(pending)) => pending,
+        (None, None) => "—".into(),
     }
 }
 
@@ -440,9 +528,11 @@ const COLLISION_RING_THICKNESS: f32 = 0.025;
 /// 是 stress 場景下最大 CPU 成本之一。改 true 可恢復 debug 可視化。
 const COLLISION_RING_ENABLED: bool = false;
 /// Per-frame debug 畫每個 entity 的 collision ring（走 SceneDrawingContext，
-/// 千個 entity 還是 1 個 draw call，跟 COLLISION_RING_ENABLED 的 24K scene node
-/// 路徑不同）。stress 場景開著沒事。
-const DEBUG_COLLISION_RINGS: bool = true;
+/// 但 10k entity 仍會產生 240k line segments；stress 驗收預設關閉。
+const DEBUG_COLLISION_RINGS: bool = false;
+const STRESS_SAFE_BODY_BATCH_CAPACITY: u32 = 16_384;
+const STRESS_SAFE_HP_BATCH_CAPACITY: u32 = STRESS_SAFE_BODY_BATCH_CAPACITY * 2;
+const STRESS_SAFE_FACING_BATCH_CAPACITY: u32 = STRESS_SAFE_BODY_BATCH_CAPACITY;
 const REGION_LINE_THICKNESS: f32 = 0.04;
 const REGION_BLOCKER_SEGMENTS: usize = 12;
 const REGION_BLOCKER_THICKNESS: f32 = 0.015;
@@ -999,6 +1089,44 @@ fn tower_render_dir_from_world_rad(dir_rad: f32) -> Vector2<f32> {
     Vector2::new(-dir_rad.cos(), dir_rad.sin())
 }
 
+fn safe_projectile_trail_dir(dir: Vector2<f32>) -> Vector2<f32> {
+    let len_sq = dir.x * dir.x + dir.y * dir.y;
+    if !len_sq.is_finite() || len_sq <= 1.0e-8 {
+        return Vector2::new(1.0, 0.0);
+    }
+    dir / len_sq.sqrt()
+}
+
+fn initial_projectile_trail_dir(
+    spawn_pos: Vector2<f32>,
+    projectile_pos: Vector2<f32>,
+    fallback_dir: Vector2<f32>,
+) -> Vector2<f32> {
+    let delta = projectile_pos - spawn_pos;
+    let len_sq = delta.x * delta.x + delta.y * delta.y;
+    if len_sq.is_finite() && len_sq > 1.0e-8 {
+        delta / len_sq.sqrt()
+    } else {
+        safe_projectile_trail_dir(fallback_dir)
+    }
+}
+
+fn projectile_trail_quad(
+    spawn_pos: Vector2<f32>,
+    projectile_pos: Vector2<f32>,
+    dir: Vector2<f32>,
+) -> (Vector2<f32>, f32, f32) {
+    let displacement = projectile_pos - spawn_pos;
+    let trail_len = (displacement.x * displacement.x + displacement.y * displacement.y).sqrt();
+    let max_trail = 0.6_f32;
+    let len = trail_len.min(max_trail).max(0.05);
+    let dir = safe_projectile_trail_dir(dir);
+    let tail = projectile_pos - dir * len;
+    let mid = (projectile_pos + tail) * 0.5;
+    let rotation = dir.y.atan2(dir.x);
+    (mid, len, rotation)
+}
+
 fn build_tower_rect_node(
     scene: &mut Scene,
     material: Option<MaterialResource>,
@@ -1138,6 +1266,9 @@ enum ConnectionStatus {
 struct FrameProfile {
     frame_count: u64,
     events_ns: u128,
+    lockstep_ns: u128,
+    snapshot_ns: u128,
+    render_bridge_ns: u128,
     interp_ns: u128,
     visual_ns: u128,
     proj_ns: u128,
@@ -1151,6 +1282,20 @@ struct FrameProfile {
     capped_render_ms_total: f64,
     draw_calls_total: u64,
     triangles_total: u64,
+    paced_frame_count: u64,
+    stale_snapshot_frame_count: u64,
+    frame_interval_ms_total: f64,
+    max_frame_interval_ms: f64,
+    frame_interval_ms_window: Vec<f64>,
+    render_target_tps: u32,
+    sim_tps_total: f64,
+    sim_diag_samples: u64,
+    latest_sim_tick: u32,
+    sim_queue_len_total: u64,
+    sim_max_queue_len: usize,
+    sim_waits: u64,
+    sim_blocking_receives: u64,
+    sim_backlog_receives: u64,
     last_fps: usize,
     /// 最近的每幀快照（覆蓋每次呼叫“record_render_stats”）。
     /// 由 HUD 狀態文字使用 — 視窗平均值會重設每個 WINDOW 幀，以便
@@ -1160,7 +1305,7 @@ struct FrameProfile {
 }
 
 impl FrameProfile {
-    const WINDOW: u64 = 60;
+    const WINDOW: u64 = 120;
 
     fn finish_frame(&mut self) {
         self.frame_count += 1;
@@ -1172,16 +1317,29 @@ impl FrameProfile {
 
     fn emit_log(&self) {
         let w = Self::WINDOW as f64;
+        let frame_samples = self.frame_interval_ms_window.len().max(1) as f64;
         let total_ms = self.total_ns as f64 / w / 1_000_000.0;
         let max_fps = if total_ms > 0.0 {
             (1000.0 / total_ms) as u32
         } else {
             0
         };
+        let (p50_ms, p95_ms, p99_ms, one_pct_low_fps) =
+            frame_time_summary(&self.frame_interval_ms_window);
+        let avg_fps = if self.frame_interval_ms_total > 0.0 {
+            frame_samples * 1000.0 / self.frame_interval_ms_total
+        } else {
+            0.0
+        };
+        let pure_render_avg = self.pure_render_ms_total / w;
+        let capped_render_avg = self.capped_render_ms_total / w;
+        let cap_or_present_wait_avg = (capped_render_avg - pure_render_avg).max(0.0);
         log::info!(
-            "omfx_frame window={} avg(ms) events={:.2} interp={:.2} visual={:.2} proj={:.2} cam={:.2} ui={:.2} total={:.2} (max_fps={}, events_per_frame={:.0}, creeps={:.0}, projectiles={:.0})",
+            "omfx_frame window={} avg(ms) lockstep={:.2} snapshot={:.2} render_bridge={:.2} interp={:.2} visual={:.2} proj={:.2} cam={:.2} ui={:.2} total={:.2} (max_fps={}, events_per_frame={:.0}, creeps={:.0}, projectiles={:.0})",
             Self::WINDOW,
-            self.events_ns as f64 / w / 1_000_000.0,
+            self.lockstep_ns as f64 / w / 1_000_000.0,
+            self.snapshot_ns as f64 / w / 1_000_000.0,
+            self.render_bridge_ns as f64 / w / 1_000_000.0,
             self.interp_ns as f64 / w / 1_000_000.0,
             self.visual_ns as f64 / w / 1_000_000.0,
             self.proj_ns as f64 / w / 1_000_000.0,
@@ -1194,11 +1352,45 @@ impl FrameProfile {
             self.projectiles_seen as f64 / w,
         );
         log::info!(
-            "omfx_render window={} avg(ms) pure={:.2} capped={:.2} fps={} draw_calls={:.0} triangles={:.0}",
+            "omfx_frame_slo window={} target_fps={} avg_fps={:.2} one_pct_low_fps={:.2} frame_ms p50={:.2} p95={:.2} p99={:.2} max={:.2} plugin_avg={:.2} pure_avg={:.2} capped_avg={:.2} cap_or_present_wait_avg={:.2} sim_tps={:.2} latest_sim_tick={} sim_queue_avg={:.2} sim_queue_max={} sim_waits={} sim_blocking_receives={} sim_backlog_receives={}",
             Self::WINDOW,
-            self.pure_render_ms_total / Self::WINDOW as f64,
-            self.capped_render_ms_total / Self::WINDOW as f64,
+            self.render_target_tps.max(1),
+            avg_fps,
+            one_pct_low_fps,
+            p50_ms,
+            p95_ms,
+            p99_ms,
+            self.max_frame_interval_ms,
+            total_ms,
+            pure_render_avg,
+            capped_render_avg,
+            cap_or_present_wait_avg,
+            if self.sim_diag_samples > 0 {
+                self.sim_tps_total / self.sim_diag_samples as f64
+            } else {
+                0.0
+            },
+            self.latest_sim_tick,
+            if self.sim_diag_samples > 0 {
+                self.sim_queue_len_total as f64 / self.sim_diag_samples as f64
+            } else {
+                0.0
+            },
+            self.sim_max_queue_len,
+            self.sim_waits,
+            self.sim_blocking_receives,
+            self.sim_backlog_receives,
+        );
+        log::info!(
+            "omfx_render window={} target_fps={} target_ms={:.2} avg(ms) pure={:.2} capped={:.2} fps={} paced_frames={} stale_snapshot_frames={} draw_calls={:.0} triangles={:.0}",
+            Self::WINDOW,
+            self.render_target_tps.max(1),
+            1000.0 / self.render_target_tps.max(1) as f32,
+            pure_render_avg,
+            capped_render_avg,
             self.last_fps,
+            self.paced_frame_count,
+            self.stale_snapshot_frame_count,
             self.draw_calls_total as f64 / Self::WINDOW as f64,
             self.triangles_total as f64 / Self::WINDOW as f64,
         );
@@ -1214,8 +1406,40 @@ impl FrameProfile {
         self.last_triangles = stats.geometry.triangles_rendered;
     }
 
+    fn record_frame_interval(&mut self, interval: Option<std::time::Duration>) {
+        let Some(interval) = interval else {
+            return;
+        };
+        let ms = interval.as_secs_f64() * 1000.0;
+        self.frame_interval_ms_total += ms;
+        self.max_frame_interval_ms = self.max_frame_interval_ms.max(ms);
+        self.frame_interval_ms_window.push(ms);
+    }
+
+    fn record_render_pacing(&mut self, snapshot_reused: bool, target_tps: u32) {
+        self.paced_frame_count += 1;
+        self.render_target_tps = target_tps.max(1);
+        if snapshot_reused {
+            self.stale_snapshot_frame_count += 1;
+        }
+    }
+
+    fn record_sim_diagnostics(&mut self, diagnostics: &sim_runner::SimRunnerDiagnostics) {
+        self.sim_tps_total += diagnostics.sim_tps as f64;
+        self.sim_diag_samples += 1;
+        self.latest_sim_tick = diagnostics.latest_tick;
+        self.sim_queue_len_total += diagnostics.queue_len as u64;
+        self.sim_max_queue_len = self.sim_max_queue_len.max(diagnostics.max_queue_len);
+        self.sim_waits += diagnostics.waits as u64;
+        self.sim_blocking_receives += diagnostics.blocking_receives as u64;
+        self.sim_backlog_receives += diagnostics.backlog_receives as u64;
+    }
+
     fn reset_window(&mut self) {
         self.events_ns = 0;
+        self.lockstep_ns = 0;
+        self.snapshot_ns = 0;
+        self.render_bridge_ns = 0;
         self.interp_ns = 0;
         self.visual_ns = 0;
         self.proj_ns = 0;
@@ -1229,8 +1453,48 @@ impl FrameProfile {
         self.capped_render_ms_total = 0.0;
         self.draw_calls_total = 0;
         self.triangles_total = 0;
+        self.paced_frame_count = 0;
+        self.stale_snapshot_frame_count = 0;
+        self.frame_interval_ms_total = 0.0;
+        self.max_frame_interval_ms = 0.0;
+        self.frame_interval_ms_window.clear();
+        self.render_target_tps = LOCKSTEP_TPS;
+        self.sim_tps_total = 0.0;
+        self.sim_diag_samples = 0;
+        self.latest_sim_tick = 0;
+        self.sim_queue_len_total = 0;
+        self.sim_max_queue_len = 0;
+        self.sim_waits = 0;
+        self.sim_blocking_receives = 0;
+        self.sim_backlog_receives = 0;
         // last_fps 只是覆蓋每一幀，無需重置
     }
+}
+
+fn frame_time_summary(samples: &[f64]) -> (f64, f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let percentile = |p: f64| -> f64 {
+        let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    };
+    let slow_count = ((sorted.len() as f64) * 0.01).ceil().max(1.0) as usize;
+    let slow_start = sorted.len().saturating_sub(slow_count);
+    let slow_avg_ms = sorted[slow_start..].iter().sum::<f64>() / slow_count as f64;
+    let one_pct_low_fps = if slow_avg_ms > 0.0 {
+        1000.0 / slow_avg_ms
+    } else {
+        0.0
+    };
+    (
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
+        one_pct_low_fps,
+    )
 }
 
 #[derive(Default, Visit, Reflect, Debug)]
@@ -1253,18 +1517,18 @@ pub struct Game {
 
     /// 所有 entity body sprite 共用的 batched mesh — 1 個 mesh / 1 draw call 容納
     /// 數千個 entity，取代之前每 entity 1 個 Mesh 的爆量 draw call 浪費。
-    /// Capacity 4096 quad（涵蓋 1800 creep + 1000 tower + 餘裕）。
+    /// Capacity 16k quad，支援 10k stress units + projectile/hero 餘裕。
     #[visit(skip)]
     #[reflect(hidden)]
     body_batch: Option<sprite_resources::BatchedSpriteMesh>,
 
     /// HP bar 黑底 + 綠條 共用 batched mesh（per-vertex color，bg/fg 兩個 slot
-    /// 一個 entity）。Capacity 8192 = 4096 entity × 2 (bg + fg)。
+    /// 一個 entity）。Capacity 32k = 16k entity × 2 (bg + fg)。
     #[visit(skip)]
     #[reflect(hidden)]
     hp_batch: Option<sprite_resources::BatchedSpriteMesh>,
 
-    /// Facing arrow 共用 batched mesh（with rotation）。Capacity 4096。
+    /// Facing arrow 共用 batched mesh（with rotation）。Capacity 16k。
     #[visit(skip)]
     #[reflect(hidden)]
     facing_batch: Option<sprite_resources::BatchedSpriteMesh>,
@@ -1298,6 +1562,9 @@ pub struct Game {
     pending_inputs_evicted: u64,
     #[visit(skip)]
     #[reflect(hidden)]
+    pending_inputs_stale: u64,
+    #[visit(skip)]
+    #[reflect(hidden)]
     input_latency_meter: InputLatencyMeter,
     /// 階段 3.2 sim_runner 工作執行緒（執行完整的 omb ECS 排程器）
     /// 後台線程）。落在 `on_deinit` 上，所以頻道
@@ -1318,6 +1585,15 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     sim_dev_lua_reload_error: Option<String>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_speed_last_tick: u32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_speed_last_at: Option<Instant>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_speed_tps: f32,
     /// 階段 3.4 渲染橋：每個畫面讀取 `SimWorldSnapshot` 並
     /// （第 4 階段）為每個實體產生/更新/消失 Fyrox sprite。
     /// 目前是記錄實體渲染資料的存根。始終分配
@@ -1539,6 +1815,17 @@ pub struct Game {
     #[reflect(hidden)]
     frame_profile: FrameProfile,
 
+    /// Render pacing follows shared lockstep cadence; executor owns the actual frame cap.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    render_pacing_last_frame_at: Option<Instant>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    render_pacing_last_snapshot_tick: Option<u32>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_batches_last_snapshot_tick: Option<u32>,
+
     #[visit(skip)]
     #[reflect(hidden)]
     pending_label_deletions: Vec<Handle<Text>>,
@@ -1565,6 +1852,12 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     projectile_spawn_pos: HashMap<u32, Vector2<f32>>,
+
+    /// 子彈拖尾方向：第一次看到 projectile 時鎖定，避免飛行中因目標移動或
+    /// snapshot 追蹤更新而旋轉。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    projectile_trail_dir: HashMap<u32, Vector2<f32>>,
 
     /// 第一幀的掛鐘時間戳；所使用的
     /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` 煙霧循環
@@ -2429,7 +2722,7 @@ impl Plugin for Game {
         // 驗證工作執行緒產生+符號解析。
         {
             use std::path::PathBuf;
-            // 預設為 omb/scripts/，其中 run.bat 複製新建的 DLL
+            // 預設為 scripts/，其中 run.bat 複製新建的 DLL
             // （調試或發布 - 無論 run.bat 使用哪個設定檔）。載入腳本目錄
             // 取得父目錄並掃描 .dll，因此這對兩者都適用。
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
@@ -2515,15 +2808,32 @@ impl Plugin for Game {
 
     fn update(&mut self, context: &mut PluginContext) -> GameResult {
         let scene = &mut context.scenes[self.scene];
+        let frame_span = tracing::trace_span!(
+            "omfx::Plugin::update",
+            perfetto = true,
+            tick = self.current_sim_tick,
+            network_entities = self.network_entities.len(),
+            projectiles = self.client_projectiles.len(),
+            draw_calls = self.frame_profile.last_draw_calls,
+            triangles = self.frame_profile.last_triangles,
+            deep = perfetto_deep_enabled(),
+        )
+        .entered();
         // 每 frame 清掉 drawing_context 的 line buffer，避免累積到無限大導致 FPS 為 0。
         // 後續 phase（爆炸 / 路徑 debug 等）會 push 新的 line 進來。
         scene.drawing_context.clear_lines();
         let frame_t0 = std::time::Instant::now();
+        let frame_interval = self
+            .render_pacing_last_frame_at
+            .map(|prev| frame_t0.duration_since(prev));
+        let last_rendered_snapshot_tick = self.render_pacing_last_snapshot_tick;
 
         // 煙環鉤子（第一次更新時讀取一次）。兩個環境變數都是
         // 獨立的;可以設定其中之一或兩者。供自動化測試使用
         // 執行，以便可以啟動單一「run.bat」→按開始回合→
         // 退出，無需人工點擊按鈕。
+        let auto_hooks_span =
+            tracing::trace_span!("omfx::frame::auto_hooks", perfetto = true).entered();
         let now = std::time::Instant::now();
         if self.auto_clock_start.is_none() {
             self.auto_clock_start = Some(now);
@@ -2610,6 +2920,7 @@ impl Plugin for Game {
                 }
             }
         }
+        drop(auto_hooks_span);
 
         // 延遲初始化在第一幀上共享 sprite 資源。
         if self.sprite_resources.is_none() {
@@ -2620,20 +2931,26 @@ impl Plugin for Game {
         if self.body_batch.is_none() {
             let material = self.sprite_resources.as_ref().unwrap().material.clone();
             self.body_batch = Some(sprite_resources::BatchedSpriteMesh::new(
-                scene, 4096, material,
+                scene,
+                STRESS_SAFE_BODY_BATCH_CAPACITY,
+                material,
             ));
         }
         if self.hp_batch.is_none() {
             let material = self.sprite_resources.as_ref().unwrap().material.clone();
-            // 8192 = 4096 個實體 × 2 (背景 + 背景)
+            // 2 slots per entity: background + foreground.
             self.hp_batch = Some(sprite_resources::BatchedSpriteMesh::new(
-                scene, 8192, material,
+                scene,
+                STRESS_SAFE_HP_BATCH_CAPACITY,
+                material,
             ));
         }
         if self.facing_batch.is_none() {
             let material = self.sprite_resources.as_ref().unwrap().material.clone();
             self.facing_batch = Some(sprite_resources::BatchedSpriteMesh::new(
-                scene, 4096, material,
+                scene,
+                STRESS_SAFE_FACING_BATCH_CAPACITY,
+                material,
             ));
         }
 
@@ -2650,6 +2967,9 @@ impl Plugin for Game {
         // - 斷開連接 → 記錄。
         // TickBatch 每秒採樣一次，以避免日誌垃圾郵件。
         let mut forwarded_pending_input_ids: Vec<u32> = Vec::new();
+        let t_lockstep = std::time::Instant::now();
+        let event_drain_span =
+            tracing::trace_span!("omfx::frame::lockstep_event_drain", perfetto = true,).entered();
         if let (Some(ref lh), Some(ref sim)) = (
             self.lockstep_handle.as_ref(),
             self.sim_runner_handle.as_ref(),
@@ -2757,6 +3077,8 @@ impl Plugin for Game {
                 }
             }
         }
+        drop(event_drain_span);
+        let lockstep_ns = t_lockstep.elapsed().as_nanos();
 
         // 階段 3.4：讀取最新的 sim 快照並（存根）更新渲染
         // 橋。透過“try_lock”獲取，因此不會出現緩慢的渲染幀
@@ -2766,6 +3088,10 @@ impl Plugin for Game {
         // despawn，退休 NetworkBridge GameEvent → sprite pipeline
         // 下面是 SIM 權威擁有的實體。
         let mut applied_inputs_to_pair: Option<Vec<sim_runner::AppliedInputMeta>> = None;
+        let t_snapshot = std::time::Instant::now();
+        let mut render_bridge_ns: u128 = 0;
+        let snapshot_span =
+            tracing::trace_span!("omfx::frame::snapshot_consumption", perfetto = true,).entered();
         let sim_state_for_frame = if let Some(ref sim) = self.sim_runner_handle {
             self.wait_for_applied_input_snapshot(sim, &forwarded_pending_input_ids);
             Some(sim.state.clone())
@@ -2794,350 +3120,362 @@ impl Plugin for Game {
                     self.sim_lua_content_hash = snapshot.lua_content_hash.clone();
                 }
 
-                self.render_bridge.update(&*snapshot, scene);
-                applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
+                let runtime_tick_changed =
+                    self.render_pacing_last_snapshot_tick != Some(snapshot.tick);
+                if runtime_tick_changed {
+                    let t_render_bridge = std::time::Instant::now();
+                    self.render_bridge.update(&*snapshot, scene);
+                    render_bridge_ns += t_render_bridge.elapsed().as_nanos();
+                    applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
 
-                // 階段 5.x：HUD 心跳源自 sim 快照
-                // （NetworkBridge GameEvent 串流在第 5.1 階段被刪除；這
-                // 恢復頂線上的蜱/實體/英雄/小兵計數
-                // 英雄面板上的狀態文字和 hp / max_hp）。
-                self.heartbeat.tick = snapshot.tick as u64;
-                // sim_runner 以共享 lockstep cadence 運作。
-                self.heartbeat.game_time = ticks_to_seconds_f64(snapshot.tick);
-                self.heartbeat.entity_count = snapshot.entities.len() as u64;
-                self.heartbeat.hero_count = snapshot
-                    .entities
-                    .iter()
-                    .filter(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
-                    .count() as u64;
-                self.heartbeat.creep_count = snapshot
-                    .entities
-                    .iter()
-                    .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
-                    .count() as u64;
+                    // 階段 5.x：HUD 心跳源自 sim 快照
+                    // （NetworkBridge GameEvent 串流在第 5.1 階段被刪除；這
+                    // 恢復頂線上的蜱/實體/英雄/小兵計數
+                    // 英雄面板上的狀態文字和 hp / max_hp）。
+                    self.heartbeat.tick = snapshot.tick as u64;
+                    self.render_pacing_last_snapshot_tick = Some(snapshot.tick);
+                    self.update_sim_speed(snapshot.tick);
+                    // sim_runner 以共享 lockstep cadence 運作。
+                    self.heartbeat.game_time = ticks_to_seconds_f64(snapshot.tick);
+                    self.heartbeat.entity_count = snapshot.entities.len() as u64;
+                    self.heartbeat.hero_count = snapshot
+                        .entities
+                        .iter()
+                        .filter(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
+                        .count() as u64;
+                    self.heartbeat.creep_count = snapshot
+                        .entities
+                        .iter()
+                        .filter(|e| matches!(e.kind, sim_runner::EntityKind::Creep))
+                        .count() as u64;
 
-                // 階段 3.2：來自 sim 快照的 TD HUD 狀態。取代了
-                // 遺留的 NetworkBridge `apply_event` 寫入被切入
-                // 階段 5.1，使這些欄位保持預設狀態。開始
-                // 圓形按鈕文字 + LIVES 頂行都顯示這些內容。
-                self.current_round = snapshot.round;
-                self.total_rounds = snapshot.total_rounds;
-                self.round_is_running = snapshot.round_is_running;
-                self.hero_state.lives = snapshot.lives;
+                    // 階段 3.2：來自 sim 快照的 TD HUD 狀態。取代了
+                    // 遺留的 NetworkBridge `apply_event` 寫入被切入
+                    // 階段 5.1，使這些欄位保持預設狀態。開始
+                    // 圓形按鈕文字 + LIVES 頂行都顯示這些內容。
+                    self.current_round = snapshot.round;
+                    self.total_rounds = snapshot.total_rounds;
+                    self.round_is_running = snapshot.round_is_running;
+                    self.hero_state.lives = snapshot.lives;
 
-                // 階段 4.2：將模擬爆炸排入本地
-                // `active_explosions` 環形緩衝區。按刻度進行重複資料刪除
-                // 重新讀取相同快照的渲染幀不會
-                // 產生重複的環。環生命週期由下列因素驅動
-                // omfx 掛鐘（`elapsed += dt`）所以爆炸
-                // 動畫以獨立於 sim 的渲染速率運行
-                // 滴答率。
-                if !snapshot.explosions.is_empty()
-                    && self.sim_last_explosion_tick != Some(snapshot.tick)
-                {
-                    for ex in &snapshot.explosions {
-                        // ActiveExplosion 儲存**未翻轉**渲染座標
-                        // （後端 × WORLD_SCALE）。渲染路徑位於~第 2136 行
-                        // 在餵食 Fyrox 時應用單一「-x」翻轉
-                        // SceneDrawingContext（匹配 build_line_segment /
-                        // add_circle_lines 約定）。此處預翻
-                        // 會雙翻轉→鏡像爆炸位置。
-                        let render_pos =
-                            Vector2::new(ex.pos_x * WORLD_SCALE, ex.pos_y * WORLD_SCALE);
-                        let max_radius = ex.radius * WORLD_SCALE;
-                        let duration = (ex.duration_ms as f32 / 1000.0).max(0.05);
-                        self.active_explosions.push(ActiveExplosion {
-                            pos: render_pos,
-                            max_radius,
-                            duration,
-                            elapsed: 0.0,
-                        });
-                    }
-                    self.sim_last_explosion_tick = Some(snapshot.tick);
-                }
-
-                // TD 塔建立選單：種子 `td_template_order` + `td_templates`
-                // 來自第一個非空收據上的 snapshot.tower_templates。
-                // 階段 5.1 刪除了使用的遺留「tower_templates」遊戲事件
-                // 透過 apply_event 填充這些；右側建置選單
-                // 卡在 0 個按鈕上。首次建置後靜態（註冊表為
-                // 不可變的後腳本 DLL 載入），因此 !is_empty 防護運行
-                // 作為一擊。
-                if self.td_template_order.is_empty() && !snapshot.tower_templates.is_empty() {
-                    for t in snapshot.tower_templates.iter() {
-                        self.td_template_order.push(t.unit_id.clone());
-                        self.td_templates
-                            .insert(t.unit_id.clone(), td_template_from_snapshot(t));
-                    }
-                    let layout_placeholder = if self.td_templates.contains_key("tower_dart") {
-                        Some("tower_dart".to_string())
-                    } else {
-                        self.td_template_order.first().cloned()
-                    };
-                    if let Some(layout_placeholder) = layout_placeholder {
-                        while self.td_template_order.len() < TD_SHOP_LAYOUT_DEBUG_MIN_CARDS {
-                            self.td_template_order.push(layout_placeholder.clone());
-                        }
-                    }
-                    log::info!(
-                        "TD build menu seeded: {} snapshot towers, {} displayed cards",
-                        snapshot.tower_templates.len(),
-                        self.td_template_order.len()
-                    );
-                }
-
-                // 從 snapshot.tower_upgrades 上種子 `td_upgrade_defs` 緩存
-                // 第一張非空收據。銷售按鈕退款+升級按鈕
-                // 文字均從此處讀取。首次建置後靜態（登錄
-                // 是不可變的後腳本 DLL 載入）。
-                if self.td_upgrade_defs.is_empty() && !snapshot.tower_upgrades.is_empty() {
-                    for d in snapshot.tower_upgrades.iter() {
-                        self.td_upgrade_defs.insert(
-                            (d.tower_kind.clone(), d.path, d.level),
-                            (d.name.clone(), d.description.clone(), d.cost),
-                        );
-                    }
-                    log::info!(
-                        "TD upgrade defs seeded: {} entries from snapshot",
-                        self.td_upgrade_defs.len()
-                    );
-                }
-
-                // 將 Mirror Tower 實體從快照轉換為“network_entities”
-                // 所以塔選擇/出售/升級用戶界面（上面寫著
-                // `network_entities`) 在遺留後繼續工作
-                // GameEvent 路径被切断。僅鏡像塔條目 —
-                // 選擇/出售/升級UI是唯一的消費者
-                // 仍然查詢這張地圖。
-                {
-                    use std::collections::HashSet;
-                    let mut alive_towers: HashSet<u32> = HashSet::new();
-                    for e in snapshot.entities.iter() {
-                        if !matches!(e.kind, sim_runner::EntityKind::Tower) {
-                            continue;
-                        }
-                        alive_towers.insert(e.entity_id);
-                        let tower_kind = if e.unit_id.is_empty() {
-                            None
-                        } else {
-                            Some(e.unit_id.clone())
-                        };
-                        let (footprint_backend, template_range_backend) = tower_kind
-                            .as_deref()
-                            .and_then(|uid| self.td_templates.get(uid))
-                            .map(|t| (t.footprint_backend, t.range_backend))
-                            .unwrap_or((0.4, 0.0));
-                        let range_backend = if e.attack_range > 0.0 {
-                            e.attack_range
-                        } else {
-                            template_range_backend
-                        };
-                        let pos = Vector2::new(e.pos_x * WORLD_SCALE, e.pos_y * WORLD_SCALE);
-                        let entry = self
-                            .network_entities
-                            .entry(e.entity_id)
-                            .or_insert_with(NetworkEntity::default);
-                        entry.entity_type = "tower".to_string();
-                        entry.position = pos;
-                        entry.tower_kind = tower_kind;
-                        entry.upgrade_levels = e.upgrade_levels.unwrap_or([0; 3]);
-                        entry.collision_radius_render = footprint_backend * WORLD_SCALE;
-                        entry.attack_range_backend = range_backend;
-                    }
-                    self.network_entities
-                        .retain(|id, ent| ent.entity_type != "tower" || alive_towers.contains(id));
-                }
-
-                // 階段 4.5：AbilityRegistry→ability_info_map。靜止的
-                // 在第一個非空弧之後；僅種子缺失條目
-                // 所以任何後端推送的AbilityInfo (cooldown / mana_cost
-                // 不在登錄中的陣列）不會被破壞。這
-                // display_name/max_level/icon路徑涵蓋了基本
-                // 工具提示路徑；沒有時冷卻查找回落到 0
-                // 存在條目（現有 UI 可以優雅地處理該條目）。
-                if !snapshot.abilities.is_empty() {
-                    for def in snapshot.abilities.iter() {
-                        let entry = self
-                            .ability_info_map
-                            .entry(def.ability_id.clone())
-                            .or_insert_with(|| AbilityInfo {
-                                id: def.ability_id.clone(),
-                                ..Default::default()
+                    // 階段 4.2：將模擬爆炸排入本地
+                    // `active_explosions` 環形緩衝區。按刻度進行重複資料刪除
+                    // 重新讀取相同快照的渲染幀不會
+                    // 產生重複的環。環生命週期由下列因素驅動
+                    // omfx 掛鐘（`elapsed += dt`）所以爆炸
+                    // 動畫以獨立於 sim 的渲染速率運行
+                    // 滴答率。
+                    if !snapshot.explosions.is_empty()
+                        && self.sim_last_explosion_tick != Some(snapshot.tick)
+                    {
+                        for ex in &snapshot.explosions {
+                            // ActiveExplosion 儲存**未翻轉**渲染座標
+                            // （後端 × WORLD_SCALE）。渲染路徑位於~第 2136 行
+                            // 在餵食 Fyrox 時應用單一「-x」翻轉
+                            // SceneDrawingContext（匹配 build_line_segment /
+                            // add_circle_lines 約定）。此處預翻
+                            // 會雙翻轉→鏡像爆炸位置。
+                            let render_pos =
+                                Vector2::new(ex.pos_x * WORLD_SCALE, ex.pos_y * WORLD_SCALE);
+                            let max_radius = ex.radius * WORLD_SCALE;
+                            let duration = (ex.duration_ms as f32 / 1000.0).max(0.05);
+                            self.active_explosions.push(ActiveExplosion {
+                                pos: render_pos,
+                                max_radius,
+                                duration,
+                                elapsed: 0.0,
                             });
-                        if entry.name.is_empty() {
-                            entry.name = def.display_name.clone();
                         }
-                        if !def.icon_path.is_empty() && entry.icon_path != def.icon_path {
-                            entry.icon_path = def.icon_path.clone();
-                        }
-                        if entry.max_level == 0 {
-                            entry.max_level = def.max_level as i32;
-                        }
+                        self.sim_last_explosion_tick = Some(snapshot.tick);
                     }
-                }
 
-                // 階段 4.1：渲染座標中的 BlockedRegion 多邊形
-                // 放置驗證（下面檢查“circle_hits_polygon”）。
-                // 世界初始化後靜態，但便宜（〜少數區域最大）；
-                // 覆蓋每個刻度而不是髒標誌追蹤。
-                if !snapshot.blocked_regions.is_empty()
-                    && self.td_regions_render.len() != snapshot.blocked_regions.len()
-                {
-                    self.td_regions_render = snapshot
-                        .blocked_regions
-                        .iter()
-                        .map(|r| {
-                            r.points
-                                .iter()
-                                .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
-                                .collect()
-                        })
-                        .collect();
-                }
-                // 階段 3.x：渲染座標中的 TD 路徑檢查點
-                // `point_segment_dist_sq` 放置檢查。同樣的一擊
-                // 作為區域的人口格局。
-                if !snapshot.paths.is_empty() && self.td_paths_render.len() != snapshot.paths.len()
-                {
-                    self.td_paths_render = snapshot
-                        .paths
-                        .iter()
-                        .map(|p| {
-                            p.iter()
-                                .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
-                                .collect()
-                        })
-                        .collect();
-                }
-
-                // 第一個英雄實體驅動英雄面板。現在實體渲染數據
-                // 攜帶英雄元資料（名稱/頭銜/等級/經驗值/金幣/
-                // 力量/敏捷/智力/主要屬性）所以
-                // 面板可以以與舊版 NetworkBridge 路徑相同的方式呈現。
-                if let Some(hero) = snapshot
-                    .entities
-                    .iter()
-                    .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
-                {
-                    self.hero_state.hp = hero.hp as f32;
-                    self.hero_state.max_hp = hero.max_hp as f32;
-                    self.hero_state.name = hero.hero_name.clone();
-                    self.hero_state.title = hero.hero_title.clone();
-                    self.hero_state.level = hero.hero_level;
-                    self.hero_state.xp = hero.hero_xp;
-                    self.hero_state.xp_next = hero.hero_xp_next;
-                    self.hero_state.skill_points = hero.hero_skill_points;
-                    self.hero_state.primary_attribute = hero.hero_primary_attribute.clone();
-                    self.hero_state.strength = hero.hero_strength;
-                    self.hero_state.agility = hero.hero_agility;
-                    self.hero_state.intelligence = hero.hero_intelligence;
-                    self.hero_state.gold = hero.gold;
-                    self.hero_state.entity_id = Some(hero.entity_id);
-
-                    // 階段 3.3：源自 sim 的派生英雄統計數據
-                    // 聚合 (HeroStatsExt) — 取代舊版
-                    // omb `hero.stats` 0.3s 廣播階段 5.1
-                    // 切。鏡像 omb `build_hero_stats_payload` 1:1。
-                    if let Some(ext) = hero.hero_ext.as_deref() {
-                        self.hero_state.armor = ext.armor;
-                        self.hero_state.magic_resist = ext.magic_resist;
-                        self.hero_state.move_speed = ext.move_speed;
-                        self.hero_state.attack_damage = ext.attack_damage;
-                        self.hero_state.attack_interval = ext.attack_speed_sec;
-                        self.hero_state.attack_range = ext.attack_range;
-                        self.hero_state.bullet_speed = ext.bullet_speed;
-
-                        // BUFF快照重設為權威值
-                        // 每個刻度。渲染端每幀倒數計時
-                        // （由現有的 buff 計時器代碼處理
-                        // 如下）使顯示的秒數保持平滑
-                        // 快照之間。
-                        self.hero_state.buffs = ext
-                            .buffs
-                            .iter()
-                            .map(|b| LocalBuff {
-                                id: b.buff_id.clone(),
-                                remaining: b.remaining_secs,
-                                payload: serde_json::from_str(&b.payload_json)
-                                    .unwrap_or(serde_json::Value::Null),
-                            })
-                            .collect();
-
-                        // 階段 4.4：快照中的英雄清單。每個
-                        // slot 變成 `Some((item_id, cd))` — cd 開始
-                        // 為 0，因為快照不包含每個項目
-                        // 今天冷卻（Inventory.ItemInstance 有它
-                        // 但我們只投影item_id；本地 CD
-                        // 每幀遞減 `(_, cd)` 的程式碼
-                        // 當 cd=0 時保持無害）。空槽位圖
-                        // 為“None”，匹配舊版 UI 合約。
-                        // 調整大小為 6，以防英雄狀態為
-                        // 早些時候用較小的 Vec 初始化。
-                        if self.hero_state.inventory.len() < 6 {
-                            self.hero_state.inventory.resize(6, None);
+                    // TD 塔建立選單：種子 `td_template_order` + `td_templates`
+                    // 來自第一個非空收據上的 snapshot.tower_templates。
+                    // 階段 5.1 刪除了使用的遺留「tower_templates」遊戲事件
+                    // 透過 apply_event 填充這些；右側建置選單
+                    // 卡在 0 個按鈕上。首次建置後靜態（註冊表為
+                    // 不可變的後腳本 DLL 載入），因此 !is_empty 防護運行
+                    // 作為一擊。
+                    if self.td_template_order.is_empty() && !snapshot.tower_templates.is_empty() {
+                        for t in snapshot.tower_templates.iter() {
+                            self.td_template_order.push(t.unit_id.clone());
+                            self.td_templates
+                                .insert(t.unit_id.clone(), td_template_from_snapshot(t));
                         }
-                        for (i, slot) in ext.inventory.iter().enumerate().take(6) {
-                            let prev_cd = self
-                                .hero_state
-                                .inventory
-                                .get(i)
-                                .and_then(Option::as_ref)
-                                .map(|(prev_id, cd)| {
-                                    // 僅在相同項目時保留 CD
-                                    // 仍在插槽中（否則
-                                    // 插槽已交換 — 重設 CD）。
-                                    if Some(prev_id.as_str()) == slot.as_deref() {
-                                        *cd
-                                    } else {
-                                        0.0
-                                    }
-                                })
-                                .unwrap_or(0.0);
-                            self.hero_state.inventory[i] =
-                                slot.as_ref().map(|id| (id.clone(), prev_cd));
-                        }
-
-                        // 階段 4.5：能力 ID + 快照等級。
-                        // `Hero.bility` (Vec<String>) 驅動
-                        // Q/W/E/R 訂單； `ability_levels[i]` 反映了
-                        // omb HashMap 投影。本地 `ability_cd` 是
-                        // 每個畫面都打勾；我們只播種到 0
-                        // 對於新發現的能力 ID，
-                        // 飛行中的 CD 不會在每個快照上重置。
-                        let new_abilities: Vec<String> = ext
-                            .ability_ids
-                            .iter()
-                            .filter_map(|opt| opt.clone())
-                            .collect();
-                        if new_abilities != self.hero_state.abilities {
-                            self.hero_state.abilities = new_abilities.clone();
-                        }
-                        self.hero_state.ability_levels.clear();
-                        for (i, id_opt) in ext.ability_ids.iter().enumerate() {
-                            if let Some(id) = id_opt {
-                                self.hero_state
-                                    .ability_levels
-                                    .insert(id.clone(), ext.ability_levels[i]);
-                                self.hero_state.ability_cd.entry(id.clone()).or_insert(0.0);
+                        let layout_placeholder = if self.td_templates.contains_key("tower_dart") {
+                            Some("tower_dart".to_string())
+                        } else {
+                            self.td_template_order.first().cloned()
+                        };
+                        if let Some(layout_placeholder) = layout_placeholder {
+                            while self.td_template_order.len() < TD_SHOP_LAYOUT_DEBUG_MIN_CARDS {
+                                self.td_template_order.push(layout_placeholder.clone());
                             }
                         }
-                    } else {
-                        // 英雄實體存在但聚合缺失
-                        // （不應該發生 - UnitStats 路徑始終
-                        // 為英雄手臂奔跑）。歸零以避免
-                        // 陳舊的遺留價值。
-                        self.hero_state.armor = 0.0;
-                        self.hero_state.magic_resist = 0.0;
-                        self.hero_state.move_speed = 0.0;
-                        self.hero_state.attack_damage = 0.0;
-                        self.hero_state.attack_interval = 0.0;
-                        self.hero_state.attack_range = 0.0;
-                        self.hero_state.bullet_speed = 0.0;
-                        self.hero_state.buffs.clear();
+                        log::info!(
+                            "TD build menu seeded: {} snapshot towers, {} displayed cards",
+                            snapshot.tower_templates.len(),
+                            self.td_template_order.len()
+                        );
+                    }
+
+                    // 從 snapshot.tower_upgrades 上種子 `td_upgrade_defs` 緩存
+                    // 第一張非空收據。銷售按鈕退款+升級按鈕
+                    // 文字均從此處讀取。首次建置後靜態（登錄
+                    // 是不可變的後腳本 DLL 載入）。
+                    if self.td_upgrade_defs.is_empty() && !snapshot.tower_upgrades.is_empty() {
+                        for d in snapshot.tower_upgrades.iter() {
+                            self.td_upgrade_defs.insert(
+                                (d.tower_kind.clone(), d.path, d.level),
+                                (d.name.clone(), d.description.clone(), d.cost),
+                            );
+                        }
+                        log::info!(
+                            "TD upgrade defs seeded: {} entries from snapshot",
+                            self.td_upgrade_defs.len()
+                        );
+                    }
+
+                    // 將 Mirror Tower 實體從快照轉換為“network_entities”
+                    // 所以塔選擇/出售/升級用戶界面（上面寫著
+                    // `network_entities`) 在遺留後繼續工作
+                    // GameEvent 路径被切断。僅鏡像塔條目 —
+                    // 選擇/出售/升級UI是唯一的消費者
+                    // 仍然查詢這張地圖。
+                    {
+                        use std::collections::HashSet;
+                        let mut alive_towers: HashSet<u32> = HashSet::new();
+                        for e in snapshot.entities.iter() {
+                            if !matches!(e.kind, sim_runner::EntityKind::Tower) {
+                                continue;
+                            }
+                            alive_towers.insert(e.entity_id);
+                            let tower_kind = if e.unit_id.is_empty() {
+                                None
+                            } else {
+                                Some(e.unit_id.clone())
+                            };
+                            let (footprint_backend, template_range_backend) = tower_kind
+                                .as_deref()
+                                .and_then(|uid| self.td_templates.get(uid))
+                                .map(|t| (t.footprint_backend, t.range_backend))
+                                .unwrap_or((0.4, 0.0));
+                            let range_backend = if e.attack_range > 0.0 {
+                                e.attack_range
+                            } else {
+                                template_range_backend
+                            };
+                            let pos = Vector2::new(e.pos_x * WORLD_SCALE, e.pos_y * WORLD_SCALE);
+                            let entry = self
+                                .network_entities
+                                .entry(e.entity_id)
+                                .or_insert_with(NetworkEntity::default);
+                            entry.entity_type = "tower".to_string();
+                            entry.position = pos;
+                            entry.tower_kind = tower_kind;
+                            entry.upgrade_levels = e.upgrade_levels.unwrap_or([0; 3]);
+                            entry.collision_radius_render = footprint_backend * WORLD_SCALE;
+                            entry.attack_range_backend = range_backend;
+                        }
+                        self.network_entities.retain(|id, ent| {
+                            ent.entity_type != "tower" || alive_towers.contains(id)
+                        });
+                    }
+
+                    // 階段 4.5：AbilityRegistry→ability_info_map。靜止的
+                    // 在第一個非空弧之後；僅種子缺失條目
+                    // 所以任何後端推送的AbilityInfo (cooldown / mana_cost
+                    // 不在登錄中的陣列）不會被破壞。這
+                    // display_name/max_level/icon路徑涵蓋了基本
+                    // 工具提示路徑；沒有時冷卻查找回落到 0
+                    // 存在條目（現有 UI 可以優雅地處理該條目）。
+                    if !snapshot.abilities.is_empty() {
+                        for def in snapshot.abilities.iter() {
+                            let entry = self
+                                .ability_info_map
+                                .entry(def.ability_id.clone())
+                                .or_insert_with(|| AbilityInfo {
+                                    id: def.ability_id.clone(),
+                                    ..Default::default()
+                                });
+                            if entry.name.is_empty() {
+                                entry.name = def.display_name.clone();
+                            }
+                            if !def.icon_path.is_empty() && entry.icon_path != def.icon_path {
+                                entry.icon_path = def.icon_path.clone();
+                            }
+                            if entry.max_level == 0 {
+                                entry.max_level = def.max_level as i32;
+                            }
+                        }
+                    }
+
+                    // 階段 4.1：渲染座標中的 BlockedRegion 多邊形
+                    // 放置驗證（下面檢查“circle_hits_polygon”）。
+                    // 世界初始化後靜態，但便宜（〜少數區域最大）；
+                    // 覆蓋每個刻度而不是髒標誌追蹤。
+                    if !snapshot.blocked_regions.is_empty()
+                        && self.td_regions_render.len() != snapshot.blocked_regions.len()
+                    {
+                        self.td_regions_render = snapshot
+                            .blocked_regions
+                            .iter()
+                            .map(|r| {
+                                r.points
+                                    .iter()
+                                    .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
+                                    .collect()
+                            })
+                            .collect();
+                    }
+                    // 階段 3.x：渲染座標中的 TD 路徑檢查點
+                    // `point_segment_dist_sq` 放置檢查。同樣的一擊
+                    // 作為區域的人口格局。
+                    if !snapshot.paths.is_empty()
+                        && self.td_paths_render.len() != snapshot.paths.len()
+                    {
+                        self.td_paths_render = snapshot
+                            .paths
+                            .iter()
+                            .map(|p| {
+                                p.iter()
+                                    .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
+                                    .collect()
+                            })
+                            .collect();
+                    }
+
+                    // 第一個英雄實體驅動英雄面板。現在實體渲染數據
+                    // 攜帶英雄元資料（名稱/頭銜/等級/經驗值/金幣/
+                    // 力量/敏捷/智力/主要屬性）所以
+                    // 面板可以以與舊版 NetworkBridge 路徑相同的方式呈現。
+                    if let Some(hero) = snapshot
+                        .entities
+                        .iter()
+                        .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
+                    {
+                        self.hero_state.hp = hero.hp as f32;
+                        self.hero_state.max_hp = hero.max_hp as f32;
+                        self.hero_state.name = hero.hero_name.clone();
+                        self.hero_state.title = hero.hero_title.clone();
+                        self.hero_state.level = hero.hero_level;
+                        self.hero_state.xp = hero.hero_xp;
+                        self.hero_state.xp_next = hero.hero_xp_next;
+                        self.hero_state.skill_points = hero.hero_skill_points;
+                        self.hero_state.primary_attribute = hero.hero_primary_attribute.clone();
+                        self.hero_state.strength = hero.hero_strength;
+                        self.hero_state.agility = hero.hero_agility;
+                        self.hero_state.intelligence = hero.hero_intelligence;
+                        self.hero_state.gold = hero.gold;
+                        self.hero_state.entity_id = Some(hero.entity_id);
+
+                        // 階段 3.3：源自 sim 的派生英雄統計數據
+                        // 聚合 (HeroStatsExt) — 取代舊版
+                        // omb `hero.stats` 0.3s 廣播階段 5.1
+                        // 切。鏡像 omb `build_hero_stats_payload` 1:1。
+                        if let Some(ext) = hero.hero_ext.as_deref() {
+                            self.hero_state.armor = ext.armor;
+                            self.hero_state.magic_resist = ext.magic_resist;
+                            self.hero_state.move_speed = ext.move_speed;
+                            self.hero_state.attack_damage = ext.attack_damage;
+                            self.hero_state.attack_interval = ext.attack_speed_sec;
+                            self.hero_state.attack_range = ext.attack_range;
+                            self.hero_state.bullet_speed = ext.bullet_speed;
+
+                            // BUFF快照重設為權威值
+                            // 每個刻度。渲染端每幀倒數計時
+                            // （由現有的 buff 計時器代碼處理
+                            // 如下）使顯示的秒數保持平滑
+                            // 快照之間。
+                            self.hero_state.buffs = ext
+                                .buffs
+                                .iter()
+                                .map(|b| LocalBuff {
+                                    id: b.buff_id.clone(),
+                                    remaining: b.remaining_secs,
+                                    payload: serde_json::from_str(&b.payload_json)
+                                        .unwrap_or(serde_json::Value::Null),
+                                })
+                                .collect();
+
+                            // 階段 4.4：快照中的英雄清單。每個
+                            // slot 變成 `Some((item_id, cd))` — cd 開始
+                            // 為 0，因為快照不包含每個項目
+                            // 今天冷卻（Inventory.ItemInstance 有它
+                            // 但我們只投影item_id；本地 CD
+                            // 每幀遞減 `(_, cd)` 的程式碼
+                            // 當 cd=0 時保持無害）。空槽位圖
+                            // 為“None”，匹配舊版 UI 合約。
+                            // 調整大小為 6，以防英雄狀態為
+                            // 早些時候用較小的 Vec 初始化。
+                            if self.hero_state.inventory.len() < 6 {
+                                self.hero_state.inventory.resize(6, None);
+                            }
+                            for (i, slot) in ext.inventory.iter().enumerate().take(6) {
+                                let prev_cd = self
+                                    .hero_state
+                                    .inventory
+                                    .get(i)
+                                    .and_then(Option::as_ref)
+                                    .map(|(prev_id, cd)| {
+                                        // 僅在相同項目時保留 CD
+                                        // 仍在插槽中（否則
+                                        // 插槽已交換 — 重設 CD）。
+                                        if Some(prev_id.as_str()) == slot.as_deref() {
+                                            *cd
+                                        } else {
+                                            0.0
+                                        }
+                                    })
+                                    .unwrap_or(0.0);
+                                self.hero_state.inventory[i] =
+                                    slot.as_ref().map(|id| (id.clone(), prev_cd));
+                            }
+
+                            // 階段 4.5：能力 ID + 快照等級。
+                            // `Hero.bility` (Vec<String>) 驅動
+                            // Q/W/E/R 訂單； `ability_levels[i]` 反映了
+                            // omb HashMap 投影。本地 `ability_cd` 是
+                            // 每個畫面都打勾；我們只播種到 0
+                            // 對於新發現的能力 ID，
+                            // 飛行中的 CD 不會在每個快照上重置。
+                            let new_abilities: Vec<String> = ext
+                                .ability_ids
+                                .iter()
+                                .filter_map(|opt| opt.clone())
+                                .collect();
+                            if new_abilities != self.hero_state.abilities {
+                                self.hero_state.abilities = new_abilities.clone();
+                            }
+                            self.hero_state.ability_levels.clear();
+                            for (i, id_opt) in ext.ability_ids.iter().enumerate() {
+                                if let Some(id) = id_opt {
+                                    self.hero_state
+                                        .ability_levels
+                                        .insert(id.clone(), ext.ability_levels[i]);
+                                    self.hero_state.ability_cd.entry(id.clone()).or_insert(0.0);
+                                }
+                            }
+                        } else {
+                            // 英雄實體存在但聚合缺失
+                            // （不應該發生 - UnitStats 路徑始終
+                            // 為英雄手臂奔跑）。歸零以避免
+                            // 陳舊的遺留價值。
+                            self.hero_state.armor = 0.0;
+                            self.hero_state.magic_resist = 0.0;
+                            self.hero_state.move_speed = 0.0;
+                            self.hero_state.attack_damage = 0.0;
+                            self.hero_state.attack_interval = 0.0;
+                            self.hero_state.attack_range = 0.0;
+                            self.hero_state.bullet_speed = 0.0;
+                            self.hero_state.buffs.clear();
+                        }
                     }
                 }
             }
         }
+        drop(snapshot_span);
+        let snapshot_ns = t_snapshot.elapsed().as_nanos();
         if let Some(inputs) = applied_inputs_to_pair.as_deref() {
             self.pair_applied_inputs(inputs);
         } else {
@@ -3172,6 +3510,12 @@ impl Plugin for Game {
         let events_ns = t_events.elapsed().as_nanos();
 
         // 4. 插入實體位置（客戶端 lerp）
+        let interp_span = tracing::trace_span!(
+            "omfx::frame::entity_interpolation_and_batches",
+            perfetto = true,
+            network_entities = self.network_entities.len(),
+        )
+        .entered();
         let t_interp = std::time::Instant::now();
         let dt = context.dt;
         // P7 layered: 預先 sum 每個 target 的 applied 預測扣血，HP bar 渲染時減去。
@@ -3401,11 +3745,14 @@ impl Plugin for Game {
         scene.graph.update_hierarchical_data();
 
         let interp_ns = t_interp.elapsed().as_nanos();
+        drop(interp_span);
 
         // TD 塔預覽圓圈：選中塔時每 frame 在滑鼠位置重畫 footprint + 攻擊範圍兩圈。
         // 用 SceneDrawingContext（drawing_context 已在 update() 開頭被 clear_lines()），
         // 不再 per-frame 增刪 24+48=72 個 RectangleBuilder node。
         let t_visual = std::time::Instant::now();
+        let visual_span =
+            tracing::trace_span!("omfx::frame::visual_debug", perfetto = true).entered();
         {
             if let Some(kind) = self.selected_tower_kind.clone() {
                 if let Some(tpl) = self.td_templates.get(&kind).cloned() {
@@ -3517,6 +3864,7 @@ impl Plugin for Game {
         }
 
         let visual_ns = t_visual.elapsed().as_nanos();
+        drop(visual_span);
 
         // 4b.推進客戶模擬的彈體（追擊目標
         // 目前插值位置； t 在 Flight_time 處強制為 1）。
@@ -3529,6 +3877,13 @@ impl Plugin for Game {
         // 收 id 後在 loop 結束後一起做（避免 self.client_projectiles 與 self.pending_pred_dmg
         // 同時 mut borrow 的 split-borrow 麻煩）。
         let mut predicted_apply_ids: Vec<u32> = Vec::new();
+        let projectile_span = tracing::trace_span!(
+            "omfx::frame::projectiles_and_vfx",
+            perfetto = true,
+            projectiles = self.client_projectiles.len(),
+            explosions = self.active_explosions.len(),
+        )
+        .entered();
         for (id, proj) in self.client_projectiles.iter_mut() {
             proj.elapsed += dt;
             let t = (proj.elapsed / proj.flight_time).clamp(0.0, 1.0);
@@ -3598,10 +3953,12 @@ impl Plugin for Game {
         }
 
         let proj_ns = t_proj.elapsed().as_nanos();
+        drop(projectile_span);
 
         // 4c. Camera follow hero（MOBA 模式）或 固定俯視（TD 模式）
         //     TD 模式下：相機固定在地圖中心、拉遠到能看完整條路線。
         let t_cam = std::time::Instant::now();
+        let camera_span = tracing::trace_span!("omfx::frame::camera", perfetto = true).entered();
         if self.is_td_mode {
             if !self.td_camera_configured {
                 // 一次性：放大視角、鎖定在原點
@@ -3636,9 +3993,17 @@ impl Plugin for Game {
         }
 
         let cam_ns = t_cam.elapsed().as_nanos();
+        drop(camera_span);
 
         // 5.更新姓名標籤（UI層）
         let t_ui = std::time::Instant::now();
+        let ui_span = tracing::trace_span!(
+            "omfx::frame::ui",
+            perfetto = true,
+            labels = self.sim_entity_labels.len(),
+            pending_labels = self.pending_label_deletions.len(),
+        )
+        .entered();
         let ui = context.user_interfaces.first_mut();
         let win = self.window_size;
 
@@ -3740,140 +4105,150 @@ impl Plugin for Game {
         // 透過“sim_entity_labels”同步。
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
-                let mut alive = std::collections::HashSet::with_capacity(snapshot.entities.len());
-                let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
-                for entity in &snapshot.entities {
-                    // Skip Other (internal ECS rows) and Projectile (子彈不需要標名稱).
-                    if matches!(
-                        entity.kind,
-                        sim_runner::EntityKind::Other | sim_runner::EntityKind::Projectile
-                    ) {
-                        continue;
+                const SIM_NAME_LABEL_HIDE_THRESHOLD: usize = 200;
+                let labels_hidden =
+                    snapshot.entities.len() > SIM_NAME_LABEL_HIDE_THRESHOLD && !self.alt_held;
+                if labels_hidden {
+                    for (_, slot) in self.sim_entity_labels.drain() {
+                        ui.send(slot.handle, WidgetMessage::Remove);
                     }
-                    alive.insert(entity.entity_id);
+                } else {
+                    let mut alive =
+                        std::collections::HashSet::with_capacity(snapshot.entities.len());
+                    let world_height = if self.is_td_mode { 28.0 } else { 20.0 };
+                    for entity in &snapshot.entities {
+                        // Skip Other (internal ECS rows) and Projectile (子彈不需要標名稱).
+                        if matches!(
+                            entity.kind,
+                            sim_runner::EntityKind::Other | sim_runner::EntityKind::Projectile
+                        ) {
+                            continue;
+                        }
+                        alive.insert(entity.entity_id);
 
-                    // 顯示名稱：更喜歡hero_name（英雄），否則unit_id sans
-                    // 模板前綴，否則回退到“#<id>”。
-                    let display_name = if !entity.hero_name.is_empty() {
-                        entity.hero_name.clone()
-                    } else if !entity.unit_id.is_empty() {
-                        entity
-                            .unit_id
-                            .strip_prefix("creep_")
-                            .or_else(|| entity.unit_id.strip_prefix("tower_"))
-                            .or_else(|| entity.unit_id.strip_prefix("hero_"))
-                            .or_else(|| entity.unit_id.strip_prefix("unit_"))
-                            .unwrap_or(&entity.unit_id)
-                            .to_string()
-                    } else {
-                        format!("#{}", entity.entity_id)
-                    };
-                    // Tower 標籤：只在有升級時顯示「L0/L1/L2」格式，無升級不顯示
-                    // 任何文字（也不顯示 HP — 塔不需要 HP 資訊）。Hero/Creep 走
-                    // 既有 "name HP/MaxHP" 格式。
-                    let is_tower = matches!(entity.kind, sim_runner::EntityKind::Tower);
-                    // 跳過為沒有升級的塔繪製標籤小工具。
-                    // 標記為不活動，以便循環後保留步驟刪除任何
-                    // 從前一幀中徘徊的陳舊小部件
-                    // （例如，塔剛剛出售或從未升級）。
-                    if is_tower
-                        && entity
-                            .upgrade_levels
-                            .map_or(true, |lv| lv.iter().all(|&n| n == 0))
-                    {
-                        alive.remove(&entity.entity_id);
-                        continue;
-                    }
-                    let text = if is_tower {
-                        match entity.upgrade_levels {
-                            Some(lv) if lv.iter().any(|&n| n > 0) => {
-                                format!("{}/{}/{}", lv[0], lv[1], lv[2])
+                        // 顯示名稱：更喜歡hero_name（英雄），否則unit_id sans
+                        // 模板前綴，否則回退到“#<id>”。
+                        let display_name = if !entity.hero_name.is_empty() {
+                            entity.hero_name.clone()
+                        } else if !entity.unit_id.is_empty() {
+                            entity
+                                .unit_id
+                                .strip_prefix("creep_")
+                                .or_else(|| entity.unit_id.strip_prefix("tower_"))
+                                .or_else(|| entity.unit_id.strip_prefix("hero_"))
+                                .or_else(|| entity.unit_id.strip_prefix("unit_"))
+                                .unwrap_or(&entity.unit_id)
+                                .to_string()
+                        } else {
+                            format!("#{}", entity.entity_id)
+                        };
+                        // Tower 標籤：只在有升級時顯示「L0/L1/L2」格式，無升級不顯示
+                        // 任何文字（也不顯示 HP — 塔不需要 HP 資訊）。Hero/Creep 走
+                        // 既有 "name HP/MaxHP" 格式。
+                        let is_tower = matches!(entity.kind, sim_runner::EntityKind::Tower);
+                        // 跳過為沒有升級的塔繪製標籤小工具。
+                        // 標記為不活動，以便循環後保留步驟刪除任何
+                        // 從前一幀中徘徊的陳舊小部件
+                        // （例如，塔剛剛出售或從未升級）。
+                        if is_tower
+                            && entity
+                                .upgrade_levels
+                                .map_or(true, |lv| lv.iter().all(|&n| n == 0))
+                        {
+                            alive.remove(&entity.entity_id);
+                            continue;
+                        }
+                        let text = if is_tower {
+                            match entity.upgrade_levels {
+                                Some(lv) if lv.iter().any(|&n| n > 0) => {
+                                    format!("{}/{}/{}", lv[0], lv[1], lv[2])
+                                }
+                                _ => String::new(),
                             }
-                            _ => String::new(),
-                        }
-                    } else if entity.max_hp > 0 {
-                        format!("{} {}/{}", display_name, entity.hp.max(0), entity.max_hp)
-                    } else {
-                        display_name
-                    };
+                        } else if entity.max_hp > 0 {
+                            format!("{} {}/{}", display_name, entity.hp.max(0), entity.max_hp)
+                        } else {
+                            display_name
+                        };
 
-                    // BUG FIX (Phase 5.x): 之前用 backend coords 直接餵 world_to_screen_approx。
-                    // 該函式註解寫 "camera 的 -1 X scale 已把原本的翻轉抵消"，意思是它
-                    // 接受 backend X 直接乘 WORLD_SCALE（不需自己翻 -x），然後函式內 +X
-                    // world → +X screen 對應；sprite render 走 fyrox scene graph 經過
-                    // camera -1 X 翻轉後才到螢幕，正好抵消 render_bridge 的 -x flip。
-                    // 先前我多翻一次 → 名字跟 sprite 左右相反。
-                    const WORLD_SCALE: f32 = 0.01;
-                    let render_x = entity.pos_x * WORLD_SCALE;
-                    let render_y = entity.pos_y * WORLD_SCALE + 0.5;
-                    let screen_pos = world_to_screen_approx(
-                        render_x - self.camera_world_pos.x,
-                        render_y - self.camera_world_pos.y,
-                        win.x,
-                        win.y,
-                        world_height,
-                    );
-                    let pos = Vector2::new(screen_pos.x - 110.0, screen_pos.y - 24.0);
-
-                    if let Some(slot) = self.sim_entity_labels.get_mut(&entity.entity_id) {
-                        // 更新現有的 — gateway 以避免淹沒 UI 隊列。
-                        let pos_changed = (pos.x - slot.last_pos.x).abs() >= 1.0
-                            || (pos.y - slot.last_pos.y).abs() >= 1.0;
-                        if pos_changed {
-                            ui.send(slot.handle, WidgetMessage::DesiredPosition(pos));
-                            slot.last_pos = pos;
-                        }
-                        if text != slot.last_text {
-                            ui.send(slot.handle, TextMessage::Text(text.clone()));
-                            slot.last_text = text;
-                        }
-                    } else {
-                        // 該實體首次產生。
-                        let handle = TextBuilder::new(
-                            WidgetBuilder::new()
-                                .with_desired_position(pos)
-                                .with_width(220.0)
-                                .with_foreground(
-                                    Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into(),
-                                ),
-                        )
-                        .with_text(text.clone())
-                        .with_font_size(20.0.into())
-                        .with_horizontal_text_alignment(HorizontalAlignment::Center)
-                        .build(&mut ui.build_ctx());
-                        self.sim_entity_labels.insert(
-                            entity.entity_id,
-                            SimEntityLabel {
-                                handle,
-                                last_text: text,
-                                last_pos: pos,
-                            },
+                        // BUG FIX (Phase 5.x): 之前用 backend coords 直接餵 world_to_screen_approx。
+                        // 該函式註解寫 "camera 的 -1 X scale 已把原本的翻轉抵消"，意思是它
+                        // 接受 backend X 直接乘 WORLD_SCALE（不需自己翻 -x），然後函式內 +X
+                        // world → +X screen 對應；sprite render 走 fyrox scene graph 經過
+                        // camera -1 X 翻轉後才到螢幕，正好抵消 render_bridge 的 -x flip。
+                        // 先前我多翻一次 → 名字跟 sprite 左右相反。
+                        const WORLD_SCALE: f32 = 0.01;
+                        let render_x = entity.pos_x * WORLD_SCALE;
+                        let render_y = entity.pos_y * WORLD_SCALE + 0.5;
+                        let screen_pos = world_to_screen_approx(
+                            render_x - self.camera_world_pos.x,
+                            render_y - self.camera_world_pos.y,
+                            win.x,
+                            win.y,
+                            world_height,
                         );
-                    }
-                }
+                        let pos = Vector2::new(screen_pos.x - 110.0, screen_pos.y - 24.0);
 
-                // 不再出現在快照中的實體的消失標籤。
-                // 階段 1.6：快照現在有明確的 `removed_entity_ids`
-                // （在 sim_runner 中本地計算工人），替換
-                // 遺留 omb `entity.death` 遊戲事件。我們仍然保留著
-                // 「活著」-設置掃掠下方作為腰帶和吊帶防禦
-                // 針對其 eid 從未出現過的任何快取行
-                // `removed_entity_ids`（例如，在先前建立的標籤）
-                // 第一個 prev_alive 快照已填入）。
-                for &eid in &snapshot.removed_entity_ids {
-                    if let Some(slot) = self.sim_entity_labels.remove(&eid) {
-                        ui.send(slot.handle, WidgetMessage::Remove);
+                        if let Some(slot) = self.sim_entity_labels.get_mut(&entity.entity_id) {
+                            // 更新現有的 — gateway 以避免淹沒 UI 隊列。
+                            let pos_changed = (pos.x - slot.last_pos.x).abs() >= 1.0
+                                || (pos.y - slot.last_pos.y).abs() >= 1.0;
+                            if pos_changed {
+                                ui.send(slot.handle, WidgetMessage::DesiredPosition(pos));
+                                slot.last_pos = pos;
+                            }
+                            if text != slot.last_text {
+                                ui.send(slot.handle, TextMessage::Text(text.clone()));
+                                slot.last_text = text;
+                            }
+                        } else {
+                            // 該實體首次產生。
+                            let handle = TextBuilder::new(
+                                WidgetBuilder::new()
+                                    .with_desired_position(pos)
+                                    .with_width(220.0)
+                                    .with_foreground(
+                                        Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into(),
+                                    ),
+                            )
+                            .with_text(text.clone())
+                            .with_font_size(20.0.into())
+                            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                            .build(&mut ui.build_ctx());
+                            self.sim_entity_labels.insert(
+                                entity.entity_id,
+                                SimEntityLabel {
+                                    handle,
+                                    last_text: text,
+                                    last_pos: pos,
+                                },
+                            );
+                        }
                     }
-                }
-                let to_remove: Vec<u32> = self
-                    .sim_entity_labels
-                    .keys()
-                    .filter(|id| !alive.contains(id))
-                    .copied()
-                    .collect();
-                for id in to_remove {
-                    if let Some(slot) = self.sim_entity_labels.remove(&id) {
-                        ui.send(slot.handle, WidgetMessage::Remove);
+
+                    // 不再出現在快照中的實體的消失標籤。
+                    // 階段 1.6：快照現在有明確的 `removed_entity_ids`
+                    // （在 sim_runner 中本地計算工人），替換
+                    // 遺留 omb `entity.death` 遊戲事件。我們仍然保留著
+                    // 「活著」-設置掃掠下方作為腰帶和吊帶防禦
+                    // 針對其 eid 從未出現過的任何快取行
+                    // `removed_entity_ids`（例如，在先前建立的標籤）
+                    // 第一個 prev_alive 快照已填入）。
+                    for &eid in &snapshot.removed_entity_ids {
+                        if let Some(slot) = self.sim_entity_labels.remove(&eid) {
+                            ui.send(slot.handle, WidgetMessage::Remove);
+                        }
+                    }
+                    let to_remove: Vec<u32> = self
+                        .sim_entity_labels
+                        .keys()
+                        .filter(|id| !alive.contains(id))
+                        .copied()
+                        .collect();
+                    for id in to_remove {
+                        if let Some(slot) = self.sim_entity_labels.remove(&id) {
+                            ui.send(slot.handle, WidgetMessage::Remove);
+                        }
                     }
                 }
             }
@@ -3899,19 +4274,20 @@ impl Plugin for Game {
                     Some(us) => format!("{:.1} ms", us as f64 / 1000.0),
                     None => "—".into(),
                 };
-                let lag_str = if self.input_latency_meter.has_samples() {
-                    format!(
-                        "p50 {} / p99 {} ms",
-                        self.input_latency_meter.cached_p50_ms,
-                        self.input_latency_meter.cached_p99_ms,
-                    )
-                } else {
-                    "—".into()
-                };
+                let lag_str = format_input_lag_status(
+                    &self.input_latency_meter,
+                    oldest_pending_input_age_ms(&self.pending_inputs, wall_clock_us()),
+                );
+                let sim_lag_ticks = self
+                    .current_sim_tick
+                    .saturating_sub(self.heartbeat.tick as u32);
                 format!(
-                    "Connected | Ping: {} | Lag: {} | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
+                    "Connected | Ping: {} | Lag: {} | Sim: {:.0}/{:.0}Hz lag={}t | Tick: {} | Time: {:.1} | Entities: {} | Heroes: {} | Creeps: {} | Net: {} wire / {} logical",
                     ping_str,
                     lag_str,
+                    self.sim_speed_tps,
+                    LOCKSTEP_TPS as f32,
+                    sim_lag_ticks,
                     self.heartbeat.tick,
                     self.heartbeat.game_time,
                     self.heartbeat.entity_count,
@@ -3931,10 +4307,8 @@ impl Plugin for Game {
         // 前一幀的渲染統計資訊（record_render_stats() 在更新結束時運行，
         // 所以這裡的值落後 1 幀 — 對於實時讀數來說很好）。
         let render_stats_part = format!(
-            "fps: {} | draws: {} | tris: {}",
-            self.frame_profile.last_fps,
-            self.frame_profile.last_draw_calls,
-            self.frame_profile.last_triangles,
+            "draws: {} | tris: {}",
+            self.frame_profile.last_draw_calls, self.frame_profile.last_triangles,
         );
         let status_str = if self.fps_display.is_empty() {
             format!("{} | {}", render_stats_part, connection_part)
@@ -5189,9 +5563,27 @@ impl Plugin for Game {
             }
         }
         let ui_ns = t_ui.elapsed().as_nanos();
+        drop(ui_span);
 
         let total_ns = frame_t0.elapsed().as_nanos();
+        let frame_stats_span =
+            tracing::trace_span!("omfx::frame::statistics", perfetto = true).entered();
+        let snapshot_reused = self.render_pacing_last_snapshot_tick.is_some()
+            && self.render_pacing_last_snapshot_tick == last_rendered_snapshot_tick;
+        self.render_pacing_last_frame_at = Some(frame_t0);
+        let render_target_tps = RENDER_UPDATE_TPS;
+        self.frame_profile.record_frame_interval(frame_interval);
+        self.frame_profile
+            .record_render_pacing(snapshot_reused, render_target_tps);
+        if let Some(ref sim) = self.sim_runner_handle {
+            if let Ok(diagnostics) = sim.diagnostics.try_lock() {
+                self.frame_profile.record_sim_diagnostics(&diagnostics);
+            }
+        }
         self.frame_profile.events_ns += events_ns;
+        self.frame_profile.lockstep_ns += lockstep_ns;
+        self.frame_profile.snapshot_ns += snapshot_ns;
+        self.frame_profile.render_bridge_ns += render_bridge_ns;
         self.frame_profile.interp_ns += interp_ns;
         self.frame_profile.visual_ns += visual_ns;
         self.frame_profile.proj_ns += proj_ns;
@@ -5207,6 +5599,8 @@ impl Plugin for Game {
                 .record_render_stats(&gc.renderer.get_statistics());
         }
         self.frame_profile.finish_frame();
+        drop(frame_stats_span);
+        drop(frame_span);
 
         Ok(())
     }
@@ -5852,6 +6246,24 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    fn update_sim_speed(&mut self, tick: u32) {
+        if tick == self.sim_speed_last_tick {
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(prev_at) = self.sim_speed_last_at {
+            let elapsed = now.duration_since(prev_at).as_secs_f32();
+            let delta_ticks = tick.saturating_sub(self.sim_speed_last_tick);
+            if elapsed > 0.0 && delta_ticks > 0 {
+                self.sim_speed_tps = delta_ticks as f32 / elapsed;
+                fyrox::engine::executor::set_render_target_tps(RENDER_UPDATE_TPS);
+            }
+        }
+        self.sim_speed_last_tick = tick;
+        self.sim_speed_last_at = Some(now);
+    }
+
     fn clear_lua_metadata_caches(&mut self) {
         self.td_templates.clear();
         self.td_template_order.clear();
@@ -6067,6 +6479,30 @@ impl Game {
         }
         let pos = scene.graph[handle].global_position();
         Some(Vector2::new(pos.x, pos.y))
+    }
+
+    fn projectile_owner_spawn_and_dir(
+        &self,
+        scene: &Scene,
+        entities: &[sim_runner::EntityRenderData],
+        owner_id: u32,
+    ) -> Option<(Vector2<f32>, Vector2<f32>)> {
+        let owner = entities.iter().find(|e| e.entity_id == owner_id)?;
+        let fallback_dir = tower_render_dir_from_world_rad(owner.facing_rad);
+        if let Some(pos) = self.hero_muzzle_render_pos(scene, owner_id) {
+            return Some((pos, fallback_dir));
+        }
+        if matches!(owner.kind, sim_runner::EntityKind::Tower) {
+            if let Some(tpl) = self.td_templates.get(&owner.unit_id) {
+                let owner_pos = render_bridge::world_to_render(owner);
+                let aim_angle =
+                    tower_render_angle_from_facing(owner.facing_rad, tpl.default_angle_deg);
+                let muzzle_pos = owner_pos
+                    + rotate_vec2(tower_render_offset(&tpl.muzzle_offset, 1.0), aim_angle);
+                return Some((muzzle_pos, fallback_dir));
+            }
+        }
+        Some((render_bridge::world_to_render(owner), fallback_dir))
     }
 
     fn request_hero_model_asset(
@@ -7119,6 +7555,10 @@ impl Game {
         let Ok(snapshot) = sim_state.try_lock() else {
             return;
         };
+        if self.sim_batches_last_snapshot_tick == Some(snapshot.tick) {
+            return;
+        }
+        self.sim_batches_last_snapshot_tick = Some(snapshot.tick);
 
         self.sim_seen_attack_phase_fx
             .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
@@ -7198,14 +7638,15 @@ impl Game {
                 self.remove_hero_model(scene, e.entity_id);
                 false
             };
-            let projectile_initial_spawn_pos =
-                if matches!(e.kind, sim_runner::EntityKind::Projectile) {
-                    e.projectile_owner_entity_id
-                        .and_then(|owner_id| self.hero_muzzle_render_pos(scene, owner_id))
-                        .unwrap_or(pos)
-                } else {
-                    pos
-                };
+            let projectile_initial = if matches!(e.kind, sim_runner::EntityKind::Projectile) {
+                e.projectile_owner_entity_id
+                    .and_then(|owner_id| {
+                        self.projectile_owner_spawn_and_dir(scene, &snapshot.entities, owner_id)
+                    })
+                    .unwrap_or((pos, Vector2::new(1.0, 0.0)))
+            } else {
+                (pos, Vector2::new(1.0, 0.0))
+            };
 
             // 主體槽：在第一次看到時分配，然後在每個刻度上 write_quad。
             let slots_entry = self.sim_entity_slots.entry(e.entity_id);
@@ -7221,33 +7662,19 @@ impl Game {
 
             if matches!(e.kind, sim_runner::EntityKind::Projectile) {
                 // 子彈：從發射點到當前位置畫一條暖色拖尾矩形（不是中央小方塊）。
-                // 第一次看到該 eid 時把 spawn_pos 鎖定為當前 render pos。
+                // 第一次看到該 eid 時鎖定 spawn_pos 與方向，避免飛行中旋轉。
                 let spawn_pos = *self
                     .projectile_spawn_pos
                     .entry(e.entity_id)
-                    .or_insert(projectile_initial_spawn_pos);
-                let dx = pos.x - spawn_pos.x;
-                let dy = pos.y - spawn_pos.y;
-                let trail_len = (dx * dx + dy * dy).sqrt();
-                // 拖尾上限：太長視覺糊（高速大絕距離飛行可達 5-10 render units）。
-                // 0.6 大約是 1.5 個塔身寬，視覺剛好能看出方向。
-                let max_trail = 0.6_f32;
-                let len = trail_len.min(max_trail).max(0.05);
-                // 若拖尾被截短，從尾端往前算實際 tail 起點。
-                let dir_x = if trail_len > 0.0001 {
-                    dx / trail_len
-                } else {
-                    1.0
-                };
-                let dir_y = if trail_len > 0.0001 {
-                    dy / trail_len
-                } else {
-                    0.0
-                };
-                let tail_x = pos.x - dir_x * len;
-                let tail_y = pos.y - dir_y * len;
-                let mid = Vector2::new((pos.x + tail_x) * 0.5, (pos.y + tail_y) * 0.5);
-                let rotation = dy.atan2(dx);
+                    .or_insert(projectile_initial.0);
+                let trail_dir =
+                    *self
+                        .projectile_trail_dir
+                        .entry(e.entity_id)
+                        .or_insert_with(|| {
+                            initial_projectile_trail_dir(spawn_pos, pos, projectile_initial.1)
+                        });
+                let (mid, len, rotation) = projectile_trail_quad(spawn_pos, pos, trail_dir);
                 // 暖色拖尾：偏黃橙，視覺像 tracer round。
                 let trail_color: [u8; 4] = [255, 180, 60, 230];
                 if let Some(batch) = self.body_batch.as_mut() {
@@ -7438,6 +7865,7 @@ impl Game {
             }
             // 子彈消失時清拖尾起點 cache（HashMap 不會自己縮）
             self.projectile_spawn_pos.remove(&eid);
+            self.projectile_trail_dir.remove(&eid);
         }
         let to_remove: Vec<u32> = self
             .sim_entity_slots
@@ -7467,6 +7895,7 @@ impl Game {
                 }
             }
             self.projectile_spawn_pos.remove(&id);
+            self.projectile_trail_dir.remove(&id);
         }
     }
 
@@ -7609,11 +8038,41 @@ impl Game {
             }
         }
         self.pending_inputs_evict_at = Some(now + Duration::from_secs(1));
-        let cutoff_us = wall_clock_us().saturating_sub(PENDING_INPUT_MAX_AGE_MS * 1_000);
-        let before = self.pending_inputs.len();
-        self.pending_inputs
-            .retain(|_, pending| pending.submit_wall_clock_us >= cutoff_us);
-        self.pending_inputs_evicted += (before - self.pending_inputs.len()) as u64;
+        let now_us = wall_clock_us();
+        let cutoff_us = now_us.saturating_sub(PENDING_INPUT_MAX_AGE_MS * 1_000);
+        let stale: Vec<PendingInputDiagnostic> = self
+            .pending_inputs
+            .iter()
+            .filter(|(_, pending)| pending.submit_wall_clock_us < cutoff_us)
+            .map(|(input_id, pending)| pending_input_diagnostic(*input_id, pending, now_us))
+            .collect();
+
+        for diag in &stale {
+            log::warn!(
+                "input_pending_stale: id={} kind={:?} base_tick={} target_tick={} pending_age_ms={} submit_start={} submit_done={} client_receive_tickbatch={} game_forward_to_sim={} sim_publish_snapshot={} server_receive_tick={:?} server_drain_tick={:?} server_queue_us={:?}",
+                diag.input_id,
+                diag.action_kind,
+                diag.base_tick,
+                diag.target_tick,
+                diag.pending_age_ms,
+                diag.has_submit_start,
+                diag.has_submit_done,
+                diag.has_client_receive_tickbatch,
+                diag.has_game_forward_to_sim,
+                diag.has_sim_publish_snapshot,
+                diag.server_receive_tick,
+                diag.server_drain_tick,
+                diag.server_queue_us,
+            );
+        }
+
+        let stale_count = stale.len() as u64;
+        if stale_count > 0 {
+            self.pending_inputs_stale = self.pending_inputs_stale.saturating_add(stale_count);
+            self.pending_inputs_evicted = self.pending_inputs_evicted.saturating_add(stale_count);
+            self.pending_inputs
+                .retain(|_, pending| pending.submit_wall_clock_us >= cutoff_us);
+        }
     }
 
     fn send_lockstep_input(&mut self, input: omoba_core::kcp::game_proto::PlayerInput) {
@@ -8262,6 +8721,27 @@ mod input_latency_tests {
         }
     }
 
+    fn pending_input(submit_wall_clock_us: u64, action_kind: InputActionKind) -> PendingInput {
+        PendingInput {
+            submit_wall_clock_us,
+            submit_instant: Instant::now(),
+            base_tick: 22,
+            target_tick: 24,
+            action_kind,
+            origin_kind: lockstep_client::InputOriginKind::Direct,
+            origin_us: submit_wall_clock_us.saturating_sub(100),
+            send_lockstep_input_us: submit_wall_clock_us,
+            submit_start_us: None,
+            submit_done_us: None,
+            client_receive_tickbatch_us: None,
+            game_forward_to_sim_us: None,
+            sim_publish_snapshot_us: None,
+            server_receive_tick: None,
+            server_drain_tick: None,
+            server_queue_us: None,
+        }
+    }
+
     fn sample_tower_template(
         cost: i32,
         range: f32,
@@ -8385,6 +8865,101 @@ mod input_latency_tests {
     }
 
     #[test]
+    fn frame_time_summary_reports_one_percent_low_from_slowest_frames() {
+        let samples = vec![8.0; 118]
+            .into_iter()
+            .chain([10.0, 12.0])
+            .collect::<Vec<_>>();
+
+        let (_p50, _p95, _p99, one_pct_low_fps) = frame_time_summary(&samples);
+
+        // 1% of 120 frames uses the two slowest frames: average 11 ms.
+        assert!((one_pct_low_fps - (1000.0 / 11.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn lag_status_exposes_pending_input_when_it_exceeds_p99() {
+        let mut meter = InputLatencyMeter::default();
+        for i in 0..47 {
+            meter.push(sample(i, 46));
+        }
+        let now = meter.last_compute_at + Duration::from_secs(1);
+        meter.maybe_recompute(now);
+
+        let lag = format_input_lag_status(&meter, Some(1_000));
+
+        assert!(lag.contains("p50 46 / p99 46 ms"));
+        assert!(lag.contains("pending 1000 ms"));
+    }
+
+    #[test]
+    fn lag_status_keeps_paired_only_when_pending_is_lower_than_p99() {
+        let mut meter = InputLatencyMeter::default();
+        meter.push(sample(1, 80));
+
+        let lag = format_input_lag_status(&meter, Some(40));
+
+        assert_eq!(lag, "p50 80 / p99 80 ms");
+    }
+
+    #[test]
+    fn oldest_pending_input_age_uses_max_pending_age() {
+        let mut pending = HashMap::new();
+        pending.insert(1, pending_input(10_000, InputActionKind::MoveTo));
+        pending.insert(2, pending_input(11_500, InputActionKind::NoOp));
+
+        assert_eq!(oldest_pending_input_age_ms(&pending, 12_000), Some(2));
+    }
+
+    #[test]
+    fn stale_pending_diagnostic_keeps_last_known_phase() {
+        let mut pending = pending_input(1_000, InputActionKind::MoveTo);
+        pending.submit_start_us = Some(1_010);
+        pending.submit_done_us = Some(1_020);
+        pending.client_receive_tickbatch_us = Some(2_000);
+        pending.game_forward_to_sim_us = Some(2_100);
+        pending.server_receive_tick = Some(22);
+        pending.server_drain_tick = Some(24);
+        pending.server_queue_us = Some(16_000);
+
+        let diag = pending_input_diagnostic(42, &pending, 2_500_000);
+
+        assert_eq!(diag.input_id, 42);
+        assert_eq!(diag.action_kind, InputActionKind::MoveTo);
+        assert_eq!(diag.base_tick, 22);
+        assert_eq!(diag.target_tick, 24);
+        assert_eq!(diag.pending_age_ms, 2_499);
+        assert!(diag.has_submit_start);
+        assert!(diag.has_submit_done);
+        assert!(diag.has_client_receive_tickbatch);
+        assert!(diag.has_game_forward_to_sim);
+        assert!(!diag.has_sim_publish_snapshot);
+        assert_eq!(diag.server_receive_tick, Some(22));
+        assert_eq!(diag.server_drain_tick, Some(24));
+        assert_eq!(diag.server_queue_us, Some(16_000));
+    }
+
+    #[test]
+    fn stale_pending_evicts_without_adding_paired_sample() {
+        let mut game = Game::default();
+        let now_us = wall_clock_us();
+        game.pending_inputs.insert(
+            42,
+            pending_input(
+                now_us.saturating_sub((PENDING_INPUT_MAX_AGE_MS + 500) * 1_000),
+                InputActionKind::MoveTo,
+            ),
+        );
+
+        game.evict_stale_pending_inputs();
+
+        assert!(game.pending_inputs.is_empty());
+        assert_eq!(game.pending_inputs_stale, 1);
+        assert_eq!(game.pending_inputs_evicted, 1);
+        assert!(game.input_latency_meter.samples.is_empty());
+    }
+
+    #[test]
     fn latency_sample_preserves_phase_breakdown() {
         let mut s = sample(7, 42);
         s.origin_kind = lockstep_client::InputOriginKind::OsEvent;
@@ -8437,5 +9012,42 @@ mod input_latency_tests {
         assert_eq!(ability_key_index(KeyCode::KeyR), Some(2));
         assert_eq!(ability_key_index(KeyCode::KeyT), Some(3));
         assert_eq!(ability_key_index(KeyCode::KeyQ), None);
+    }
+
+    #[test]
+    fn projectile_trail_dir_uses_initial_delta() {
+        let dir = initial_projectile_trail_dir(
+            Vector2::new(0.0, 0.0),
+            Vector2::new(3.0, 4.0),
+            Vector2::new(-1.0, 0.0),
+        );
+
+        assert!((dir.x - 0.6).abs() < 1.0e-6);
+        assert!((dir.y - 0.8).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn projectile_trail_dir_falls_back_for_zero_delta() {
+        let dir = initial_projectile_trail_dir(
+            Vector2::new(2.0, 2.0),
+            Vector2::new(2.0, 2.0),
+            Vector2::new(0.0, -2.0),
+        );
+
+        assert!(dir.x.abs() < 1.0e-6);
+        assert!((dir.y + 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn projectile_trail_quad_keeps_initial_rotation_after_position_changes() {
+        let spawn = Vector2::new(0.0, 0.0);
+        let initial_dir =
+            initial_projectile_trail_dir(spawn, Vector2::new(1.0, 0.0), Vector2::new(0.0, 1.0));
+
+        let (_, _, rotation_a) = projectile_trail_quad(spawn, Vector2::new(1.0, 0.0), initial_dir);
+        let (_, _, rotation_b) = projectile_trail_quad(spawn, Vector2::new(1.0, 1.0), initial_dir);
+
+        assert!(rotation_a.abs() < 1.0e-6);
+        assert!(rotation_b.abs() < 1.0e-6);
     }
 }

@@ -11,17 +11,17 @@
 
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use log::{error, info};
 use omoba_core::lockstep_timing::{
     lockstep_dt_fixed_raw_for_tick, ticks_to_seconds_f64, LOCKSTEP_FIVE_SECONDS_TICKS_U32,
-    LOCKSTEP_ONE_SECOND_TICKS_U32,
+    LOCKSTEP_TPS,
 };
 
 use specs::{World, WorldExt};
@@ -49,16 +49,17 @@ pub struct TickBatchInput {
 
 pub use omoba_core::runtime::{
     buff_remaining_secs_for_snapshot, build_ability_def_snapshots, build_tower_template_snapshots,
-    build_tower_upgrade_def_snapshots, extract_snapshot, hero_render_snapshot_for_unit_id,
-    retain_recent_render_fx, AbilityDefSnapshot, AppliedInputMeta, AttackCancelFx, AttackPhaseFx,
-    BlockedRegionSnapshot, BuffSnapshot, EntityKind, EntityRenderData, ExplosionFx,
-    HeroAnimationBindingSnapshot, HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt,
-    SimWorldSnapshot, TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot,
-    TowerRenderAnimationSnapshot, TowerRenderPointSnapshot, TowerTemplateSnapshot,
-    TowerUpgradeDefSnapshot,
+    build_tower_upgrade_def_snapshots, extract_runtime_render_update,
+    hero_render_snapshot_for_unit_id, retain_recent_render_fx, AbilityDefSnapshot,
+    AppliedInputMeta, AttackCancelFx, AttackPhaseFx, BlockedRegionSnapshot, BuffSnapshot,
+    EntityKind, EntityRenderData, ExplosionFx, HeroAnimationBindingSnapshot,
+    HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt, SimWorldSnapshot,
+    TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot, TowerRenderAnimationSnapshot,
+    TowerRenderPointSnapshot, TowerTemplateSnapshot, TowerUpgradeDefSnapshot,
 };
 
 const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
+const RUNTIME_RENDER_PUBLISH_DIVISOR: u32 = 4;
 /// 每個時脈週期由鎖步饋送器提交的通道有效負載。
 #[derive(Clone, Debug)]
 pub struct TickBatchPayload {
@@ -66,6 +67,18 @@ pub struct TickBatchPayload {
     pub inputs: Vec<TickBatchInput>,
     pub lua_content_generation: u64,
     pub lua_content_hash: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SimRunnerDiagnostics {
+    pub window_ms: u128,
+    pub sim_tps: f32,
+    pub latest_tick: u32,
+    pub queue_len: usize,
+    pub max_queue_len: usize,
+    pub waits: u32,
+    pub blocking_receives: u32,
+    pub backlog_receives: u32,
 }
 
 /// 返回 omfx 遊戲的句柄，以便渲染線程可以讀取快照
@@ -77,6 +90,8 @@ pub struct SimRunnerHandle {
     pub state: Arc<Mutex<SimWorldSnapshot>>,
     /// 每次 TickBatch 到達時發送（刻度、輸入）。第 3.3 階段對此進行接線。
     pub tick_input_tx: Sender<TickBatchPayload>,
+    /// Low-frequency sim_runner profile snapshot for render-frame SLO logs.
+    pub diagnostics: Arc<Mutex<SimRunnerDiagnostics>>,
     /// 在「GameStart」到達後發送「master_seed」一次。這
     /// 在初始化世界之前，工作人員會阻止此操作，因此
     /// MasterSeed 資源在第一個tick 運行之前設定。
@@ -93,6 +108,8 @@ pub struct SimRunnerHandle {
 pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> SimRunnerHandle {
     let state = Arc::new(Mutex::new(SimWorldSnapshot::default()));
     let state_for_thread = state.clone();
+    let diagnostics = Arc::new(Mutex::new(SimRunnerDiagnostics::default()));
+    let diagnostics_for_thread = diagnostics.clone();
 
     let (tick_input_tx, tick_input_rx) = unbounded::<TickBatchPayload>();
     let (master_seed_tx, master_seed_rx) = unbounded::<u64>();
@@ -102,6 +119,7 @@ pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> 
         .spawn(move || {
             run_sim_loop(
                 state_for_thread,
+                diagnostics_for_thread,
                 tick_input_rx,
                 master_seed_rx,
                 base_content_dll_path,
@@ -113,6 +131,7 @@ pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> 
     SimRunnerHandle {
         state,
         tick_input_tx,
+        diagnostics,
         master_seed_tx,
         _thread: handle,
     }
@@ -120,6 +139,7 @@ pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> 
 
 fn run_sim_loop(
     state_out: Arc<Mutex<SimWorldSnapshot>>,
+    diagnostics_out: Arc<Mutex<SimRunnerDiagnostics>>,
     tick_input_rx: Receiver<TickBatchPayload>,
     master_seed_rx: Receiver<u64>,
     dll_path: PathBuf,
@@ -173,55 +193,127 @@ fn run_sim_loop(
     info!("sim_runner: dispatcher ready, entering tick loop");
 
     let mut last_starvation_log = std::time::Instant::now();
-    // Phase 1b: removed_entity_ids 從 RemovedEntitiesQueue resource drain
-    // 取代既有 prev_alive HashSet diff。helper `delete_entity_tracked` 統
-    // 一往 queue 推入；`extract_snapshot` 用 `mem::take` 把整批拉到
-    // snapshot，render 端對該 list 釋放 per-eid scene caches。
-
-    // 階段 4.5：AbilityRegistry→AbilityDefSnapshot Arc。懶惰地建構於
-    // 註冊表非空的第一個勾號（腳本 DLL 載入為
-    // 非同步 — 註冊表由 `scripting::registry::load` 填充
-    // 在世界初始化期間，但我們重新輪詢每個刻度，直到設定 Arc
-    // 因為在某些場景中，註冊表可能會保持為空，直到英雄出現為止
-    // 腳本註冊能力）。建置後，每個快照都只是克隆
-    // Arc（O(1) 引用計數凸點）。
+    // Full ECS snapshots are initialization-only. Runtime ticks publish only
+    // lightweight changing fields and must not call extract_snapshot.
     let mut abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
-    // TD 塔範本具有相同的延遲建置模式 — 註冊表已填充
-    // 在遊戲開始時，每個塔腳本的「tower_metadata()」。
     let mut tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>> =
         std::sync::Arc::new(Vec::new());
     let mut tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
+    rebuild_metadata_arcs(
+        &world,
+        &mut abilities_arc,
+        &mut tower_templates_arc,
+        &mut tower_upgrades_arc,
+    );
+    if let Ok(mut snapshot) = state_out.lock() {
+        *snapshot = build_initial_render_seed(
+            &world,
+            abilities_arc.clone(),
+            tower_templates_arc.clone(),
+            tower_upgrades_arc.clone(),
+        );
+    }
     let mut recent_applied_inputs: VecDeque<(u32, AppliedInputMeta)> = VecDeque::new();
     let mut recent_tower_fire_fx: VecDeque<TowerFireFx> = VecDeque::new();
     let mut recent_attack_phase_fx: VecDeque<AttackPhaseFx> = VecDeque::new();
     let mut recent_attack_cancel_fx: VecDeque<AttackCancelFx> = VecDeque::new();
+    let mut profile_started_at = Instant::now();
+    let mut profile_processed_ticks: u32 = 0;
+    let mut profile_runtime_publishes: u32 = 0;
+    let mut profile_latest_tick: u32 = 0;
+    let mut profile_dispatch_ns: u128 = 0;
+    let mut profile_drains_ns: u128 = 0;
+    let mut profile_script_ns: u128 = 0;
+    let mut profile_extract_ns: u128 = 0;
+    let mut profile_publish_ns: u128 = 0;
+    let mut profile_receive_active_ns: u128 = 0;
+    let mut profile_tick_active_ns: u128 = 0;
+    let mut profile_idle_wait_ns: u128 = 0;
+    let mut profile_wait_count: u32 = 0;
+    let mut profile_blocking_receives: u32 = 0;
+    let mut profile_backlog_receives: u32 = 0;
+    let mut profile_max_queue_len: usize = 0;
     loop {
-        // 使用recv_timeout而不是recv()，因此線路停頓會出現在
-        // 記錄為「1.0 秒內沒有 TickBatch — 上游鎖步用戶端是
-        // 懷疑」而不是看起來像 sim_runner 正在緩慢計算。
-        let batch = match tick_input_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(b) => b,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                let now = std::time::Instant::now();
-                if now.duration_since(last_starvation_log).as_secs() >= 2 {
-                    let pending = tick_input_rx.len();
-                    info!(
-                        "sim_runner: no TickBatch in 1.0s (queue_len={}). \
-                         Upstream Game→lockstep_client→KCP path is the suspect.",
-                        pending,
-                    );
-                    last_starvation_log = now;
-                }
-                continue;
+        let queue_len_before_receive = tick_input_rx.len();
+        profile_max_queue_len = profile_max_queue_len.max(queue_len_before_receive);
+        let (batch, received_from_backlog) = match tick_input_rx.try_recv() {
+            Ok(batch) => (batch, queue_len_before_receive > 0),
+            Err(TryRecvError::Empty) => {
+                // Blocking wait is cadence/idle time, not active receive work.
+                let wait_span = tracing::trace_span!(
+                    "omfx::sim_runner::wait_tick_batch",
+                    perfetto = true,
+                    queue_len = queue_len_before_receive,
+                )
+                .entered();
+                let wait_started = Instant::now();
+                let batch = match tick_input_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(b) => b,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        profile_idle_wait_ns += wait_started.elapsed().as_nanos();
+                        profile_wait_count += 1;
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_starvation_log).as_secs() >= 2 {
+                            let pending = tick_input_rx.len();
+                            info!(
+                                "sim_runner: no TickBatch in 1.0s (queue_len={}). \
+                                 Upstream Game→lockstep_client→KCP path is the suspect.",
+                                pending,
+                            );
+                            last_starvation_log = now;
+                        }
+                        drop(wait_span);
+                        continue;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        info!("sim_runner: input channel closed, exiting");
+                        drop(wait_span);
+                        break;
+                    }
+                };
+                profile_idle_wait_ns += wait_started.elapsed().as_nanos();
+                profile_wait_count += 1;
+                profile_blocking_receives += 1;
+                drop(wait_span);
+                (batch, false)
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(TryRecvError::Disconnected) => {
                 info!("sim_runner: input channel closed, exiting");
                 break;
             }
         };
+        if received_from_backlog {
+            profile_backlog_receives += 1;
+        }
+        let receive_active_started = Instant::now();
+        let receive_span = tracing::trace_span!(
+            "omfx::sim_runner::receive_tick_batch",
+            perfetto = true,
+            tick = batch.tick,
+            queue_len_before = queue_len_before_receive,
+            queue_len_after = tick_input_rx.len(),
+            from_backlog = received_from_backlog,
+        )
+        .entered();
+        let input_count = batch.inputs.len();
+        profile_receive_active_ns += receive_active_started.elapsed().as_nanos();
+        drop(receive_span);
+        let tick_active_started = Instant::now();
+        let tick_span = tracing::trace_span!(
+            "omfx::sim_runner::tick",
+            perfetto = true,
+            tick = batch.tick,
+            queue_len = tick_input_rx.len(),
+            input_count,
+            runtime_publish = batch.tick % RUNTIME_RENDER_PUBLISH_DIVISOR == 0,
+        )
+        .entered();
 
+        let lua_reload_span =
+            tracing::trace_span!("omfx::sim_runner::dev_lua_reload_check", perfetto = true)
+                .entered();
         if let Err(err) = ensure_dev_lua_content_for_batch(
             &mut world,
             &script_registry,
@@ -238,7 +330,14 @@ fn run_sim_loop(
             publish_dev_lua_reload_error(&state_out, &batch, err);
             break;
         }
+        drop(lua_reload_span);
 
+        let input_apply_span = tracing::trace_span!(
+            "omfx::sim_runner::input_apply_and_time",
+            perfetto = true,
+            input_count,
+        )
+        .entered();
         for input in batch.inputs.iter().filter(|input| input.input_id != 0) {
             recent_applied_inputs.push_back((
                 batch.tick,
@@ -285,14 +384,24 @@ fn run_sim_loop(
             let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
             dt.0 = omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64));
         }
+        drop(input_apply_span);
 
+        let t_dispatch = Instant::now();
+        let dispatch_span =
+            tracing::trace_span!("omfx::sim_runner::dispatcher", perfetto = true).entered();
         dispatcher.dispatch(&world);
         world.maintain();
+        profile_dispatch_ns += t_dispatch.elapsed().as_nanos();
+        drop(dispatch_span);
         {
             let mut events = world.write_resource::<omoba_core::runtime::RuntimeEvents>();
             events.clear();
         }
 
+        let t_drains = Instant::now();
+        let drains_span =
+            tracing::trace_span!("omfx::sim_runner::pending_queue_drains", perfetto = true)
+                .entered();
         // 階段 2.1：drain `PendingTowerSpawnQueue`，與 authoritative runtime
         // 使用相同 tick boundary，讓 TowerPlace input deterministic 地建立 TD tower。
         omoba_core::runtime::drain_pending_tower_spawns(&mut world);
@@ -326,17 +435,28 @@ fn run_sim_loop(
         // MoveTo (右鍵移動): drain `PendingMoveQueue`，在玩家英雄寫入 MoveTarget。
         omoba_core::runtime::drain_pending_moves(&mut world);
         world.maintain();
+        profile_drains_ns += t_drains.elapsed().as_nanos();
+        drop(drains_span);
 
         // 階段 3 調度程序僅調度滴答系統；它不包括
         // GameProcessor::process_outcomes。如果沒有這個，`creep_wave`會產生
         // `Outcome::Creep { cd }` 行堆積在 `Vec<Outcome>` 中，但沒有
         // 實體在本機 sim 中產生 → snapshot.creep 保持 0。
+        let pre_script_outcomes_span = tracing::trace_span!(
+            "omfx::sim_runner::process_outcomes_pre_script",
+            perfetto = true,
+        )
+        .entered();
         let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
         if let Err(e) = omoba_core::runtime::process_outcomes(&mut world, &mut event_sink) {
             log::warn!("sim_runner: process_outcomes failed: {}", e);
         }
         world.maintain();
+        drop(pre_script_outcomes_span);
 
+        let t_script = Instant::now();
+        let script_span =
+            tracing::trace_span!("omfx::sim_runner::script_dispatch", perfetto = true).entered();
         // 運行腳本調度，以便塔/英雄/召喚`on_tick`鉤子火。
         // 塔是 ScriptUnitTag 驅動的 - 沒有這個， tower_dart / tower_
         // 炸彈/ tower_ice從未決定攻擊，所以projectile_tick有
@@ -356,10 +476,13 @@ fn run_sim_loop(
             log::warn!("sim_runner: process_outcomes (post-script) failed: {}", e);
         }
         world.maintain();
+        profile_script_ns += t_script.elapsed().as_nanos();
+        drop(script_span);
 
-        // 階段 4.5：重建能力 如果仍然為空，則懶惰地弧形並且
-        // 註冊表已填入。在第一個非空構建之後
-        // Arc 永遠不會改變（註冊表在載入後是不可變的）。
+        // Metadata is static after init except DEV Lua reload, where the reload
+        // path rebuilds these Arcs explicitly.
+        let metadata_span =
+            tracing::trace_span!("omfx::sim_runner::metadata_refresh", perfetto = true).entered();
         if abilities_arc.is_empty() {
             let reg = world.read_resource::<omoba_core::ability_runtime::AbilityRegistry>();
             if !reg.is_empty() {
@@ -400,71 +523,181 @@ fn run_sim_loop(
                 );
             }
         }
+        drop(metadata_span);
 
-        let mut snapshot = extract_snapshot(
-            &mut world,
-            batch.tick,
-            abilities_arc.clone(),
-            tower_templates_arc.clone(),
-            tower_upgrades_arc.clone(),
-            applied_input_ids,
-            applied_input_meta,
-        );
-        let tower_fire_fx = std::mem::take(&mut snapshot.tower_fire_fx);
-        snapshot.tower_fire_fx =
-            retain_recent_render_fx(&mut recent_tower_fire_fx, tower_fire_fx, batch.tick, |fx| {
-                fx.spawn_tick
-            });
-        let attack_phase_fx = std::mem::take(&mut snapshot.attack_phase_fx);
-        snapshot.attack_phase_fx = retain_recent_render_fx(
-            &mut recent_attack_phase_fx,
-            attack_phase_fx,
-            batch.tick,
-            |fx| fx.spawn_tick,
-        );
-        let attack_cancel_fx = std::mem::take(&mut snapshot.attack_cancel_fx);
-        snapshot.attack_cancel_fx = retain_recent_render_fx(
-            &mut recent_attack_cancel_fx,
-            attack_cancel_fx,
-            batch.tick,
-            |fx| fx.spawn_tick,
-        );
-        let sim_publish_us = wall_clock_us();
-        for meta in &mut snapshot.applied_input_meta {
-            meta.sim_publish_us = sim_publish_us;
-        }
-
-        // 「蠕變 HP 條保持滿」回歸報告的診斷
-        // （第 4-5 階段鎖步清理）。每秒採樣一次
-        // 前幾個小兵的 HP 值。如果惠普永遠不會改變
-        // 跑，鏡子的傷害路徑被打破；如果 HP 減少，
-        // 鏡像很好，回歸僅渲染。採樣每秒一次以將日誌量保持在
-        // TD_STRESS 規模的較低水準。
-        if batch.tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
-            let creep_hps: Vec<(u32, i32, i32)> = snapshot
-                .entities
-                .iter()
-                .filter(|e| matches!(e.kind, EntityKind::Creep))
-                .take(5)
-                .map(|e| (e.entity_id, e.hp, e.max_hp))
-                .collect();
-            if !creep_hps.is_empty() {
-                log::info!(
-                    "[mirror-snapshot] tick={} creep_count={} sample_hp={:?}",
-                    batch.tick,
-                    snapshot
-                        .entities
-                        .iter()
-                        .filter(|e| matches!(e.kind, EntityKind::Creep))
-                        .count(),
-                    creep_hps,
-                );
+        let should_publish_runtime = batch.tick % RUNTIME_RENDER_PUBLISH_DIVISOR == 0;
+        if should_publish_runtime {
+            let t_extract = Instant::now();
+            let extract_span = tracing::trace_span!(
+                "omfx::sim_runner::runtime_snapshot_extract",
+                perfetto = true,
+                tick = batch.tick,
+            )
+            .entered();
+            let mut snapshot = extract_runtime_render_update(
+                &mut world,
+                batch.tick,
+                applied_input_ids,
+                applied_input_meta,
+            );
+            profile_extract_ns += t_extract.elapsed().as_nanos();
+            drop(extract_span);
+            let fx_span =
+                tracing::trace_span!("omfx::sim_runner::render_fx_retention", perfetto = true)
+                    .entered();
+            let tower_fire_fx = std::mem::take(&mut snapshot.tower_fire_fx);
+            snapshot.tower_fire_fx = retain_recent_render_fx(
+                &mut recent_tower_fire_fx,
+                tower_fire_fx,
+                batch.tick,
+                |fx| fx.spawn_tick,
+            );
+            let attack_phase_fx = std::mem::take(&mut snapshot.attack_phase_fx);
+            snapshot.attack_phase_fx = retain_recent_render_fx(
+                &mut recent_attack_phase_fx,
+                attack_phase_fx,
+                batch.tick,
+                |fx| fx.spawn_tick,
+            );
+            let attack_cancel_fx = std::mem::take(&mut snapshot.attack_cancel_fx);
+            snapshot.attack_cancel_fx = retain_recent_render_fx(
+                &mut recent_attack_cancel_fx,
+                attack_cancel_fx,
+                batch.tick,
+                |fx| fx.spawn_tick,
+            );
+            let sim_publish_us = wall_clock_us();
+            for meta in &mut snapshot.applied_input_meta {
+                meta.sim_publish_us = sim_publish_us;
             }
-        }
+            drop(fx_span);
 
-        if let Ok(mut s) = state_out.lock() {
-            *s = snapshot;
+            let t_publish = Instant::now();
+            let publish_span = tracing::trace_span!(
+                "omfx::sim_runner::snapshot_publish",
+                perfetto = true,
+                snapshot_entities = snapshot.entities.len(),
+            )
+            .entered();
+            if let Ok(mut s) = state_out.lock() {
+                snapshot.paths = s.paths.clone();
+                snapshot.blocked_regions = s.blocked_regions.clone();
+                snapshot.abilities = abilities_arc.clone();
+                snapshot.tower_templates = tower_templates_arc.clone();
+                snapshot.tower_upgrades = tower_upgrades_arc.clone();
+                *s = snapshot;
+            }
+            profile_publish_ns += t_publish.elapsed().as_nanos();
+            drop(publish_span);
+            profile_runtime_publishes += 1;
         }
+        profile_processed_ticks += 1;
+        profile_latest_tick = batch.tick;
+        profile_tick_active_ns += tick_active_started.elapsed().as_nanos();
+        let profile_elapsed = profile_started_at.elapsed();
+        if profile_elapsed.as_secs_f32() >= 1.0 {
+            let ticks = profile_processed_ticks.max(1) as f64;
+            if let Ok(mut diagnostics) = diagnostics_out.lock() {
+                diagnostics.window_ms = profile_elapsed.as_millis();
+                diagnostics.sim_tps =
+                    profile_processed_ticks as f32 / profile_elapsed.as_secs_f32();
+                diagnostics.latest_tick = profile_latest_tick;
+                diagnostics.queue_len = tick_input_rx.len();
+                diagnostics.max_queue_len = profile_max_queue_len;
+                diagnostics.waits = profile_wait_count;
+                diagnostics.blocking_receives = profile_blocking_receives;
+                diagnostics.backlog_receives = profile_backlog_receives;
+            }
+            info!(
+                "sim_runner_profile window_ms={} target_tps={} processed_ticks={} runtime_publishes={} latest_tick={} queue_len={} max_queue_len={} waits={} blocking_receives={} backlog_receives={} avg_ms wait_idle={:.3} receive_active={:.3} tick_active={:.3} dispatch={:.3} drains={:.3} script={:.3} extract={:.3} publish={:.3}",
+                profile_elapsed.as_millis(),
+                LOCKSTEP_TPS,
+                profile_processed_ticks,
+                profile_runtime_publishes,
+                profile_latest_tick,
+                tick_input_rx.len(),
+                profile_max_queue_len,
+                profile_wait_count,
+                profile_blocking_receives,
+                profile_backlog_receives,
+                profile_idle_wait_ns as f64 / profile_wait_count.max(1) as f64 / 1_000_000.0,
+                profile_receive_active_ns as f64 / ticks / 1_000_000.0,
+                profile_tick_active_ns as f64 / ticks / 1_000_000.0,
+                profile_dispatch_ns as f64 / ticks / 1_000_000.0,
+                profile_drains_ns as f64 / ticks / 1_000_000.0,
+                profile_script_ns as f64 / ticks / 1_000_000.0,
+                profile_extract_ns as f64 / ticks / 1_000_000.0,
+                profile_publish_ns as f64 / ticks / 1_000_000.0,
+            );
+            profile_started_at = Instant::now();
+            profile_processed_ticks = 0;
+            profile_runtime_publishes = 0;
+            profile_dispatch_ns = 0;
+            profile_drains_ns = 0;
+            profile_script_ns = 0;
+            profile_extract_ns = 0;
+            profile_publish_ns = 0;
+            profile_receive_active_ns = 0;
+            profile_tick_active_ns = 0;
+            profile_idle_wait_ns = 0;
+            profile_wait_count = 0;
+            profile_blocking_receives = 0;
+            profile_backlog_receives = 0;
+            profile_max_queue_len = 0;
+        }
+        drop(tick_span);
+    }
+}
+
+fn build_initial_render_seed(
+    world: &World,
+    abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>>,
+    tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>>,
+    tower_upgrades_arc: std::sync::Arc<Vec<TowerUpgradeDefSnapshot>>,
+) -> SimWorldSnapshot {
+    let paths: Vec<Vec<(f32, f32)>> = world
+        .read_resource::<BTreeMap<String, omoba_core::runtime::comp::check_point::Path>>()
+        .values()
+        .map(|p| {
+            p.check_points
+                .iter()
+                .map(|cp| (cp.pos.x, cp.pos.y))
+                .collect()
+        })
+        .collect();
+
+    let blocked_regions: Vec<BlockedRegionSnapshot> = world
+        .read_resource::<omoba_core::runtime::BlockedRegions>()
+        .0
+        .iter()
+        .map(|r| BlockedRegionSnapshot {
+            points: r.points.iter().map(|p| (p.x, p.y)).collect(),
+            circle: None,
+        })
+        .collect();
+
+    let total_rounds = world
+        .read_resource::<Vec<omoba_core::runtime::CreepWave>>()
+        .len() as u32;
+    let lives = world.read_resource::<omoba_core::runtime::PlayerLives>().0;
+
+    SimWorldSnapshot {
+        paths,
+        blocked_regions,
+        abilities: abilities_arc,
+        tower_templates: tower_templates_arc,
+        tower_upgrades: tower_upgrades_arc,
+        total_rounds,
+        lives,
+        lua_content_generation: omoba_template_ids::runtime_lua_content_generation()
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+        lua_content_hash: omoba_template_ids::runtime_lua_content_hash()
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        ..Default::default()
     }
 }
 
