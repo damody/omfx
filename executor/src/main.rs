@@ -10,7 +10,7 @@ use simplelog::{
 };
 use std::fs::File;
 
-const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS + 10;
+const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS;
 
 struct LogSettings {
     level: LevelFilter,
