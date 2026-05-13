@@ -15,14 +15,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use log::{error, info};
-use omoba_core::lockstep_timing::{
-    lockstep_dt_fixed_raw_for_tick, ticks_to_seconds_f64, LOCKSTEP_FIVE_SECONDS_TICKS_U32,
-    LOCKSTEP_TPS,
-};
+use omoba_core::lockstep_timing::LockstepTiming;
 
 use specs::{World, WorldExt};
 
@@ -58,8 +55,43 @@ pub use omoba_core::runtime::{
     TowerRenderPointSnapshot, TowerTemplateSnapshot, TowerUpgradeDefSnapshot,
 };
 
-const APPLIED_INPUT_ID_RETENTION_TICKS: u32 = LOCKSTEP_FIVE_SECONDS_TICKS_U32;
 const RUNTIME_RENDER_PUBLISH_DIVISOR: u32 = 4;
+const WAIT_PRECISION_WINDOW: Duration = Duration::from_millis(2);
+const WAIT_STARVATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug)]
+pub struct SimStartMetadata {
+    pub master_seed: u64,
+    pub step_fps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaitPlan {
+    tick_interval: Duration,
+    remaining: Duration,
+    sleep: Option<Duration>,
+    precision_window: Duration,
+}
+
+fn plan_tick_wait(
+    last_tick_started_at: Instant,
+    timing: LockstepTiming,
+    precision_window: Duration,
+    now: Instant,
+) -> WaitPlan {
+    let tick_interval = timing.dt_duration();
+    let deadline = last_tick_started_at + tick_interval;
+    let remaining = deadline.saturating_duration_since(now);
+    let sleep = remaining
+        .checked_sub(precision_window)
+        .filter(|duration| !duration.is_zero());
+    WaitPlan {
+        tick_interval,
+        remaining,
+        sleep,
+        precision_window,
+    }
+}
 /// 每個時脈週期由鎖步饋送器提交的通道有效負載。
 #[derive(Clone, Debug)]
 pub struct TickBatchPayload {
@@ -95,7 +127,7 @@ pub struct SimRunnerHandle {
     /// 在「GameStart」到達後發送「master_seed」一次。這
     /// 在初始化世界之前，工作人員會阻止此操作，因此
     /// MasterSeed 資源在第一個tick 運行之前設定。
-    pub master_seed_tx: Sender<u64>,
+    pub master_seed_tx: Sender<SimStartMetadata>,
     /// 工作線程連接句柄。持有但未加入；線程退出於
     /// 當“SimRunnerHandle”被刪除時，通道會中斷。
     _thread: thread::JoinHandle<()>,
@@ -112,7 +144,7 @@ pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> 
     let diagnostics_for_thread = diagnostics.clone();
 
     let (tick_input_tx, tick_input_rx) = unbounded::<TickBatchPayload>();
-    let (master_seed_tx, master_seed_rx) = unbounded::<u64>();
+    let (master_seed_tx, master_seed_rx) = unbounded::<SimStartMetadata>();
 
     let handle = thread::Builder::new()
         .name("omfx-sim-runner".into())
@@ -141,7 +173,7 @@ fn run_sim_loop(
     state_out: Arc<Mutex<SimWorldSnapshot>>,
     diagnostics_out: Arc<Mutex<SimRunnerDiagnostics>>,
     tick_input_rx: Receiver<TickBatchPayload>,
-    master_seed_rx: Receiver<u64>,
+    master_seed_rx: Receiver<SimStartMetadata>,
     dll_path: PathBuf,
     scene_path: PathBuf,
 ) {
@@ -154,24 +186,37 @@ fn run_sim_loop(
     // 遊戲開始於階段 3.3)。提早返回——沒有滴答作響——
     // 是預期的第 3.2 階段結果，因為 LockstepClient 不
     // 還餵這個頻道。
-    let master_seed = match master_seed_rx.recv() {
+    let start = match master_seed_rx.recv() {
         Ok(s) => s,
         Err(_) => {
             info!("sim_runner: master_seed channel dropped before GameStart, exiting");
             return;
         }
     };
-    info!("sim_runner: got master_seed=0x{:016x}", master_seed);
-
-    let script_registry = load_script_registry(&dll_path);
-
-    let (mut world, creep_wave_data) = match init_world(&scene_path, master_seed, script_registry) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("sim_runner: init_world failed: {}", e);
+    let timing = match LockstepTiming::new(start.step_fps) {
+        Ok(timing) => timing,
+        Err(err) => {
+            error!("sim_runner: invalid server cadence: {}", err);
             return;
         }
     };
+    let applied_input_retention_ticks = timing.ticks_for_seconds(5);
+    info!(
+        "sim_runner: got master_seed=0x{:016x} step_fps={}",
+        start.master_seed,
+        timing.step_fps()
+    );
+
+    let script_registry = load_script_registry(&dll_path);
+
+    let (mut world, creep_wave_data) =
+        match init_world(&scene_path, start.master_seed, script_registry) {
+            Ok(w) => w,
+            Err(e) => {
+                error!("sim_runner: init_world failed: {}", e);
+                return;
+            }
+        };
 
     let mut dispatcher = match omoba_core::runtime::build_phase3_dispatcher() {
         Ok(d) => d,
@@ -235,6 +280,7 @@ fn run_sim_loop(
     let mut profile_blocking_receives: u32 = 0;
     let mut profile_backlog_receives: u32 = 0;
     let mut profile_max_queue_len: usize = 0;
+    let mut last_tick_started_at = Instant::now();
     loop {
         let queue_len_before_receive = tick_input_rx.len();
         profile_max_queue_len = profile_max_queue_len.max(queue_len_before_receive);
@@ -249,9 +295,15 @@ fn run_sim_loop(
                 )
                 .entered();
                 let wait_started = Instant::now();
-                let batch = match tick_input_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(b) => b,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let batch = match wait_tick_batch(
+                    &tick_input_rx,
+                    last_tick_started_at,
+                    timing,
+                    WAIT_PRECISION_WINDOW,
+                    WAIT_STARVATION_TIMEOUT,
+                ) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
                         profile_idle_wait_ns += wait_started.elapsed().as_nanos();
                         profile_wait_count += 1;
                         let now = std::time::Instant::now();
@@ -267,7 +319,7 @@ fn run_sim_loop(
                         drop(wait_span);
                         continue;
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    Err(WaitTickBatchError::Disconnected) => {
                         info!("sim_runner: input channel closed, exiting");
                         drop(wait_span);
                         break;
@@ -287,6 +339,7 @@ fn run_sim_loop(
         if received_from_backlog {
             profile_backlog_receives += 1;
         }
+        last_tick_started_at = Instant::now();
         let receive_active_started = Instant::now();
         let receive_span = tracing::trace_span!(
             "omfx::sim_runner::receive_tick_batch",
@@ -353,7 +406,7 @@ fn run_sim_loop(
             ));
         }
         while recent_applied_inputs.front().is_some_and(|(tick, _)| {
-            batch.tick.saturating_sub(*tick) > APPLIED_INPUT_ID_RETENTION_TICKS
+            batch.tick.saturating_sub(*tick) > applied_input_retention_ticks
         }) {
             recent_applied_inputs.pop_front();
         }
@@ -369,7 +422,7 @@ fn run_sim_loop(
 
         // 更新 Tick + Time + DeltaTime，以便時間閘控系統（creep_wave、
         // 增益計時器、彈丸飛行）實際上是提前的。鎖步 cadence 由
-        // `omoba_core::lockstep_timing::LOCKSTEP_TPS` 定義。
+        // server GameStart metadata 宣告。
         // 如果沒有這些，本地 sim 會有 Tick 前進，但時間停留在 0，
         // 這使得 `creep_wave` 看到 `totaltime=0` 並且永遠不會產生 — 完全正確
         // 為什麼 Start Round 會觸發（is_running 翻轉）但沒有小兵出現。
@@ -378,11 +431,11 @@ fn run_sim_loop(
             .0 = batch.tick as u64;
         {
             let mut t = world.write_resource::<omoba_core::comp::resources::Time>();
-            t.0 = ticks_to_seconds_f64(batch.tick);
+            t.0 = timing.ticks_to_seconds_f64(batch.tick);
         }
         {
             let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
-            dt.0 = omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64));
+            dt.0 = omoba_sim::Fixed64::from_raw(timing.fixed_raw_for_tick(batch.tick as u64));
         }
         drop(input_apply_span);
 
@@ -468,7 +521,7 @@ fn run_sim_loop(
             &mut world,
             &script_registry,
             batch.tick as u64,
-            omoba_sim::Fixed64::from_raw(lockstep_dt_fixed_raw_for_tick(batch.tick as u64)),
+            omoba_sim::Fixed64::from_raw(timing.fixed_raw_for_tick(batch.tick as u64)),
         );
         // 處理推送的任何結果腳本（投射物/損壞/等）。
         let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
@@ -611,7 +664,7 @@ fn run_sim_loop(
             info!(
                 "sim_runner_profile window_ms={} target_tps={} processed_ticks={} runtime_publishes={} latest_tick={} queue_len={} max_queue_len={} waits={} blocking_receives={} backlog_receives={} avg_ms wait_idle={:.3} receive_active={:.3} tick_active={:.3} dispatch={:.3} drains={:.3} script={:.3} extract={:.3} publish={:.3}",
                 profile_elapsed.as_millis(),
-                LOCKSTEP_TPS,
+                timing.step_fps(),
                 profile_processed_ticks,
                 profile_runtime_publishes,
                 profile_latest_tick,
@@ -646,6 +699,67 @@ fn run_sim_loop(
             profile_max_queue_len = 0;
         }
         drop(tick_span);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitTickBatchError {
+    Disconnected,
+}
+
+fn wait_tick_batch(
+    rx: &Receiver<TickBatchPayload>,
+    last_tick_started_at: Instant,
+    timing: LockstepTiming,
+    precision_window: Duration,
+    starvation_timeout: Duration,
+) -> Result<Option<TickBatchPayload>, WaitTickBatchError> {
+    let wait_started = Instant::now();
+    loop {
+        match rx.try_recv() {
+            Ok(batch) => return Ok(Some(batch)),
+            Err(TryRecvError::Disconnected) => return Err(WaitTickBatchError::Disconnected),
+            Err(TryRecvError::Empty) => {}
+        }
+
+        if wait_started.elapsed() >= starvation_timeout {
+            return Ok(None);
+        }
+
+        let now = Instant::now();
+        let plan = plan_tick_wait(last_tick_started_at, timing, precision_window, now);
+        if let Some(sleep_duration) = plan.sleep {
+            let timeout =
+                sleep_duration.min(starvation_timeout.saturating_sub(wait_started.elapsed()));
+            match rx.recv_timeout(timeout) {
+                Ok(batch) => return Ok(Some(batch)),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(WaitTickBatchError::Disconnected);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+
+        if plan.remaining.is_zero() {
+            let timeout =
+                precision_window.min(starvation_timeout.saturating_sub(wait_started.elapsed()));
+            match rx.recv_timeout(timeout) {
+                Ok(batch) => return Ok(Some(batch)),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(WaitTickBatchError::Disconnected);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+
+        let deadline = last_tick_started_at + plan.tick_interval;
+        while Instant::now() < deadline && wait_started.elapsed() < starvation_timeout {
+            match rx.try_recv() {
+                Ok(batch) => return Ok(Some(batch)),
+                Err(TryRecvError::Disconnected) => return Err(WaitTickBatchError::Disconnected),
+                Err(TryRecvError::Empty) => thread::yield_now(),
+            }
+        }
     }
 }
 
@@ -909,6 +1023,67 @@ mod tests {
     #[test]
     fn smoke_links() {
         assert_eq!(smoke(), "omoba-core runtime linked");
+    }
+
+    #[test]
+    fn wait_plan_keeps_precision_window_for_supported_fps() {
+        let now = Instant::now();
+        let precision = Duration::from_millis(2);
+        for (fps, expected_interval_us) in [(120, 8_333), (90, 11_111), (60, 16_666)] {
+            let timing = LockstepTiming::new(fps).unwrap();
+            let plan = plan_tick_wait(now, timing, precision, now);
+            assert!(
+                plan.tick_interval
+                    .as_micros()
+                    .abs_diff(expected_interval_us)
+                    <= 1,
+                "fps={fps} interval={:?}",
+                plan.tick_interval
+            );
+            let sleep = plan.sleep.expect("sleep for full frame budget");
+            assert!(
+                sleep <= plan.tick_interval - precision,
+                "fps={fps} sleep={sleep:?} interval={:?}",
+                plan.tick_interval
+            );
+        }
+    }
+
+    #[test]
+    fn wait_plan_uses_yield_path_inside_precision_window() {
+        let now = Instant::now();
+        let timing = LockstepTiming::new(120).unwrap();
+        let precision = Duration::from_millis(2);
+        let consumed = timing.dt_duration() - Duration::from_millis(1);
+        let plan = plan_tick_wait(now, timing, precision, now + consumed);
+
+        assert!(plan.remaining <= precision);
+        assert_eq!(plan.sleep, None);
+    }
+
+    #[test]
+    fn wait_tick_batch_returns_ready_payload_without_pacing_sleep() {
+        let (tx, rx) = unbounded();
+        tx.send(TickBatchPayload {
+            tick: 7,
+            inputs: Vec::new(),
+            lua_content_generation: 0,
+            lua_content_hash: String::new(),
+        })
+        .unwrap();
+        let started = Instant::now();
+        let batch = wait_tick_batch(
+            &rx,
+            started,
+            LockstepTiming::new(60).unwrap(),
+            Duration::from_millis(2),
+            Duration::from_millis(50),
+        )
+        .unwrap()
+        .expect("payload");
+
+        assert_eq!(batch.tick, 7);
+        assert!(started.elapsed() < Duration::from_millis(10));
     }
 
     #[test]

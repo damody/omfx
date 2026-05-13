@@ -160,8 +160,7 @@ fn main() {
             named_objects: false,
         },
     );
-    // Keep authoritative lockstep at 120 TPS, but give the render/plugin loop
-    // a small cadence headroom so 120 FPS 1% lows survive Windows wakeup jitter.
+    fyrox::engine::executor::set_render_target_tps(RENDER_UPDATE_TPS);
     executor.set_desired_update_rate(RENDER_UPDATE_TPS as f32);
 
     // 動態連結並啟用熱重載。

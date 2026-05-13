@@ -7,14 +7,12 @@
 //! 傳到 Fyrox 主執行緒，以 info/debug 等級輸出；
 //! `TickBatch` 採用 debug，且每 60 幀取樣一次以避免訊息刷屏。
 //!
-//! 階段 3 預計以真正的 omoba_sim ECS 替代舊有 `GameEvent` 流式消費器，
-//! 並由 TickBatch 輸入驅動渲染；目前階段先保留舊的 `NetworkBridge` 與其
-//! 平行運作。
+//! native frontend 的 gameplay replica 由 `omoba-core::runtime` 驅動；
+//! 這個 client 只負責 KCP lockstep wire 邊界與跨 thread 事件轉送。
 //!
 //! 設計重點：
-//! - 會額外啟動自己的背景執行緒與 tokio current-thread runtime，做法上
-//!   對齊 `NetworkBridge::spawn`。兩條路徑不共用 runtime，
-//!   其中任一發生卡死/崩潰不會拖垮另一條。
+//! - 會額外啟動自己的背景執行緒與 tokio current-thread runtime，避免網路 I/O
+//!   阻塞 Fyrox render thread。
 //! - 先呼叫 `omoba_core::KcpClient::join_lockstep`（送出 JoinRequest 0x13，
 //!   等待 GameStart 0x14），再呼叫 `subscribe_lockstep` 取得已啟用
 //!   的 lockstep mpsc receiver（由 KCP reader task 推資料）。
@@ -32,6 +30,7 @@ use log::{error, info, warn};
 
 use omoba_core::kcp::client::LockstepInbound;
 use omoba_core::kcp::game_proto::{PlayerInput, ServerEvent};
+use omoba_core::lockstep_timing::LOCKSTEP_TPS;
 use omoba_core::KcpClient;
 
 fn wall_clock_us() -> u64 {
@@ -83,6 +82,7 @@ pub enum LockstepEvent {
     Connected {
         master_seed: u64,
         player_id: u32,
+        step_fps: u32,
     },
     /// 階段 3.3：改為攜帶完整 TickBatch 內容（inputs + server events），
     /// 而非只傳筆數；讓 sim_runner 可用實際玩家輸入驅動 ECS dispatcher。
@@ -227,13 +227,15 @@ async fn run_client(
         }
     };
     let player_id = client.lockstep_player_id().unwrap_or(0);
+    let step_fps = client.lockstep_step_fps().unwrap_or(LOCKSTEP_TPS);
     info!(
-        "lockstep-client joined: master_seed=0x{:016x} player_id={}",
-        master_seed, player_id
+        "lockstep-client joined: master_seed=0x{:016x} player_id={} step_fps={}",
+        master_seed, player_id, step_fps
     );
     let _ = events_tx.send(LockstepEvent::Connected {
         master_seed,
         player_id,
+        step_fps,
     });
 
     // 接管 lockstep 入站串流。`join_lockstep` 已經耗掉第一筆

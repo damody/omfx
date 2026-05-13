@@ -1,0 +1,17 @@
+[client]
+SERVER_ADDR = "127.0.0.1:50061"
+PLAYER_NAME = "omfx_player"
+LOCKSTEP_PLAYER_SUFFIX = "_lockstep"
+
+# Frontend-local content package used to locate client assets and generated Lua data.
+# Simulation cadence is server-authoritative and is announced in GameStart.
+STORY = "TD_1"
+
+[content]
+# Paths are resolved relative to this game.toml.
+DLL_PATH = "../scripts/base_content.dll"
+SCRIPTS_DIR = "../scripts"
+LUA_CONTENT = true
+LUA_CONTENT_ROOT = "../scripts/lua_data"
+LUA_HOT_RELOAD = true
+STORY_DATA_DIR = "../scripts/lua_data"

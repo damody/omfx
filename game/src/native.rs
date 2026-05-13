@@ -52,12 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use omoba_core::{
-    lockstep_timing::{
-        ticks_to_seconds_f64, LOCKSTEP_ONE_SECOND_TICKS_U32, LOCKSTEP_TICK_PERIOD_US, LOCKSTEP_TPS,
-    },
-    GameEventData,
-};
+use omoba_core::lockstep_timing::{LockstepTiming, LOCKSTEP_ONE_SECOND_TICKS_U32, LOCKSTEP_TPS};
 
 pub use fyrox;
 
@@ -72,13 +67,14 @@ pub(crate) mod sprite_resources;
 
 const ABILITY_ICON_FALLBACK_PATH: &str = "data/ability_icons/ability_default_placeholder.png";
 const DEFAULT_DLL_PATH: &str = "scripts/base_content.dll";
-const DEFAULT_GAME_TOML_PATH: &str = "scripts/game.toml";
+const DEFAULT_GAME_TOML_PATH: &str = "game.toml";
 const DEFAULT_STORY_DATA_DIR: &str = "scripts/lua_data";
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
 const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS;
-const INPUT_LOOKAHEAD_TICKS: u32 = 2;
+const INPUT_LOOKAHEAD_MIN_TICKS: u32 = 2;
+const INPUT_LOOKAHEAD_TARGET_MS: u32 = 64;
 const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
 const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
 
@@ -93,6 +89,167 @@ fn perfetto_deep_enabled() -> bool {
             .map(|value| value.eq_ignore_ascii_case("deep"))
             .unwrap_or(false)
     })
+}
+
+fn input_lookahead_ticks(timing: LockstepTiming) -> u32 {
+    let numerator = timing
+        .step_fps()
+        .saturating_mul(INPUT_LOOKAHEAD_TARGET_MS)
+        .saturating_add(999);
+    (numerator / 1000).max(INPUT_LOOKAHEAD_MIN_TICKS)
+}
+
+struct FrontendConfigFile {
+    path: PathBuf,
+    text: String,
+}
+
+fn frontend_config_file() -> Option<&'static FrontendConfigFile> {
+    static CONFIG: OnceLock<Option<FrontendConfigFile>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let path = PathBuf::from(
+                std::env::var("OMFX_GAME_TOML")
+                    .unwrap_or_else(|_| DEFAULT_GAME_TOML_PATH.to_string()),
+            );
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|text| FrontendConfigFile { path, text })
+        })
+        .as_ref()
+}
+
+fn parse_toml_scalar(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('"')
+        .trim_end_matches('"')
+        .to_string()
+}
+
+fn frontend_config_section_value(section: &str, key: &str) -> Option<String> {
+    let config = frontend_config_file()?;
+    let mut current_section = "";
+    for line in config.text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current_section = name.trim();
+            continue;
+        }
+        if current_section != section {
+            continue;
+        }
+        let mut parts = line.splitn(2, '=');
+        let k = parts.next()?.trim();
+        if k == key {
+            return Some(parse_toml_scalar(parts.next()?));
+        }
+    }
+    None
+}
+
+fn frontend_config_value(key: &str) -> Option<String> {
+    frontend_config_section_value("client", key)
+        .or_else(|| frontend_config_section_value("content", key))
+        .or_else(|| frontend_config_section_value("server", key))
+}
+
+fn frontend_config_env_or_section_value(env_key: &str, section: &str, key: &str) -> Option<String> {
+    std::env::var(env_key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| frontend_config_section_value(section, key))
+}
+
+fn frontend_config_f32(env_key: &str, section: &str, key: &str) -> Option<(String, f32)> {
+    let raw = frontend_config_env_or_section_value(env_key, section, key)?;
+    raw.parse::<f32>().ok().map(|parsed| (raw, parsed))
+}
+
+fn resolve_frontend_config_path(value: String) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    if let Some(config) = frontend_config_file() {
+        return config
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path);
+    }
+    path
+}
+
+fn frontend_config_path(section: &str, key: &str) -> Option<PathBuf> {
+    frontend_config_section_value(section, key).map(resolve_frontend_config_path)
+}
+
+fn frontend_server_addr() -> String {
+    if let Ok(value) = std::env::var("OMB_KCP_ADDR") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    if let Some(value) = frontend_config_section_value("client", "SERVER_ADDR") {
+        return value;
+    }
+    let ip = frontend_config_section_value("server", "SERVER_IP")
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port =
+        frontend_config_section_value("server", "SERVER_PORT").unwrap_or_else(|| "50061".into());
+    format!(
+        "{}:{}",
+        if ip == "localhost" { "127.0.0.1" } else { &ip },
+        port
+    )
+}
+
+fn set_env_if_missing(name: &str, value: String) {
+    let should_set = std::env::var(name)
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if should_set {
+        std::env::set_var(name, value);
+    }
+}
+
+fn bool_config_value(section: &str, key: &str) -> Option<bool> {
+    frontend_config_section_value(section, key).and_then(|value| {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn apply_frontend_runtime_env_from_config() {
+    if let Some(path) = frontend_config_path("content", "DLL_PATH") {
+        set_env_if_missing("OMB_DLL_PATH", path.to_string_lossy().into_owned());
+    }
+    if let Some(path) = frontend_config_path("content", "SCRIPTS_DIR") {
+        set_env_if_missing("OMB_SCRIPTS_DIR", path.to_string_lossy().into_owned());
+    }
+    if let Some(path) = frontend_config_path("content", "LUA_CONTENT_ROOT") {
+        set_env_if_missing("OMB_LUA_CONTENT_ROOT", path.to_string_lossy().into_owned());
+    }
+    if let Some(path) = frontend_config_path("content", "STORY_DATA_DIR") {
+        set_env_if_missing("OMB_STORY_DATA_DIR", path.to_string_lossy().into_owned());
+    }
+    if let Some(enabled) = bool_config_value("content", "LUA_CONTENT") {
+        set_env_if_missing(
+            "OMB_LUA_CONTENT",
+            if enabled { "1" } else { "0" }.to_string(),
+        );
+    }
+    if let Some(enabled) = bool_config_value("content", "LUA_HOT_RELOAD") {
+        set_env_if_missing(
+            "OMB_LUA_HOT_RELOAD",
+            if enabled { "1" } else { "0" }.to_string(),
+        );
+    }
 }
 
 fn tower_fire_fx_key(cue: &sim_runner::TowerFireFx) -> TowerFireFxKey {
@@ -1541,8 +1698,8 @@ pub struct Game {
     #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
     /// 階段 4.3：觀察到最近的「LockstepEvent::TickBatch.tick」。
-    /// 用於計算輸入的“target_tick = current_sim_tick + INPUT_LOOKAHEAD_TICKS”
-    /// 提交（120 Hz、2 tick 時約 16.7 毫秒）。透過初始化為 0
+    /// 用於計算 input submit target tick。Lookahead 以 wall-clock budget
+    /// 換算為 server cadence tick 數。透過初始化為 0
     /// `#[導出（預設）]`;更新了 TickBatch 手臂中的每一幀
     /// `遊戲::更新`。
     #[visit(skip)]
@@ -1551,6 +1708,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     current_sim_tick_observed_at: Option<Instant>,
+    /// Server-authoritative cadence announced by GameStart.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    server_step_fps: u32,
     #[visit(skip)]
     #[reflect(hidden)]
     pending_inputs: HashMap<u32, PendingInput>,
@@ -2693,11 +2854,13 @@ impl Plugin for Game {
         // Inventory 初始 6 格
         self.hero_state.inventory = vec![None; 6];
 
+        apply_frontend_runtime_env_from_config();
+
         // 網路初始化
-        let server_addr =
-            std::env::var("OMB_KCP_ADDR").unwrap_or_else(|_| "127.0.0.1:50061".to_string());
+        let server_addr = frontend_server_addr();
         let player_name =
-            std::env::var("OMB_PLAYER_NAME").unwrap_or_else(|_| "omfx_player".to_string());
+            frontend_config_env_or_section_value("OMB_PLAYER_NAME", "client", "PLAYER_NAME")
+                .unwrap_or_else(|| "omfx_player".to_string());
 
         // 階段 5.1：NetworkBridge 消費者削減。階段 4.5 翻轉 omb
         // `legacy_broadcast` 預設關閉，因此 0x02 GameEvent 串流是
@@ -2708,8 +2871,11 @@ impl Plugin for Game {
         // 鎖步接線。作為後台線程在其自己的 KCP 上運行
         // 聯繫。 TickBatch / StateHash驅動本地sim_runner
         // （階段 3.x）透過 render_bridge 渲染（階段 4.2）。
-        let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME")
-            .unwrap_or_else(|_| format!("{}_lockstep", player_name));
+        let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME").unwrap_or_else(|_| {
+            let suffix = frontend_config_value("LOCKSTEP_PLAYER_SUFFIX")
+                .unwrap_or_else(|| "_lockstep".to_string());
+            format!("{}{}", player_name, suffix)
+        });
         self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
             server_addr,
             lockstep_player_name,
@@ -2727,14 +2893,12 @@ impl Plugin for Game {
             // 取得父目錄並掃描 .dll，因此這對兩者都適用。
             let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_DLL_PATH));
-            // Runtime config loader reads `game.toml` through the shared
-            // `OMB_GAME_TOML` override; omfx usually has a different cwd than
-            // the backend launcher.
-            if std::env::var("OMB_GAME_TOML").is_err() {
-                std::env::set_var("OMB_GAME_TOML", DEFAULT_GAME_TOML_PATH);
-            }
-            // 透過 OMB_STORY/同一份 game.toml 的 STORY 將 sim_runner 的場景與 omb 同步。
+                .unwrap_or_else(|_| {
+                    frontend_config_path("content", "DLL_PATH")
+                        .or_else(|| frontend_config_path("client", "DLL_PATH"))
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DLL_PATH))
+                });
+            // 透過 OMB_STORY/omfx game.toml 的 STORY 將 sim_runner 的場景與 omb 同步。
             // 否則 sim_runner 載入 MVP_1，而 omb 載入 TD_1，兩個 ECS 世界分歧，sim_runner
             // 最終以 MVP_1 的訓練敵人/阻擋者結束（~410 個幽靈
             // 實體），而蠕變路徑/波與 omb 不符。
@@ -2744,39 +2908,21 @@ impl Plugin for Game {
                     let story = std::env::var("OMB_STORY")
                         .ok()
                         .filter(|s| !s.trim().is_empty())
+                        .or_else(|| frontend_config_section_value("server", "STORY"))
+                        .or_else(|| frontend_config_section_value("client", "STORY"))
                         .unwrap_or_else(|| {
-                            let toml_path = std::env::var("OMB_GAME_TOML")
-                                .unwrap_or_else(|_| DEFAULT_GAME_TOML_PATH.to_string());
-                            std::fs::read_to_string(&toml_path)
-                                .ok()
-                                .and_then(|s| {
-                                    s.lines()
-                                        .map(str::trim)
-                                        .filter(|l| !l.starts_with('#'))
-                                        .find_map(|l| {
-                                            let mut parts = l.splitn(2, '=');
-                                            let key = parts.next()?.trim();
-                                            if key != "STORY" {
-                                                return None;
-                                            }
-                                            let val = parts
-                                                .next()?
-                                                .trim()
-                                                .trim_start_matches('"')
-                                                .trim_end_matches('"')
-                                                .to_string();
-                                            Some(val)
-                                        })
-                                })
-                                .unwrap_or_else(|| {
-                                    log::warn!("game.toml missing STORY; falling back to MVP_1");
-                                    "MVP_1".to_string()
-                                })
+                            log::warn!("omfx game.toml missing STORY; falling back to MVP_1");
+                            "MVP_1".to_string()
                         });
                     log::info!("sim_runner: scene STORY={}", story);
                     let data_root = std::env::var("OMB_STORY_DATA_DIR")
-                        .unwrap_or_else(|_| DEFAULT_STORY_DATA_DIR.to_string());
-                    PathBuf::from(data_root).join(story)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| {
+                            frontend_config_path("content", "STORY_DATA_DIR")
+                                .or_else(|| frontend_config_path("client", "STORY_DATA_DIR"))
+                                .unwrap_or_else(|| PathBuf::from(DEFAULT_STORY_DATA_DIR))
+                        });
+                    data_root.join(story)
                 });
             log::info!(
                 "Phase 3.2 sim_runner spawn: dll={:?} scene={:?}",
@@ -2842,15 +2988,65 @@ impl Plugin for Game {
             .duration_since(self.auto_clock_start.unwrap())
             .as_secs_f32();
         if !self.auto_start_sent {
-            if let Ok(v) = std::env::var("OMFX_AUTO_START_AFTER_SEC") {
-                if let Ok(threshold) = v.parse::<f32>() {
-                    if elapsed_s >= threshold {
-                        let input = omoba_core::kcp::game_proto::PlayerInput {
-                            action: Some(
-                                omoba_core::kcp::game_proto::player_input::Action::StartRound(
-                                    omoba_core::kcp::game_proto::StartRound {},
-                                ),
+            if let Some((raw, threshold)) = frontend_config_f32(
+                "OMFX_AUTO_START_AFTER_SEC",
+                "client",
+                "AUTO_START_AFTER_SEC",
+            ) {
+                if elapsed_s >= threshold {
+                    let input = omoba_core::kcp::game_proto::PlayerInput {
+                        action: Some(
+                            omoba_core::kcp::game_proto::player_input::Action::StartRound(
+                                omoba_core::kcp::game_proto::StartRound {},
                             ),
+                        ),
+                    };
+                    let origin_us = wall_clock_us();
+                    self.send_lockstep_input_from(
+                        input,
+                        lockstep_client::InputOriginKind::Auto,
+                        origin_us,
+                    );
+                    log::info!(
+                        "[auto-smoke] Start Round sent at t={:.2}s (AUTO_START_AFTER_SEC={})",
+                        elapsed_s,
+                        raw
+                    );
+                    self.auto_start_sent = true;
+                }
+            }
+        }
+        if let Some((_raw, interval_ms)) =
+            frontend_config_f32("OMFX_AUTO_NOOP_EVERY_MS", "client", "AUTO_NOOP_EVERY_MS")
+        {
+            if interval_ms > 0.0 {
+                let start_after_s = frontend_config_f32(
+                    "OMFX_AUTO_NOOP_START_AFTER_SEC",
+                    "client",
+                    "AUTO_NOOP_START_AFTER_SEC",
+                )
+                .map(|(_, v)| v)
+                .or_else(|| {
+                    frontend_config_f32(
+                        "OMFX_AUTO_START_AFTER_SEC",
+                        "client",
+                        "AUTO_START_AFTER_SEC",
+                    )
+                    .map(|(_, v)| v)
+                })
+                .unwrap_or(0.0);
+                let interval_s = interval_ms / 1000.0;
+                if elapsed_s < start_after_s {
+                    self.auto_noop_next_at_s = Some(start_after_s + interval_s);
+                } else {
+                    let next_at = self
+                        .auto_noop_next_at_s
+                        .unwrap_or(start_after_s + interval_s);
+                    if elapsed_s >= next_at {
+                        let input = omoba_core::kcp::game_proto::PlayerInput {
+                            action: Some(omoba_core::kcp::game_proto::player_input::Action::NoOp(
+                                omoba_core::kcp::game_proto::NoOp {},
+                            )),
                         };
                         let origin_us = wall_clock_us();
                         self.send_lockstep_input_from(
@@ -2858,66 +3054,23 @@ impl Plugin for Game {
                             lockstep_client::InputOriginKind::Auto,
                             origin_us,
                         );
-                        log::info!(
-                            "[auto-smoke] Start Round sent at t={:.2}s (OMFX_AUTO_START_AFTER_SEC={})",
-                            elapsed_s, v
-                        );
-                        self.auto_start_sent = true;
-                    }
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("OMFX_AUTO_NOOP_EVERY_MS") {
-            if let Ok(interval_ms) = v.parse::<f32>() {
-                if interval_ms > 0.0 {
-                    let start_after_s = std::env::var("OMFX_AUTO_NOOP_START_AFTER_SEC")
-                        .ok()
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .or_else(|| {
-                            std::env::var("OMFX_AUTO_START_AFTER_SEC")
-                                .ok()
-                                .and_then(|v| v.parse::<f32>().ok())
-                        })
-                        .unwrap_or(0.0);
-                    let interval_s = interval_ms / 1000.0;
-                    if elapsed_s < start_after_s {
-                        self.auto_noop_next_at_s = Some(start_after_s + interval_s);
+                        self.auto_noop_next_at_s = Some(next_at + interval_s);
                     } else {
-                        let next_at = self
-                            .auto_noop_next_at_s
-                            .unwrap_or(start_after_s + interval_s);
-                        if elapsed_s >= next_at {
-                            let input = omoba_core::kcp::game_proto::PlayerInput {
-                                action: Some(
-                                    omoba_core::kcp::game_proto::player_input::Action::NoOp(
-                                        omoba_core::kcp::game_proto::NoOp {},
-                                    ),
-                                ),
-                            };
-                            let origin_us = wall_clock_us();
-                            self.send_lockstep_input_from(
-                                input,
-                                lockstep_client::InputOriginKind::Auto,
-                                origin_us,
-                            );
-                            self.auto_noop_next_at_s = Some(next_at + interval_s);
-                        } else {
-                            self.auto_noop_next_at_s = Some(next_at);
-                        }
+                        self.auto_noop_next_at_s = Some(next_at);
                     }
                 }
             }
         }
-        if let Ok(v) = std::env::var("OMFX_AUTO_EXIT_AFTER_SEC") {
-            if let Ok(threshold) = v.parse::<f32>() {
-                if elapsed_s >= threshold {
-                    log::info!(
-                        "[auto-smoke] exiting at t={:.2}s (OMFX_AUTO_EXIT_AFTER_SEC={})",
-                        elapsed_s,
-                        v
-                    );
-                    std::process::exit(0);
-                }
+        if let Some((raw, threshold)) =
+            frontend_config_f32("OMFX_AUTO_EXIT_AFTER_SEC", "client", "AUTO_EXIT_AFTER_SEC")
+        {
+            if elapsed_s >= threshold {
+                log::info!(
+                    "[auto-smoke] exiting at t={:.2}s (AUTO_EXIT_AFTER_SEC={})",
+                    elapsed_s,
+                    raw
+                );
+                std::process::exit(0);
             }
         }
         drop(auto_hooks_span);
@@ -2979,13 +3132,19 @@ impl Plugin for Game {
                     lockstep_client::LockstepEvent::Connected {
                         master_seed,
                         player_id,
+                        step_fps,
                     } => {
+                        self.server_step_fps = step_fps;
                         log::info!(
-                            "[lockstep] connected master_seed=0x{:016x} player_id={}",
+                            "[lockstep] connected master_seed=0x{:016x} player_id={} step_fps={}",
                             master_seed,
-                            player_id
+                            player_id,
+                            step_fps
                         );
-                        if let Err(e) = sim.master_seed_tx.send(master_seed) {
+                        if let Err(e) = sim.master_seed_tx.send(sim_runner::SimStartMetadata {
+                            master_seed,
+                            step_fps,
+                        }) {
                             log::error!("[lockstep] failed to forward master_seed: {}", e);
                         }
                     }
@@ -3136,7 +3295,7 @@ impl Plugin for Game {
                     self.render_pacing_last_snapshot_tick = Some(snapshot.tick);
                     self.update_sim_speed(snapshot.tick);
                     // sim_runner 以共享 lockstep cadence 運作。
-                    self.heartbeat.game_time = ticks_to_seconds_f64(snapshot.tick);
+                    self.heartbeat.game_time = self.ticks_to_seconds(snapshot.tick);
                     self.heartbeat.entity_count = snapshot.entities.len() as u64;
                     self.heartbeat.hero_count = snapshot
                         .entities
@@ -4286,7 +4445,7 @@ impl Plugin for Game {
                     ping_str,
                     lag_str,
                     self.sim_speed_tps,
-                    LOCKSTEP_TPS as f32,
+                    self.server_timing().step_fps() as f32,
                     sim_lag_ticks,
                     self.heartbeat.tick,
                     self.heartbeat.game_time,
@@ -5577,6 +5736,7 @@ impl Plugin for Game {
             .record_render_pacing(snapshot_reused, render_target_tps);
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(diagnostics) = sim.diagnostics.try_lock() {
+                self.sim_speed_tps = diagnostics.sim_tps;
                 self.frame_profile.record_sim_diagnostics(&diagnostics);
             }
         }
@@ -6246,6 +6406,19 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    fn server_timing(&self) -> LockstepTiming {
+        LockstepTiming::new(if self.server_step_fps == 0 {
+            LOCKSTEP_TPS
+        } else {
+            self.server_step_fps
+        })
+        .unwrap_or(LockstepTiming::DEFAULT)
+    }
+
+    fn ticks_to_seconds(&self, tick: u32) -> f64 {
+        self.server_timing().ticks_to_seconds_f64(tick)
+    }
+
     fn update_sim_speed(&mut self, tick: u32) {
         if tick == self.sim_speed_last_tick {
             return;
@@ -7114,7 +7287,7 @@ impl Game {
                 "attack"
             };
             let cue_age_secs =
-                ticks_to_seconds_f64(snapshot_tick.saturating_sub(cue.spawn_tick)) as f32;
+                self.ticks_to_seconds(snapshot_tick.saturating_sub(cue.spawn_tick)) as f32;
             if !self.start_hero_attack_action(
                 scene,
                 entity.entity_id,
@@ -7136,9 +7309,9 @@ impl Game {
                 .get(&entity.entity_id)
                 .and_then(|node| node.pending_attack.clone());
             if let Some(pending) = pending {
-                let cue_age_secs =
-                    ticks_to_seconds_f64(snapshot_tick.saturating_sub(pending.cue.spawn_tick))
-                        as f32;
+                let cue_age_secs = self
+                    .ticks_to_seconds(snapshot_tick.saturating_sub(pending.cue.spawn_tick))
+                    as f32;
                 if self.start_hero_attack_action(
                     scene,
                     entity.entity_id,
@@ -7528,17 +7701,10 @@ impl Game {
         }
     }
 
-    /// 階段 4.3：將 `PlayerInput` 傳送到鎖步線（omb 的鎖定步
-    /// 調度程序）。如果“lockstep_handle”為“無”，則無操作（例如僅遺留模式）。
-    /// 目標刻度 = current_sim_tick + INPUT_LOOKAHEAD_TICKS（120 Hz 時 2 tick 約 16.7 毫秒）。這
-    /// 底層的`GameClient`（在`omoba_core::kcp::client`中）標記了
-    /// `InputSubmit` 框架帶有來自 `GameStart` 的快取的 `player_id`，所以
-    /// 呼叫者不需要知道自己的身分。
-    ///
-    /// 與舊版「NetworkBridge::cmd_tx」路徑**並行**運行 —
-    /// 4.5 階段削減了遺留部分。在此之前，請點擊一下即可產生
-    /// 兩個伺服器端訊息； omb-side 負責重複資料刪除或
-    /// （Phase-4.5 後）忽略舊指令。
+    /// 階段 4.3：將 `PlayerInput` 傳送到 omoba-core KCP lockstep client。
+    /// 如果 `lockstep_handle` 為 `None`，則 no-op。目標刻度 =
+    /// `latest_tick + input_lookahead_ticks(server_timing)`。
+    /// 底層 `KcpClient` 會用 `GameStart` 快取的 `player_id` 包裝 `InputSubmit`。
     /// 階段 5.x：每個tick，將 sim_runner 快照實體鏡像到
     /// 共享 body_batch + hp_batch CPU 映像。為每個實體分配一個插槽
     /// 第一次見到時；釋放輟學時的插槽。 EntityKind::其他是
@@ -7956,7 +8122,7 @@ impl Game {
                 .map(|drain_tick| drain_tick.wrapping_sub(pending.base_tick))
                 .unwrap_or(0);
             let tick_quantized_latency_us =
-                u64::from(sim_latency_ticks).saturating_mul(LOCKSTEP_TICK_PERIOD_US);
+                u64::from(sim_latency_ticks).saturating_mul(self.server_timing().tick_period_us());
             self.input_latency_meter.push(LatencySample {
                 input_id,
                 action_kind: pending.action_kind,
@@ -8097,13 +8263,18 @@ impl Game {
         // 渲染線程的最後一個耗盡的tick；後者添加了一個框架
         // 甚至應用固定前瞻之前的延遲。
         let base_tick = handle.latest_tick();
-        let target_tick = base_tick.wrapping_add(INPUT_LOOKAHEAD_TICKS);
+        let timing = self.server_timing();
+        let lookahead_ticks = input_lookahead_ticks(timing);
+        let target_tick = base_tick.wrapping_add(lookahead_ticks);
+        let lookahead_ms = f64::from(lookahead_ticks) * 1000.0 / f64::from(timing.step_fps());
         log::debug!(
-            "input_submit_target: id={} kind={:?} base_tick={} lookahead={} target_tick={}",
+            "input_submit_target: id={} kind={:?} base_tick={} lookahead={} ({:.1}ms @ {}fps) target_tick={}",
             input_id,
             action_kind,
             base_tick,
-            INPUT_LOOKAHEAD_TICKS,
+            lookahead_ticks,
+            lookahead_ms,
+            timing.step_fps(),
             target_tick,
         );
         if let Err(e) = handle.input_tx.send(lockstep_client::LockstepInputMsg {
@@ -8875,6 +9046,13 @@ mod input_latency_tests {
 
         // 1% of 120 frames uses the two slowest frames: average 11 ms.
         assert!((one_pct_low_fps - (1000.0 / 11.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn input_lookahead_preserves_wall_clock_budget_at_supported_fps() {
+        assert_eq!(input_lookahead_ticks(LockstepTiming::new(120).unwrap()), 8);
+        assert_eq!(input_lookahead_ticks(LockstepTiming::new(90).unwrap()), 6);
+        assert_eq!(input_lookahead_ticks(LockstepTiming::new(60).unwrap()), 4);
     }
 
     #[test]
