@@ -73,8 +73,7 @@ const DEFAULT_STORY_DATA_DIR: &str = "scripts/lua_data";
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
 const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS;
-const INPUT_LOOKAHEAD_MIN_TICKS: u32 = 2;
-const INPUT_LOOKAHEAD_TARGET_MS: u32 = 64;
+const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
 const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
 
@@ -91,12 +90,8 @@ fn perfetto_deep_enabled() -> bool {
     })
 }
 
-fn input_lookahead_ticks(timing: LockstepTiming) -> u32 {
-    let numerator = timing
-        .step_fps()
-        .saturating_mul(INPUT_LOOKAHEAD_TARGET_MS)
-        .saturating_add(999);
-    (numerator / 1000).max(INPUT_LOOKAHEAD_MIN_TICKS)
+fn input_lookahead_ticks(_timing: LockstepTiming) -> u32 {
+    INPUT_LOOKAHEAD_TICKS
 }
 
 struct FrontendConfigFile {
@@ -1698,8 +1693,8 @@ pub struct Game {
     #[reflect(hidden)]
     lockstep_handle: Option<lockstep_client::LockstepClientHandle>,
     /// 階段 4.3：觀察到最近的「LockstepEvent::TickBatch.tick」。
-    /// 用於計算 input submit target tick。Lookahead 以 wall-clock budget
-    /// 換算為 server cadence tick 數。透過初始化為 0
+    /// 用於計算 input submit target tick。低延遲 client lookahead 搭配
+    /// server late-input retarget 避免偶發晚到直接掉 input。
     /// `#[導出（預設）]`;更新了 TickBatch 手臂中的每一幀
     /// `遊戲::更新`。
     #[visit(skip)]
@@ -9049,10 +9044,10 @@ mod input_latency_tests {
     }
 
     #[test]
-    fn input_lookahead_preserves_wall_clock_budget_at_supported_fps() {
-        assert_eq!(input_lookahead_ticks(LockstepTiming::new(120).unwrap()), 8);
-        assert_eq!(input_lookahead_ticks(LockstepTiming::new(90).unwrap()), 6);
-        assert_eq!(input_lookahead_ticks(LockstepTiming::new(60).unwrap()), 4);
+    fn input_lookahead_stays_low_latency_at_supported_fps() {
+        assert_eq!(input_lookahead_ticks(LockstepTiming::new(120).unwrap()), 2);
+        assert_eq!(input_lookahead_ticks(LockstepTiming::new(90).unwrap()), 2);
+        assert_eq!(input_lookahead_ticks(LockstepTiming::new(60).unwrap()), 2);
     }
 
     #[test]
