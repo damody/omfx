@@ -2,6 +2,9 @@
 SERVER_ADDR = "127.0.0.1:50061"
 PLAYER_NAME = "omfx_player"
 LOCKSTEP_PLAYER_SUFFIX = "_lockstep"
+# Extract client render data from the local ECS replica every N sim ticks.
+# 1 means every tick.
+EXTRACT_DATA_FOR_RENDER_EVERY_TICKS = 1
 
 # Frontend-local content package used to locate client assets and generated Lua data.
 # Simulation cadence is server-authoritative and is announced in GameStart.

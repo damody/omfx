@@ -2,7 +2,7 @@
 //!
 //! 產生一個工作線程，運行由以下驅動的完整 omb ECS 調度程序
 //! 來自 omb 鎖步線的 TickBatch 輸入。渲染線程讀取
-//! 發布了 `SimWorldSnapshot` Arc<Mutex<...>>。
+//! `extract_data_for_render` 發布到 `SimWorldSnapshot` Arc<Mutex<...>> 的資料。
 //!
 //! 階段 3.1 = 存根。階段 3.2 = 現實世界 init + 調度程式循環。階段
 //! 3.3 將連接 `LockstepClient` → 通道饋線。 3.4相線
@@ -46,16 +46,16 @@ pub struct TickBatchInput {
 
 pub use omoba_core::runtime::{
     buff_remaining_secs_for_snapshot, build_ability_def_snapshots, build_tower_template_snapshots,
-    build_tower_upgrade_def_snapshots, extract_runtime_render_update,
-    hero_render_snapshot_for_unit_id, retain_recent_render_fx, AbilityDefSnapshot,
-    AppliedInputMeta, AttackCancelFx, AttackPhaseFx, BlockedRegionSnapshot, BuffSnapshot,
-    EntityKind, EntityRenderData, ExplosionFx, HeroAnimationBindingSnapshot,
-    HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt, SimWorldSnapshot,
-    TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot, TowerRenderAnimationSnapshot,
-    TowerRenderPointSnapshot, TowerTemplateSnapshot, TowerUpgradeDefSnapshot,
+    build_tower_upgrade_def_snapshots, extract_data_for_render, hero_render_snapshot_for_unit_id,
+    retain_recent_render_fx, AbilityDefSnapshot, AppliedInputMeta, AttackCancelFx, AttackPhaseFx,
+    BlockedRegionSnapshot, BuffSnapshot, EntityKind, EntityRenderData, ExplosionFx,
+    HeroAnimationBindingSnapshot, HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt,
+    SimWorldSnapshot, TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot,
+    TowerRenderAnimationSnapshot, TowerRenderPointSnapshot, TowerTemplateSnapshot,
+    TowerUpgradeDefSnapshot,
 };
 
-const RUNTIME_RENDER_PUBLISH_DIVISOR: u32 = 4;
+pub const DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS: u32 = 1;
 const WAIT_PRECISION_WINDOW: Duration = Duration::from_millis(2);
 const WAIT_STARVATION_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -138,6 +138,18 @@ pub struct SimRunnerHandle {
 /// 每個蜱蟲的輸入驅動的共享階段 3 調度程序
 /// `tick_input_rx`。
 pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> SimRunnerHandle {
+    spawn_sim_runner_with_render_extract_rate(
+        base_content_dll_path,
+        scene_path,
+        DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS,
+    )
+}
+
+pub fn spawn_sim_runner_with_render_extract_rate(
+    base_content_dll_path: PathBuf,
+    scene_path: PathBuf,
+    extract_data_for_render_every_ticks: u32,
+) -> SimRunnerHandle {
     let state = Arc::new(Mutex::new(SimWorldSnapshot::default()));
     let state_for_thread = state.clone();
     let diagnostics = Arc::new(Mutex::new(SimRunnerDiagnostics::default()));
@@ -156,6 +168,7 @@ pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> 
                 master_seed_rx,
                 base_content_dll_path,
                 scene_path,
+                normalize_extract_data_for_render_every_ticks(extract_data_for_render_every_ticks),
             );
         })
         .expect("spawn omfx-sim-runner thread");
@@ -169,6 +182,19 @@ pub fn spawn_sim_runner(base_content_dll_path: PathBuf, scene_path: PathBuf) -> 
     }
 }
 
+fn normalize_extract_data_for_render_every_ticks(value: u32) -> u32 {
+    value.max(1)
+}
+
+fn should_extract_data_for_render(
+    tick: u32,
+    every_ticks: u32,
+    has_current_player_inputs: bool,
+) -> bool {
+    has_current_player_inputs
+        || tick % normalize_extract_data_for_render_every_ticks(every_ticks) == 0
+}
+
 fn run_sim_loop(
     state_out: Arc<Mutex<SimWorldSnapshot>>,
     diagnostics_out: Arc<Mutex<SimRunnerDiagnostics>>,
@@ -176,10 +202,11 @@ fn run_sim_loop(
     master_seed_rx: Receiver<SimStartMetadata>,
     dll_path: PathBuf,
     scene_path: PathBuf,
+    extract_data_for_render_every_ticks: u32,
 ) {
     info!(
-        "sim_runner: thread started; waiting for master_seed (dll={:?}, scene={:?})",
-        dll_path, scene_path
+        "sim_runner: thread started; waiting for master_seed (dll={:?}, scene={:?}, extract_data_for_render_every_ticks={})",
+        dll_path, scene_path, extract_data_for_render_every_ticks
     );
 
     // 阻止第一個 master_seed（由 LockstepClient 在
@@ -238,8 +265,8 @@ fn run_sim_loop(
     info!("sim_runner: dispatcher ready, entering tick loop");
 
     let mut last_starvation_log = std::time::Instant::now();
-    // Full ECS snapshots are initialization-only. Runtime ticks publish only
-    // lightweight changing fields and must not call extract_snapshot.
+    // Full ECS snapshots are initialization-only. Runtime ticks only extract
+    // changing data for render and must not call extract_snapshot.
     let mut abilities_arc: std::sync::Arc<Vec<AbilityDefSnapshot>> =
         std::sync::Arc::new(Vec::new());
     let mut tower_templates_arc: std::sync::Arc<Vec<TowerTemplateSnapshot>> =
@@ -266,7 +293,7 @@ fn run_sim_loop(
     let mut recent_attack_cancel_fx: VecDeque<AttackCancelFx> = VecDeque::new();
     let mut profile_started_at = Instant::now();
     let mut profile_processed_ticks: u32 = 0;
-    let mut profile_runtime_publishes: u32 = 0;
+    let mut profile_extract_data_for_render: u32 = 0;
     let mut profile_latest_tick: u32 = 0;
     let mut profile_dispatch_ns: u128 = 0;
     let mut profile_drains_ns: u128 = 0;
@@ -351,6 +378,7 @@ fn run_sim_loop(
         )
         .entered();
         let input_count = batch.inputs.len();
+        let has_current_player_inputs = batch.inputs.iter().any(|input| input.input_id != 0);
         profile_receive_active_ns += receive_active_started.elapsed().as_nanos();
         drop(receive_span);
         let tick_active_started = Instant::now();
@@ -360,7 +388,11 @@ fn run_sim_loop(
             tick = batch.tick,
             queue_len = tick_input_rx.len(),
             input_count,
-            runtime_publish = batch.tick % RUNTIME_RENDER_PUBLISH_DIVISOR == 0,
+            extract_data_for_render = should_extract_data_for_render(
+                batch.tick,
+                extract_data_for_render_every_ticks,
+                has_current_player_inputs,
+            ),
         )
         .entered();
 
@@ -401,7 +433,7 @@ fn run_sim_loop(
                     server_queue_us: input.server_queue_us,
                     client_receive_us: input.client_receive_us,
                     game_forward_us: input.game_forward_us,
-                    sim_publish_us: 0,
+                    extract_data_for_render_us: 0,
                 },
             ));
         }
@@ -578,16 +610,20 @@ fn run_sim_loop(
         }
         drop(metadata_span);
 
-        let should_publish_runtime = batch.tick % RUNTIME_RENDER_PUBLISH_DIVISOR == 0;
-        if should_publish_runtime {
+        let should_extract_data_for_render = should_extract_data_for_render(
+            batch.tick,
+            extract_data_for_render_every_ticks,
+            has_current_player_inputs,
+        );
+        if should_extract_data_for_render {
             let t_extract = Instant::now();
             let extract_span = tracing::trace_span!(
-                "omfx::sim_runner::runtime_snapshot_extract",
+                "omfx::sim_runner::extract_data_for_render",
                 perfetto = true,
                 tick = batch.tick,
             )
             .entered();
-            let mut snapshot = extract_runtime_render_update(
+            let mut snapshot = extract_data_for_render(
                 &mut world,
                 batch.tick,
                 applied_input_ids,
@@ -619,15 +655,15 @@ fn run_sim_loop(
                 batch.tick,
                 |fx| fx.spawn_tick,
             );
-            let sim_publish_us = wall_clock_us();
+            let extract_data_for_render_us = wall_clock_us();
             for meta in &mut snapshot.applied_input_meta {
-                meta.sim_publish_us = sim_publish_us;
+                meta.extract_data_for_render_us = extract_data_for_render_us;
             }
             drop(fx_span);
 
             let t_publish = Instant::now();
             let publish_span = tracing::trace_span!(
-                "omfx::sim_runner::snapshot_publish",
+                "omfx::sim_runner::render_data_publish",
                 perfetto = true,
                 snapshot_entities = snapshot.entities.len(),
             )
@@ -642,7 +678,7 @@ fn run_sim_loop(
             }
             profile_publish_ns += t_publish.elapsed().as_nanos();
             drop(publish_span);
-            profile_runtime_publishes += 1;
+            profile_extract_data_for_render += 1;
         }
         profile_processed_ticks += 1;
         profile_latest_tick = batch.tick;
@@ -662,11 +698,11 @@ fn run_sim_loop(
                 diagnostics.backlog_receives = profile_backlog_receives;
             }
             info!(
-                "sim_runner_profile window_ms={} target_tps={} processed_ticks={} runtime_publishes={} latest_tick={} queue_len={} max_queue_len={} waits={} blocking_receives={} backlog_receives={} avg_ms wait_idle={:.3} receive_active={:.3} tick_active={:.3} dispatch={:.3} drains={:.3} script={:.3} extract={:.3} publish={:.3}",
+                "sim_runner_profile window_ms={} target_tps={} processed_ticks={} extract_data_for_render={} latest_tick={} queue_len={} max_queue_len={} waits={} blocking_receives={} backlog_receives={} avg_ms wait_idle={:.3} receive_active={:.3} tick_active={:.3} dispatch={:.3} drains={:.3} script={:.3} extract={:.3} publish={:.3}",
                 profile_elapsed.as_millis(),
                 timing.step_fps(),
                 profile_processed_ticks,
-                profile_runtime_publishes,
+                profile_extract_data_for_render,
                 profile_latest_tick,
                 tick_input_rx.len(),
                 profile_max_queue_len,
@@ -684,7 +720,7 @@ fn run_sim_loop(
             );
             profile_started_at = Instant::now();
             profile_processed_ticks = 0;
-            profile_runtime_publishes = 0;
+            profile_extract_data_for_render = 0;
             profile_dispatch_ns = 0;
             profile_drains_ns = 0;
             profile_script_ns = 0;
@@ -989,18 +1025,18 @@ fn push_inputs_into_world(world: &mut World, tick: u32, inputs: Vec<TickBatchInp
     // `PendingPlayerInputs` 資源，所以 `tick::player_input_tick::Sys`
     // 可以在調度程序運行開始時耗盡它們。
     //
-    // 替換資源圖批發（鎖步合約：最多一個
-    // 每個玩家每個刻度的輸入 — 最新的 TickBatch 是權威的）。
+    // Replace the per-tick input list wholesale. Multiple commands from one
+    // player can share a lockstep tick, so keep them in TickBatch order.
     use omoba_core::comp::PendingPlayerInputs;
 
     let mut pending = world.write_resource::<PendingPlayerInputs>();
     pending.tick = tick;
-    pending.by_player.clear();
+    pending.inputs.clear();
     if !inputs.is_empty() {
         log::trace!("sim_runner: tick {} got {} inputs", tick, inputs.len());
     }
     for input in inputs {
-        pending.by_player.insert(input.player_id, input.input);
+        pending.inputs.push((input.player_id, input.input));
     }
 }
 
@@ -1084,6 +1120,27 @@ mod tests {
 
         assert_eq!(batch.tick, 7);
         assert!(started.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn extract_data_for_render_default_is_every_tick() {
+        assert!(should_extract_data_for_render(
+            1,
+            DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS,
+            false
+        ));
+        assert!(should_extract_data_for_render(
+            2,
+            DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS,
+            false
+        ));
+    }
+
+    #[test]
+    fn extract_data_for_render_periodic_setting_keeps_input_ticks() {
+        assert!(!should_extract_data_for_render(5, 4, false));
+        assert!(should_extract_data_for_render(8, 4, false));
+        assert!(should_extract_data_for_render(5, 4, true));
     }
 
     #[test]

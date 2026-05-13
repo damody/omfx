@@ -162,6 +162,23 @@ fn frontend_config_f32(env_key: &str, section: &str, key: &str) -> Option<(Strin
     raw.parse::<f32>().ok().map(|parsed| (raw, parsed))
 }
 
+fn frontend_config_u32_or_default(env_key: &str, section: &str, key: &str, default: u32) -> u32 {
+    let Some(raw) = frontend_config_env_or_section_value(env_key, section, key) else {
+        return default;
+    };
+    match raw.parse::<u32>() {
+        Ok(0) => {
+            log::warn!("{}={} is invalid; using default {}", key, raw, default);
+            default
+        }
+        Ok(value) => value,
+        Err(_) => {
+            log::warn!("{}={} is invalid; using default {}", key, raw, default);
+            default
+        }
+    }
+}
+
 fn resolve_frontend_config_path(value: String) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {
@@ -315,7 +332,7 @@ struct PendingInput {
     submit_done_us: Option<u64>,
     client_receive_tickbatch_us: Option<u64>,
     game_forward_to_sim_us: Option<u64>,
-    sim_publish_snapshot_us: Option<u64>,
+    extract_data_for_render_us: Option<u64>,
     server_receive_tick: Option<u32>,
     server_drain_tick: Option<u32>,
     server_queue_us: Option<u64>,
@@ -332,7 +349,7 @@ struct PendingInputDiagnostic {
     has_submit_done: bool,
     has_client_receive_tickbatch: bool,
     has_game_forward_to_sim: bool,
-    has_sim_publish_snapshot: bool,
+    has_extract_data_for_render: bool,
     server_receive_tick: Option<u32>,
     server_drain_tick: Option<u32>,
     server_queue_us: Option<u64>,
@@ -346,8 +363,8 @@ pub struct LatencyPhaseDurations {
     pub submit_to_client_receive_us: u64,
     pub server_queue_us: u64,
     pub client_receive_to_forward_us: u64,
-    pub forward_to_publish_us: u64,
-    pub publish_to_pair_us: u64,
+    pub forward_to_extract_data_for_render_us: u64,
+    pub extract_data_for_render_to_pair_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -457,7 +474,7 @@ fn pending_input_diagnostic(
         has_submit_done: pending.submit_done_us.is_some(),
         has_client_receive_tickbatch: pending.client_receive_tickbatch_us.is_some(),
         has_game_forward_to_sim: pending.game_forward_to_sim_us.is_some(),
-        has_sim_publish_snapshot: pending.sim_publish_snapshot_us.is_some(),
+        has_extract_data_for_render: pending.extract_data_for_render_us.is_some(),
         server_receive_tick: pending.server_receive_tick,
         server_drain_tick: pending.server_drain_tick,
         server_queue_us: pending.server_queue_us,
@@ -2919,12 +2936,23 @@ impl Plugin for Game {
                         });
                     data_root.join(story)
                 });
-            log::info!(
-                "Phase 3.2 sim_runner spawn: dll={:?} scene={:?}",
-                dll_path,
-                scene_path
+            let extract_data_for_render_every_ticks = frontend_config_u32_or_default(
+                "OMFX_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS",
+                "client",
+                "EXTRACT_DATA_FOR_RENDER_EVERY_TICKS",
+                sim_runner::DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS,
             );
-            self.sim_runner_handle = Some(sim_runner::spawn_sim_runner(dll_path, scene_path));
+            log::info!(
+                "Phase 3.2 sim_runner spawn: dll={:?} scene={:?} extract_data_for_render_every_ticks={}",
+                dll_path,
+                scene_path,
+                extract_data_for_render_every_ticks
+            );
+            self.sim_runner_handle = Some(sim_runner::spawn_sim_runner_with_render_extract_rate(
+                dll_path,
+                scene_path,
+                extract_data_for_render_every_ticks,
+            ));
         }
 
         // 階段 5.1：遺留 NetworkBridge/EventBuffer/network_entities/
@@ -3247,7 +3275,7 @@ impl Plugin for Game {
         let snapshot_span =
             tracing::trace_span!("omfx::frame::snapshot_consumption", perfetto = true,).entered();
         let sim_state_for_frame = if let Some(ref sim) = self.sim_runner_handle {
-            self.wait_for_applied_input_snapshot(sim, &forwarded_pending_input_ids);
+            self.wait_for_applied_input_render_data(sim, &forwarded_pending_input_ids);
             Some(sim.state.clone())
         } else {
             None
@@ -8081,9 +8109,9 @@ impl Game {
             let game_forward_us = pending
                 .game_forward_to_sim_us
                 .unwrap_or(meta.game_forward_us);
-            let sim_publish_us = pending
-                .sim_publish_snapshot_us
-                .unwrap_or(meta.sim_publish_us);
+            let extract_data_for_render_us = pending
+                .extract_data_for_render_us
+                .unwrap_or(meta.extract_data_for_render_us);
             let total_ms = render_us
                 .saturating_sub(pending.submit_wall_clock_us)
                 .saturating_div(1_000)
@@ -8098,8 +8126,10 @@ impl Game {
                 submit_to_client_receive_us: client_receive_us.saturating_sub(submit_done_us),
                 server_queue_us: pending.server_queue_us.unwrap_or(meta.server_queue_us),
                 client_receive_to_forward_us: game_forward_us.saturating_sub(client_receive_us),
-                forward_to_publish_us: sim_publish_us.saturating_sub(game_forward_us),
-                publish_to_pair_us: render_us.saturating_sub(sim_publish_us),
+                forward_to_extract_data_for_render_us: extract_data_for_render_us
+                    .saturating_sub(game_forward_us),
+                extract_data_for_render_to_pair_us: render_us
+                    .saturating_sub(extract_data_for_render_us),
             };
             let additive_total_us = phases
                 .origin_to_send_us
@@ -8107,8 +8137,8 @@ impl Game {
                 .saturating_add(phases.submit_io_us)
                 .saturating_add(phases.submit_to_client_receive_us)
                 .saturating_add(phases.client_receive_to_forward_us)
-                .saturating_add(phases.forward_to_publish_us)
-                .saturating_add(phases.publish_to_pair_us);
+                .saturating_add(phases.forward_to_extract_data_for_render_us)
+                .saturating_add(phases.extract_data_for_render_to_pair_us);
             let server_receive_tick = pending
                 .server_receive_tick
                 .or(Some(meta.server_receive_tick));
@@ -8142,7 +8172,7 @@ impl Game {
                 tick_quantized_latency_us,
             );
             log::debug!(
-                "input_latency_phase: id={} origin={:?} origin_to_send_us={} send_to_submit_start_us={} submit_io_us={} submit_to_client_receive_us={} server_queue_us={} client_receive_to_forward_us={} forward_to_publish_us={} publish_to_pair_us={} server_receive_tick={:?} server_drain_tick={:?} additive_total_us={} server_queue_nested_us={} base_tick={} sim_latency_ticks={} tick_quantized_latency_us={}",
+                "input_latency_phase: id={} origin={:?} origin_to_send_us={} send_to_submit_start_us={} submit_io_us={} submit_to_client_receive_us={} server_queue_us={} client_receive_to_forward_us={} forward_to_extract_data_for_render_us={} extract_data_for_render_to_pair_us={} server_receive_tick={:?} server_drain_tick={:?} additive_total_us={} server_queue_nested_us={} base_tick={} sim_latency_ticks={} tick_quantized_latency_us={}",
                 input_id,
                 pending.origin_kind,
                 phases.origin_to_send_us,
@@ -8151,8 +8181,8 @@ impl Game {
                 phases.submit_to_client_receive_us,
                 phases.server_queue_us,
                 phases.client_receive_to_forward_us,
-                phases.forward_to_publish_us,
-                phases.publish_to_pair_us,
+                phases.forward_to_extract_data_for_render_us,
+                phases.extract_data_for_render_to_pair_us,
                 server_receive_tick,
                 server_drain_tick,
                 additive_total_us,
@@ -8165,7 +8195,7 @@ impl Game {
         self.evict_stale_pending_inputs();
     }
 
-    fn wait_for_applied_input_snapshot(
+    fn wait_for_applied_input_render_data(
         &self,
         sim: &sim_runner::SimRunnerHandle,
         input_ids: &[u32],
@@ -8210,7 +8240,7 @@ impl Game {
 
         for diag in &stale {
             log::warn!(
-                "input_pending_stale: id={} kind={:?} base_tick={} target_tick={} pending_age_ms={} submit_start={} submit_done={} client_receive_tickbatch={} game_forward_to_sim={} sim_publish_snapshot={} server_receive_tick={:?} server_drain_tick={:?} server_queue_us={:?}",
+                "input_pending_stale: id={} kind={:?} base_tick={} target_tick={} pending_age_ms={} submit_start={} submit_done={} client_receive_tickbatch={} game_forward_to_sim={} extract_data_for_render={} server_receive_tick={:?} server_drain_tick={:?} server_queue_us={:?}",
                 diag.input_id,
                 diag.action_kind,
                 diag.base_tick,
@@ -8220,7 +8250,7 @@ impl Game {
                 diag.has_submit_done,
                 diag.has_client_receive_tickbatch,
                 diag.has_game_forward_to_sim,
-                diag.has_sim_publish_snapshot,
+                diag.has_extract_data_for_render,
                 diag.server_receive_tick,
                 diag.server_drain_tick,
                 diag.server_queue_us,
@@ -8298,7 +8328,7 @@ impl Game {
                 submit_done_us: None,
                 client_receive_tickbatch_us: None,
                 game_forward_to_sim_us: None,
-                sim_publish_snapshot_us: None,
+                extract_data_for_render_us: None,
                 server_receive_tick: None,
                 server_drain_tick: None,
                 server_queue_us: None,
@@ -8901,7 +8931,7 @@ mod input_latency_tests {
             submit_done_us: None,
             client_receive_tickbatch_us: None,
             game_forward_to_sim_us: None,
-            sim_publish_snapshot_us: None,
+            extract_data_for_render_us: None,
             server_receive_tick: None,
             server_drain_tick: None,
             server_queue_us: None,
@@ -9106,7 +9136,7 @@ mod input_latency_tests {
         assert!(diag.has_submit_done);
         assert!(diag.has_client_receive_tickbatch);
         assert!(diag.has_game_forward_to_sim);
-        assert!(!diag.has_sim_publish_snapshot);
+        assert!(!diag.has_extract_data_for_render);
         assert_eq!(diag.server_receive_tick, Some(22));
         assert_eq!(diag.server_drain_tick, Some(24));
         assert_eq!(diag.server_queue_us, Some(16_000));
@@ -9139,13 +9169,13 @@ mod input_latency_tests {
         s.server_receive_tick = Some(10);
         s.server_drain_tick = Some(12);
         s.phases.server_queue_us = 15_000;
-        s.phases.forward_to_publish_us = 800;
+        s.phases.forward_to_extract_data_for_render_us = 800;
 
         assert_eq!(s.origin_kind, lockstep_client::InputOriginKind::OsEvent);
         assert_eq!(s.server_receive_tick, Some(10));
         assert_eq!(s.server_drain_tick, Some(12));
         assert_eq!(s.phases.server_queue_us, 15_000);
-        assert_eq!(s.phases.forward_to_publish_us, 800);
+        assert_eq!(s.phases.forward_to_extract_data_for_render_us, 800);
     }
 
     #[test]
@@ -9163,7 +9193,7 @@ mod input_latency_tests {
             submit_done_us: Some(1_020),
             client_receive_tickbatch_us: Some(2_000),
             game_forward_to_sim_us: Some(2_100),
-            sim_publish_snapshot_us: Some(2_200),
+            extract_data_for_render_us: Some(2_200),
             server_receive_tick: Some(22),
             server_drain_tick: Some(24),
             server_queue_us: Some(16_000),
