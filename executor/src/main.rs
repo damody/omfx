@@ -53,6 +53,34 @@ fn push_allow_module(allow_modules: &mut Vec<String>, module: &str) {
     }
 }
 
+fn env_suffix(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        })
+}
+
+fn suffixed_file_name(base: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(suffix) => {
+            let stem = base.strip_suffix(".log").unwrap_or(base);
+            format!("{}_{}.log", stem, suffix)
+        }
+        None => base.to_string(),
+    }
+}
+
 fn configured_log_settings() -> LogSettings {
     let mut settings = LogSettings {
         level: LevelFilter::Info,
@@ -122,7 +150,10 @@ fn main() {
         cfg_builder.add_filter_allow(module.clone());
     }
     let cfg = cfg_builder.build();
-    let log_file = File::create("omfx_app.log").expect("create omfx_app.log");
+    let log_suffix = env_suffix("OMFX_LOG_SUFFIX").or_else(|| env_suffix("OMB_PLAYER_ID"));
+    let app_log_name = suffixed_file_name("omfx_app.log", log_suffix.as_deref());
+    let fyrox_log_name = suffixed_file_name("omfx.log", log_suffix.as_deref());
+    let log_file = File::create(&app_log_name).expect("create omfx app log");
     let _ = CombinedLogger::init(vec![
         TermLogger::new(
             log_settings.level,
@@ -146,13 +177,26 @@ fn main() {
         ),
     }
 
-    Log::set_file_name("omfx.log");
+    Log::set_file_name(&fyrox_log_name);
+
+    let title_suffix = std::env::var("OMFX_WINDOW_TITLE_SUFFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("OMB_PLAYER_ID")
+                .ok()
+                .map(|id| format!("P{}", id))
+        });
+    let window_title = match title_suffix {
+        Some(suffix) => format!("omfx - Tower Defense - {}", suffix),
+        None => "omfx - Tower Defense".to_string(),
+    };
 
     let mut executor = Executor::from_params(
         EventLoop::new().ok(),
         fyrox::engine::GraphicsContextParams {
             window_attributes: fyrox::window::WindowAttributes::default()
-                .with_title("omfx - Tower Defense")
+                .with_title(window_title)
                 .with_inner_size(fyrox::dpi::LogicalSize::new(1280.0, 720.0)),
             vsync: false,
             msaa_sample_count: None,

@@ -318,6 +318,14 @@ impl InputActionKind {
     }
 }
 
+fn tower_owned_by_local(owner_player_id: Option<u32>, local_player_id: u32) -> bool {
+    owner_player_id == Some(local_player_id)
+}
+
+fn entity_owned_by_local(entity: &NetworkEntity, local_player_id: u32) -> bool {
+    tower_owned_by_local(entity.owner_player_id, local_player_id)
+}
+
 #[derive(Clone, Debug)]
 struct PendingInput {
     submit_wall_clock_us: u64,
@@ -745,6 +753,7 @@ struct NetworkEntity {
     collision_radius_render: f32,
     collision_ring: Vec<(Handle<Node>, Vector2<f32>)>,
     tower_kind: Option<String>,
+    owner_player_id: Option<u32>,
     attack_range_backend: f32,
     upgrade_levels: [u8; 3],
     last_label_text: String,
@@ -1724,6 +1733,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     server_step_fps: u32,
+    /// Client-configured lockstep player id, known before connecting.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    local_player_id: u32,
     #[visit(skip)]
     #[reflect(hidden)]
     pending_inputs: HashMap<u32, PendingInput>,
@@ -2888,9 +2901,19 @@ impl Plugin for Game {
                 .unwrap_or_else(|| "_lockstep".to_string());
             format!("{}{}", player_name, suffix)
         });
+        let local_player_id =
+            frontend_config_u32_or_default("OMB_PLAYER_ID", "client", "PLAYER_ID", 1);
+        self.local_player_id = local_player_id;
+        log::info!(
+            "frontend identity: player_name='{}' lockstep_player_name='{}' player_id={}",
+            player_name,
+            lockstep_player_name,
+            local_player_id
+        );
         self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
             server_addr,
             lockstep_player_name,
+            local_player_id,
         ));
 
         // 階段 3.2：產生本地 sim_runner 工作執行緒。它阻止
@@ -3158,6 +3181,13 @@ impl Plugin for Game {
                         step_fps,
                     } => {
                         self.server_step_fps = step_fps;
+                        if player_id != self.local_player_id {
+                            log::warn!(
+                                "[lockstep] server returned player_id={} but local configured player_id={}",
+                                player_id,
+                                self.local_player_id
+                            );
+                        }
                         log::info!(
                             "[lockstep] connected master_seed=0x{:016x} player_id={} step_fps={}",
                             master_seed,
@@ -3455,6 +3485,7 @@ impl Plugin for Game {
                             entry.entity_type = "tower".to_string();
                             entry.position = pos;
                             entry.tower_kind = tower_kind;
+                            entry.owner_player_id = e.owner_player_id;
                             entry.upgrade_levels = e.upgrade_levels.unwrap_or([0; 3]);
                             entry.collision_radius_render = footprint_backend * WORLD_SCALE;
                             entry.attack_range_backend = range_backend;
@@ -3527,15 +3558,24 @@ impl Plugin for Game {
                             .collect();
                     }
 
-                    // 第一個英雄實體驅動英雄面板。現在實體渲染數據
+                    // 本地玩家 owns 的英雄實體驅動英雄面板。現在實體渲染數據
                     // 攜帶英雄元資料（名稱/頭銜/等級/經驗值/金幣/
                     // 力量/敏捷/智力/主要屬性）所以
                     // 面板可以以與舊版 NetworkBridge 路徑相同的方式呈現。
-                    if let Some(hero) = snapshot
+                    let local_hero = snapshot
                         .entities
                         .iter()
-                        .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
-                    {
+                        .find(|e| {
+                            matches!(e.kind, sim_runner::EntityKind::Hero)
+                                && e.owner_player_id == Some(self.local_player_id)
+                        })
+                        .or_else(|| {
+                            snapshot
+                                .entities
+                                .iter()
+                                .find(|e| matches!(e.kind, sim_runner::EntityKind::Hero))
+                        });
+                    if let Some(hero) = local_hero {
                         self.hero_state.hp = hero.hp as f32;
                         self.hero_state.max_hp = hero.max_hp as f32;
                         self.hero_state.name = hero.hero_name.clone();
@@ -4981,6 +5021,9 @@ impl Plugin for Game {
                 let info: Option<(String, i32, [u8; 3], String, f32)> =
                     self.selected_tower_entity.and_then(|tid| {
                         let ent = self.network_entities.get(&tid)?;
+                        if !entity_owned_by_local(ent, self.local_player_id) {
+                            return None;
+                        }
                         let kind_key = ent.tower_kind.as_deref()?.to_string();
                         let tpl = self.td_templates.get(&kind_key)?;
                         let mut refund = (tpl.cost as f32 * 0.85) as i32;
@@ -6017,14 +6060,30 @@ impl Plugin for Game {
                         && screen.y <= by + bh
                     {
                         if let Some(tid) = self.selected_tower_entity {
-                            // 階段 2.2：TowerSell 鎖步輸入。 tid 是
-                            // 塔實體 id（規範 `Entity::id()` u32）；
-                            // omb 的排水處理程序解析實體，驗證
-                            // 玩家陣營，退款85%基礎+75%升級，
-                            // 並刪除實體（快照差異清理
-                            // 使成為）。 selected_tower_entity 已清除
-                            // 無條件地因為該實體正在消失。
-                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                            let owned_by_local = tower_owned_by_local(
+                                self.network_entities
+                                    .get(&tid)
+                                    .and_then(|ent| ent.owner_player_id),
+                                self.local_player_id,
+                            );
+                            if !owned_by_local {
+                                log::warn!(
+                                    "Tower sell skipped locally: eid={} owner={:?} local_player_id={}",
+                                    tid,
+                                    self.network_entities
+                                        .get(&tid)
+                                        .and_then(|ent| ent.owner_player_id),
+                                    self.local_player_id
+                                );
+                            } else {
+                                // 階段 2.2：TowerSell 鎖步輸入。 tid 是
+                                // 塔實體 id（規範 `Entity::id()` u32）；
+                                // omb 的排水處理程序解析實體，驗證
+                                // 玩家陣營，退款85%基礎+75%升級，
+                                // 並刪除實體（快照差異清理
+                                // 使成為）。 selected_tower_entity 已清除
+                                // 無條件地因為該實體正在消失。
+                                let input = omoba_core::kcp::game_proto::PlayerInput {
                                 action: Some(
                                     omoba_core::kcp::game_proto::player_input::Action::TowerSell(
                                         omoba_core::kcp::game_proto::TowerSell {
@@ -6033,13 +6092,14 @@ impl Plugin for Game {
                                     ),
                                 ),
                             };
-                            self.send_lockstep_input_from(
-                                input,
-                                lockstep_client::InputOriginKind::OsEvent,
-                                event_us,
-                            );
-                            log::info!("Tower sell lockstep input submitted: eid={}", tid);
-                            self.selected_tower_entity = None;
+                                self.send_lockstep_input_from(
+                                    input,
+                                    lockstep_client::InputOriginKind::OsEvent,
+                                    event_us,
+                                );
+                                log::info!("Tower sell lockstep input submitted: eid={}", tid);
+                                self.selected_tower_entity = None;
+                            }
                         }
                         hit_ui = true;
                     }
@@ -6056,6 +6116,24 @@ impl Plugin for Game {
                             && screen.y < by + bh
                         {
                             if let Some(tid) = self.selected_tower_entity {
+                                let owned_by_local = tower_owned_by_local(
+                                    self.network_entities
+                                        .get(&tid)
+                                        .and_then(|ent| ent.owner_player_id),
+                                    self.local_player_id,
+                                );
+                                if !owned_by_local {
+                                    log::warn!(
+                                        "Tower upgrade skipped locally: eid={} owner={:?} local_player_id={}",
+                                        tid,
+                                        self.network_entities
+                                            .get(&tid)
+                                            .and_then(|ent| ent.owner_player_id),
+                                        self.local_player_id
+                                    );
+                                    hit_ui = true;
+                                    break;
+                                }
                                 // 階段 2.3：TowerUpgrade 鎖步輸入。 tid 是
                                 // 塔實體 ID； `路徑`是0/1/2； `等級`
                                 // 是升級後的等級（current_level + 1）
@@ -6176,8 +6254,24 @@ impl Plugin for Game {
                         }
                     }
                     if let Some((id, _)) = best {
-                        self.selected_tower_entity = Some(id);
-                        log::info!("點選中塔 id={}", id);
+                        let owned_by_local = self
+                            .network_entities
+                            .get(&id)
+                            .map(|ent| entity_owned_by_local(ent, self.local_player_id))
+                            .unwrap_or(false);
+                        if owned_by_local {
+                            self.selected_tower_entity = Some(id);
+                            log::info!("點選中塔 id={}", id);
+                        } else {
+                            self.selected_tower_entity = None;
+                            log::info!(
+                                "點選非本地玩家塔 id={} owner={:?}; 不顯示升級/出售 UI",
+                                id,
+                                self.network_entities
+                                    .get(&id)
+                                    .and_then(|ent| ent.owner_player_id)
+                            );
+                        }
                     } else {
                         // 點空地 → 清掉選取
                         if self.selected_tower_entity.is_some() {
@@ -9024,6 +9118,15 @@ mod input_latency_tests {
         assert!(game.ability_icon_paths.iter().all(String::is_empty));
         assert!(game.tower_texture_cache.is_empty());
         assert!(game.tower_material_cache.is_empty());
+    }
+
+    #[test]
+    fn tower_action_guard_allows_only_local_owner() {
+        assert!(tower_owned_by_local(Some(1), 1));
+        assert!(tower_owned_by_local(Some(2), 2));
+        assert!(!tower_owned_by_local(Some(2), 1));
+        assert!(!tower_owned_by_local(Some(1), 2));
+        assert!(!tower_owned_by_local(None, 1));
     }
 
     #[test]

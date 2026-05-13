@@ -147,7 +147,11 @@ impl LockstepClientHandle {
 }
 
 /// 啟動 lockstep 客戶端背景執行緒。
-pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClientHandle {
+pub fn spawn_lockstep_client(
+    addr: String,
+    player_name: String,
+    player_id: u32,
+) -> LockstepClientHandle {
     let (events_tx, events_rx) = unbounded();
     let (input_tx, input_rx) = unbounded::<LockstepInputMsg>();
     let latest_tick = Arc::new(AtomicU32::new(0));
@@ -173,6 +177,7 @@ pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClien
                 run_client(
                     addr,
                     player_name,
+                    player_id,
                     events_tx,
                     input_rx,
                     latest_tick_for_thread,
@@ -194,6 +199,7 @@ pub fn spawn_lockstep_client(addr: String, player_name: String) -> LockstepClien
 async fn run_client(
     addr: String,
     player_name: String,
+    player_id: u32,
     events_tx: Sender<LockstepEvent>,
     input_rx: Receiver<LockstepInputMsg>,
     latest_tick: Arc<AtomicU32>,
@@ -216,7 +222,10 @@ async fn run_client(
 
     // 送出 JoinRequest 0x13 並等待 GameStart 0x14，回傳
     // `master_seed`。階段 2 固定以 Player 身分加入（observer = false）。
-    let master_seed = match client.join_lockstep(player_name.clone(), false).await {
+    let master_seed = match client
+        .join_lockstep(player_name.clone(), player_id, false)
+        .await
+    {
         Ok(seed) => seed,
         Err(e) => {
             error!("lockstep-client join_lockstep failed: {}", e);
