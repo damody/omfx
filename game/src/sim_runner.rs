@@ -487,6 +487,9 @@ fn run_sim_loop(
         let drains_span =
             tracing::trace_span!("omfx::sim_runner::pending_queue_drains", perfetto = true)
                 .entered();
+        omoba_core::runtime::drain_pending_hero_command_clears(&mut world);
+        world.maintain();
+
         // 階段 2.1：drain `PendingTowerSpawnQueue`，與 authoritative runtime
         // 使用相同 tick boundary，讓 TowerPlace input deterministic 地建立 TD tower。
         omoba_core::runtime::drain_pending_tower_spawns(&mut world);
@@ -500,6 +503,9 @@ fn run_sim_loop(
         // 階段 2.3：drain TowerUpgrade input queue。扣金、upgrade_levels 增量與
         // BuffStore stat-mod 必須在 authoritative/local replica 同步執行。
         omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
+        world.maintain();
+
+        omoba_core::runtime::drain_pending_tower_target_priorities(&mut world);
         world.maintain();
 
         // 階段 2.4：drain ItemUse input queue。庫存冷卻與 CProperty

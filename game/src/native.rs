@@ -294,7 +294,9 @@ pub enum InputActionKind {
     ItemUse,
     StartRound,
     MoveTo,
+    AttackMove,
     AttackTarget,
+    SetTowerTargetPriority,
     CastAbility,
     UpgradeAbility,
     NoOp,
@@ -310,7 +312,9 @@ impl InputActionKind {
             Some(Action::ItemUse(_)) => Self::ItemUse,
             Some(Action::StartRound(_)) => Self::StartRound,
             Some(Action::MoveTo(_)) => Self::MoveTo,
+            Some(Action::AttackMove(_)) => Self::AttackMove,
             Some(Action::AttackTarget(_)) => Self::AttackTarget,
+            Some(Action::SetTowerTargetPriority(_)) => Self::SetTowerTargetPriority,
             Some(Action::CastAbility(_)) => Self::CastAbility,
             Some(Action::UpgradeAbility(_)) => Self::UpgradeAbility,
             Some(Action::NoOp(_)) | None => Self::NoOp,
@@ -324,6 +328,43 @@ fn tower_owned_by_local(owner_player_id: Option<u32>, local_player_id: u32) -> b
 
 fn entity_owned_by_local(entity: &NetworkEntity, local_player_id: u32) -> bool {
     tower_owned_by_local(entity.owner_player_id, local_player_id)
+}
+
+fn tower_priority_label(priority: &str) -> &'static str {
+    match priority {
+        "first" => "First",
+        "last" => "Last",
+        "nearest" => "Nearest",
+        "farthest" => "Farthest",
+        "highest_health" => "High HP",
+        "lowest_health" => "Low HP",
+        _ => "First",
+    }
+}
+
+fn hero_command_status_text(command: &omoba_core::runtime::native::HeroCommandSnapshot) -> String {
+    let kind = match command.command_type.as_str() {
+        "move_to" => "Move",
+        "attack_move" => "Attack Move",
+        "attack_target" => "Attack Target",
+        _ => "Command",
+    };
+    let target = command
+        .target_entity_id
+        .map(|id| format!(" target #{}", id))
+        .unwrap_or_default();
+    let destination = command
+        .destination
+        .map(|(x, y)| format!(" dest {:.0},{:.0}", x, y))
+        .unwrap_or_default();
+    let waypoint = command
+        .next_waypoint
+        .map(|(x, y)| format!(" next {:.0},{:.0}", x, y))
+        .unwrap_or_default();
+    format!(
+        "{}{}{}{}  queue {}/{}",
+        kind, target, destination, waypoint, command.queued_count, command.queue_limit
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -690,6 +731,7 @@ fn td_wrap_ui_text(text: &str, max_units: usize, max_lines: usize) -> String {
 // 結果整個畫面左右相反。改成 camera 在 -Z 側、看 +Z（default 方向）就避開了。
 const Z_BULLET: f32 = 0.5;
 const Z_HP_BAR: f32 = 1.0;
+const Z_COMMAND_QUEUE: f32 = 1.25;
 const Z_RING: f32 = 1.5;
 const Z_HERO: f32 = 1.9;
 const Z_ENEMY: f32 = 2.0;
@@ -756,6 +798,7 @@ struct NetworkEntity {
     owner_player_id: Option<u32>,
     attack_range_backend: f32,
     upgrade_levels: [u8; 3],
+    tower_target_priority: String,
     last_label_text: String,
     last_label_pos: Vector2<f32>,
     extrap_velocity: f32,
@@ -1799,6 +1842,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     network_entities: HashMap<u32, NetworkEntity>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    latest_entities: Vec<sim_runner::EntityRenderData>,
     /// BlockedRegion 線框 scene node（每個 region 一組 polygon outline segments）。
     #[visit(skip)]
     #[reflect(hidden)]
@@ -1897,6 +1943,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     td_sell_button_rect: (f32, f32, f32, f32),
+    /// 選中塔 target priority 控制 hit-test rect；塔未選時放螢幕外
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_target_priority_button_rect: (f32, f32, f32, f32),
     /// 選中塔右側面板：3 條路線升級按鈕文字
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2156,6 +2206,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     shift_held: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    attack_move_armed: bool,
     /// Ctrl 按住：蓋塔後不自動取消選塔模式（方便一次連蓋多個）
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2577,6 +2630,7 @@ impl Plugin for Game {
             .with_font_size(38.0.into())
             .build(&mut ui.build_ctx());
             self.td_sell_button_rect = (-9999.0, -9999.0, 360.0, 42.0);
+            self.td_target_priority_button_rect = (-9999.0, -9999.0, 0.0, 0.0);
 
             // 3 條路線升級按鈕（塔被選取時才定位到可見位置）
             for i in 0..3 {
@@ -3339,6 +3393,7 @@ impl Plugin for Game {
                     self.render_bridge.update(&*snapshot, scene);
                     render_bridge_ns += t_render_bridge.elapsed().as_nanos();
                     applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
+                    self.latest_entities = snapshot.entities.clone();
 
                     // 階段 5.x：HUD 心跳源自 sim 快照
                     // （NetworkBridge GameEvent 串流在第 5.1 階段被刪除；這
@@ -3487,6 +3542,7 @@ impl Plugin for Game {
                             entry.tower_kind = tower_kind;
                             entry.owner_player_id = e.owner_player_id;
                             entry.upgrade_levels = e.upgrade_levels.unwrap_or([0; 3]);
+                            entry.tower_target_priority = e.tower_target_priority.clone();
                             entry.collision_radius_render = footprint_backend * WORLD_SCALE;
                             entry.attack_range_backend = range_backend;
                         }
@@ -3940,6 +3996,8 @@ impl Plugin for Game {
                 );
             }
         }
+
+        self.draw_hero_command_queue_overlay(scene);
 
         // 階段 5.x：將 sim_runner 支援的實體寫入 body_batch + hp_batch
         // 沖洗前。替換每個實體的 RectangleBuilder 生成
@@ -5018,7 +5076,7 @@ impl Plugin for Game {
                 self.ui_td_selected_panel.right_anchor_rect =
                     td_ui_ref_rect(self.window_size, 1053.0, 45.0, 426.0, 990.0);
 
-                let info: Option<(String, i32, [u8; 3], String, f32)> =
+                let info: Option<(String, i32, [u8; 3], String, f32, String)> =
                     self.selected_tower_entity.and_then(|tid| {
                         let ent = self.network_entities.get(&tid)?;
                         if !entity_owned_by_local(ent, self.local_player_id) {
@@ -5042,10 +5100,11 @@ impl Plugin for Game {
                             ent.upgrade_levels,
                             kind_key,
                             ent.attack_range_backend,
+                            ent.tower_target_priority.clone(),
                         ))
                     });
 
-                if let Some((label, refund, levels, kind_key, range)) = info {
+                if let Some((label, refund, levels, kind_key, range, target_priority)) = info {
                     let selected_x = self
                         .selected_tower_screen_x()
                         .unwrap_or(self.window_size.x * 0.5);
@@ -5136,10 +5195,22 @@ impl Plugin for Game {
                     ui.send(
                         self.ui_td_selected_panel.summary_text,
                         TextMessage::Text(format!(
-                            "等級 {} / {} / {}   射程 {:.0}",
-                            levels[0], levels[1], levels[2], range
+                            "等級 {} / {} / {}   射程 {:.0}\n目標 {}",
+                            levels[0],
+                            levels[1],
+                            levels[2],
+                            range,
+                            tower_priority_label(&target_priority)
                         )),
                     );
+                    let target_priority_rect = td_ui_ref_rect(
+                        self.window_size,
+                        58.0 + anchor_delta_ref,
+                        395.0,
+                        354.0,
+                        36.0,
+                    );
+                    self.td_target_priority_button_rect = target_priority_rect.tuple();
 
                     for path in 0u8..3 {
                         let idx = path as usize;
@@ -5388,6 +5459,7 @@ impl Plugin for Game {
                         );
                     }
                     self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+                    self.td_target_priority_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
                     for path in 0..3 {
                         ui.send(
                             self.ui_td_selected_panel.upgrade_bgs[path],
@@ -5627,6 +5699,16 @@ impl Plugin for Game {
                 } else {
                     0.0
                 };
+                let command_line = hs
+                    .entity_id
+                    .and_then(|id| {
+                        self.latest_entities
+                            .iter()
+                            .find(|entity| entity.entity_id == id)
+                    })
+                    .and_then(|entity| entity.hero_command.as_ref())
+                    .map(|command| hero_command_status_text(command))
+                    .unwrap_or_else(|| "Idle".to_string());
                 // 組 buff 區塊：每行 "[id] 剩餘 X.Xs" 或 "[id] 持續 ∞"
                 let mut buff_lines = String::new();
                 if hs.buffs.is_empty() {
@@ -5658,6 +5740,7 @@ impl Plugin for Game {
                      護甲 {:>4.1}   魔抗 {:>4.1}   移速 {:>4.0}\n\
                      攻擊 {:>4.0}   攻速 {:>4.2}秒   射程 {:>4.0}\n\
                      彈速 {:>4.0}   每秒 {:>4.2}\n\
+                     命令 {}\n\
                      ── 技能 ──{}\n\
                      ── 效果 ──{}",
                     header,
@@ -5682,6 +5765,7 @@ impl Plugin for Game {
                     hs.attack_range,
                     hs.bullet_speed,
                     aps,
+                    command_line,
                     ability_lines,
                     buff_lines,
                 );
@@ -6053,6 +6137,19 @@ impl Plugin for Game {
 
                 // 3. Sell 按鈕（只有有已選中塔時生效）
                 if !hit_ui && self.selected_tower_entity.is_some() {
+                    let (bx, by, bw, bh) = self.td_target_priority_button_rect;
+                    if bx > -9000.0
+                        && screen.x >= bx
+                        && screen.x <= bx + bw
+                        && screen.y >= by
+                        && screen.y <= by + bh
+                    {
+                        self.cycle_selected_tower_priority(event_us);
+                        hit_ui = true;
+                    }
+                }
+
+                if !hit_ui && self.selected_tower_entity.is_some() {
                     let (bx, by, bw, bh) = self.td_sell_button_rect;
                     if screen.x >= bx
                         && screen.x <= bx + bw
@@ -6178,6 +6275,18 @@ impl Plugin for Game {
                     }
                 }
 
+                if !hit_ui && self.attack_move_armed {
+                    let queued = self.shift_held;
+                    self.send_attack_move_input_from(
+                        self.mouse_world_pos,
+                        queued,
+                        lockstep_client::InputOriginKind::OsEvent,
+                        event_us,
+                    );
+                    self.attack_move_armed = false;
+                    hit_ui = true;
+                }
+
                 // 4. 放置塔（如在選塔模式）。放完後若沒按 Ctrl 則自動取消
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
@@ -6300,20 +6409,40 @@ impl Plugin for Game {
                     // 階段 5.1：刪除舊版 NetCommand::HeroMove；步調一致
                     // PlayerInput::MoveTo（如下）是唯一的權威路徑。
                     let world_pos = self.mouse_world_pos;
-                    let target = world_render_to_vec2i(world_pos);
-                    let move_to = omoba_core::kcp::game_proto::MoveTo {
-                        target: Some(target),
-                    };
-                    let input = omoba_core::kcp::game_proto::PlayerInput {
-                        action: Some(omoba_core::kcp::game_proto::player_input::Action::MoveTo(
-                            move_to,
-                        )),
-                    };
-                    self.send_lockstep_input_from(
-                        input,
-                        lockstep_client::InputOriginKind::OsEvent,
-                        event_us,
-                    );
+                    let queued = self.shift_held;
+                    if let Some(target_id) = self.enemy_entity_at_world(world_pos) {
+                        self.send_attack_target_input_from(
+                            target_id,
+                            queued,
+                            lockstep_client::InputOriginKind::OsEvent,
+                            event_us,
+                        );
+                        self.attack_move_armed = false;
+                    } else if self.attack_move_armed {
+                        self.send_attack_move_input_from(
+                            world_pos,
+                            queued,
+                            lockstep_client::InputOriginKind::OsEvent,
+                            event_us,
+                        );
+                        self.attack_move_armed = false;
+                    } else {
+                        let target = world_render_to_vec2i(world_pos);
+                        let move_to = omoba_core::kcp::game_proto::MoveTo {
+                            target: Some(target),
+                            queued,
+                        };
+                        let input = omoba_core::kcp::game_proto::PlayerInput {
+                            action: Some(
+                                omoba_core::kcp::game_proto::player_input::Action::MoveTo(move_to),
+                            ),
+                        };
+                        self.send_lockstep_input_from(
+                            input,
+                            lockstep_client::InputOriginKind::OsEvent,
+                            event_us,
+                        );
+                    }
                 }
             }
             // LoL MVP 鍵盤輸入
@@ -6403,6 +6532,13 @@ impl Plugin for Game {
                     KeyCode::KeyB => {
                         self.shop_visible = !self.shop_visible;
                     }
+                    KeyCode::KeyA => {
+                        self.attack_move_armed = true;
+                        log::info!("AttackMove armed");
+                    }
+                    KeyCode::KeyP if self.selected_tower_entity.is_some() => {
+                        self.cycle_selected_tower_priority(event_us);
+                    }
                     // TD 模式：1-9 鍵盤快捷選塔（依 td_template_order 順序）；Escape 取消選取
                     KeyCode::Digit1
                     | KeyCode::Digit2
@@ -6433,6 +6569,9 @@ impl Plugin for Game {
                         }
                     }
                     KeyCode::Escape => {
+                        if self.attack_move_armed {
+                            self.attack_move_armed = false;
+                        }
                         if self.selected_tower_kind.is_some() {
                             self.selected_tower_kind = None;
                             log::info!("取消選塔");
@@ -8494,6 +8633,179 @@ impl Game {
         );
     }
 
+    fn send_attack_move_input_from(
+        &mut self,
+        target_world: Vector2<f32>,
+        queued: bool,
+        origin_kind: lockstep_client::InputOriginKind,
+        origin_us: u64,
+    ) {
+        let input = omoba_core::kcp::game_proto::PlayerInput {
+            action: Some(
+                omoba_core::kcp::game_proto::player_input::Action::AttackMove(
+                    omoba_core::kcp::game_proto::AttackMove {
+                        target: Some(world_render_to_vec2i(target_world)),
+                        queued,
+                    },
+                ),
+            ),
+        };
+        self.send_lockstep_input_from(input, origin_kind, origin_us);
+        log::info!("AttackMove lockstep input submitted queued={}", queued);
+    }
+
+    fn send_attack_target_input_from(
+        &mut self,
+        target_id: u32,
+        queued: bool,
+        origin_kind: lockstep_client::InputOriginKind,
+        origin_us: u64,
+    ) {
+        let input = omoba_core::kcp::game_proto::PlayerInput {
+            action: Some(
+                omoba_core::kcp::game_proto::player_input::Action::AttackTarget(
+                    omoba_core::kcp::game_proto::AttackTarget { target_id, queued },
+                ),
+            ),
+        };
+        self.send_lockstep_input_from(input, origin_kind, origin_us);
+        log::info!(
+            "AttackTarget lockstep input submitted target_id={} queued={}",
+            target_id,
+            queued
+        );
+    }
+
+    fn send_tower_target_priority_input_from(
+        &mut self,
+        tower_entity_id: u32,
+        priority: i32,
+        origin_kind: lockstep_client::InputOriginKind,
+        origin_us: u64,
+    ) {
+        let input = omoba_core::kcp::game_proto::PlayerInput {
+            action: Some(
+                omoba_core::kcp::game_proto::player_input::Action::SetTowerTargetPriority(
+                    omoba_core::kcp::game_proto::SetTowerTargetPriority {
+                        tower_entity_id,
+                        priority,
+                    },
+                ),
+            ),
+        };
+        self.send_lockstep_input_from(input, origin_kind, origin_us);
+        log::info!(
+            "SetTowerTargetPriority lockstep input submitted tower={} priority={}",
+            tower_entity_id,
+            priority
+        );
+    }
+
+    fn cycle_selected_tower_priority(&mut self, origin_us: u64) {
+        let Some(tid) = self.selected_tower_entity else {
+            return;
+        };
+        let current = self
+            .network_entities
+            .get(&tid)
+            .map(|ent| ent.tower_target_priority.as_str())
+            .unwrap_or("first");
+        let next = match current {
+            "first" => 1,
+            "last" => 2,
+            "nearest" => 3,
+            "farthest" => 4,
+            "highest_health" => 5,
+            "lowest_health" => 0,
+            _ => 0,
+        };
+        self.send_tower_target_priority_input_from(
+            tid,
+            next,
+            lockstep_client::InputOriginKind::OsEvent,
+            origin_us,
+        );
+    }
+
+    fn draw_hero_command_queue_overlay(&self, scene: &mut Scene) {
+        let Some(hero_id) = self.hero_state.entity_id else {
+            return;
+        };
+        let Some(hero) = self
+            .latest_entities
+            .iter()
+            .find(|entity| entity.entity_id == hero_id)
+        else {
+            return;
+        };
+        let Some(command) = hero.hero_command.as_ref() else {
+            return;
+        };
+
+        let points: Vec<_> = command
+            .queued_targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .target
+                    .map(|(x, y)| Vector2::new(x * WORLD_SCALE, y * WORLD_SCALE))
+            })
+            .collect();
+        if points.is_empty() {
+            return;
+        }
+
+        let line_color = Color::from_rgba(70, 240, 120, 180);
+        let hero_pos = Vector2::new(hero.pos_x * WORLD_SCALE, hero.pos_y * WORLD_SCALE);
+        add_dashed_world_line(
+            scene,
+            hero_pos,
+            points[0],
+            0.28,
+            0.14,
+            line_color,
+            Z_COMMAND_QUEUE + 0.02,
+        );
+        for pair in points.windows(2) {
+            add_dashed_world_line(
+                scene,
+                pair[0],
+                pair[1],
+                0.28,
+                0.14,
+                line_color,
+                Z_COMMAND_QUEUE + 0.02,
+            );
+        }
+        for point in points {
+            add_command_queue_flag(scene, point, Z_COMMAND_QUEUE);
+        }
+    }
+
+    fn enemy_entity_at_world(&self, world: Vector2<f32>) -> Option<u32> {
+        self.latest_entities
+            .iter()
+            .filter(|entity| match entity.kind {
+                sim_runner::EntityKind::Creep => true,
+                sim_runner::EntityKind::Hero => {
+                    entity.owner_player_id != Some(self.local_player_id)
+                }
+                _ => false,
+            })
+            .filter_map(|entity| {
+                let pos = Vector2::new(entity.pos_x * WORLD_SCALE, entity.pos_y * WORLD_SCALE);
+                let radius = match entity.kind {
+                    sim_runner::EntityKind::Creep => 0.45,
+                    sim_runner::EntityKind::Hero => 0.55,
+                    _ => 0.35,
+                };
+                let d = (pos - world).norm();
+                (d <= radius).then_some((entity.entity_id, d))
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, _)| id)
+    }
+
     // 階段 5.1（第 2 階段）：apply_event + 30+ 舊版 GameEvent 處理程序
     // 刪除方法（entity_create /entity_move/entity_hp_update/
     // 實體_刪除/實體_面向_更新/實體_速度_更新/
@@ -8856,6 +9168,69 @@ fn build_circle_outline(
 /// 對應 `build_circle_outline` 的 RectangleBuilder 版本——在每 frame rebuild 的呼叫點用這個，
 /// 避免 24-48 次 scene-graph 增刪。座標慣例與 `build_line_segment` 一致：x 取負。
 /// 注意：drawing_context 每 frame 在 update() 開頭會 `clear_lines()`，所以僅適用 per-frame redraw。
+fn add_world_line(scene: &mut Scene, from: Vector2<f32>, to: Vector2<f32>, color: Color, z: f32) {
+    use fyrox::scene::debug::Line;
+    if !from.x.is_finite() || !from.y.is_finite() || !to.x.is_finite() || !to.y.is_finite() {
+        return;
+    }
+    if (to - from).norm_squared() <= f32::EPSILON {
+        return;
+    }
+    scene.drawing_context.add_line(Line {
+        begin: Vector3::new(-from.x, from.y, z),
+        end: Vector3::new(-to.x, to.y, z),
+        color,
+    });
+}
+
+fn add_dashed_world_line(
+    scene: &mut Scene,
+    from: Vector2<f32>,
+    to: Vector2<f32>,
+    dash_len: f32,
+    gap_len: f32,
+    color: Color,
+    z: f32,
+) {
+    let delta = to - from;
+    let len = delta.norm();
+    if len <= 0.001 || dash_len <= 0.0 {
+        return;
+    }
+
+    let dir = delta / len;
+    let step = dash_len + gap_len.max(0.0);
+    let mut offset = 0.0;
+    while offset < len {
+        let end_offset = (offset + dash_len).min(len);
+        add_world_line(
+            scene,
+            from + dir * offset,
+            from + dir * end_offset,
+            color,
+            z,
+        );
+        offset += step.max(dash_len);
+    }
+}
+
+fn add_command_queue_flag(scene: &mut Scene, base: Vector2<f32>, z: f32) {
+    let green = Color::from_rgba(70, 240, 120, 235);
+    let pole = Color::from_rgba(35, 140, 75, 235);
+    let height = 0.52;
+    let width = 0.34;
+    let flag_drop = 0.18;
+    let top = base + Vector2::new(0.0, height);
+    let outer = base + Vector2::new(width, height - flag_drop * 0.5);
+    let lower = base + Vector2::new(0.0, height - flag_drop);
+
+    add_world_line(scene, base, top, pole, z);
+    add_world_line(scene, top, outer, green, z - 0.001);
+    add_world_line(scene, outer, lower, green, z - 0.001);
+    add_world_line(scene, lower, top, green, z - 0.001);
+    add_circle_lines(scene, base, 0.07, 10, green, z - 0.001);
+}
+
 fn add_circle_lines(
     scene: &mut Scene,
     center: Vector2<f32>,
