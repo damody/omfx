@@ -16,13 +16,14 @@ use fyrox::{
     },
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     gui::{
-        brush::Brush,
+        border::BorderBuilder,
+        brush::{Brush, GradientPoint},
         canvas::CanvasBuilder,
         image::{ImageBuilder, ImageMessage},
         message::{MessageDirection, UiMessage},
         text::{Text, TextBuilder, TextMessage},
         widget::{WidgetBuilder, WidgetMessage},
-        HorizontalAlignment, UiNode, UserInterface, VerticalAlignment,
+        HorizontalAlignment, Thickness, UiNode, UserInterface, VerticalAlignment,
     },
     material::{Material, MaterialResource},
     plugin::{error::GameResult, Plugin, PluginContext, PluginRegistrationContext},
@@ -678,7 +679,9 @@ fn td_upgrade_effect_text(description: &str) -> String {
         .replace(", ", "\n")
         .replace(',', "\n")
         .replace('、', "\n");
-    td_wrap_ui_text(&text, 14, 4)
+    // 各行之間插入空行增加行距（Fyrox Text widget 無原生行距設定）
+    let lines = td_wrap_ui_text(&text, 20, 3);
+    lines.lines().collect::<Vec<_>>().join("\n\n")
 }
 
 fn td_upgrade_title_text(name: &str) -> String {
@@ -697,12 +700,26 @@ fn td_wrap_ui_text(text: &str, max_units: usize, max_lines: usize) -> String {
         for ch in raw_line.trim().chars() {
             let ch_units = if ch.is_ascii() { 1 } else { 2 };
             if units + ch_units > max_units && !line.trim().is_empty() {
-                lines.push(line.trim().to_string());
+                // 斷行前若在 ASCII 單字中間，退回到最近的空格
+                let carry = if !ch.is_whitespace() {
+                    line.rfind(|c: char| c.is_whitespace())
+                        .map(|idx| {
+                            let word = line[idx..].trim().to_string();
+                            line.truncate(idx);
+                            word
+                        })
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
+                if !line.trim().is_empty() {
+                    lines.push(line.trim().to_string());
+                }
                 if lines.len() >= max_lines {
                     return lines.join("\n");
                 }
-                line.clear();
-                units = 0;
+                line = carry.unwrap_or_default();
+                units = line.chars().map(|c| if c.is_ascii() { 1usize } else { 2 }).sum();
                 if ch.is_whitespace() {
                     continue;
                 }
@@ -988,6 +1005,9 @@ struct TdRightShopPanel {
 #[derive(Default, Debug)]
 struct TdSelectedTowerPanel {
     bg: Handle<UiNode>,
+    body_bg: Handle<UiNode>,
+    header_strip_bg: Handle<UiNode>,
+    header_strip_bottom_mask: Handle<UiNode>,
     tower_card_bg: Handle<UiNode>,
     tower_icon: Handle<UiNode>,
     summary_text: Handle<Text>,
@@ -1006,6 +1026,44 @@ struct TdSelectedTowerPanel {
     refund_rect: UiRect,
     sell_rect: UiRect,
     upgrade_rects: [UiRect; 3],
+    // BTD6-style elements
+    header_bg: Handle<UiNode>,
+    header_title: Handle<Text>,
+    close_btn_bg: Handle<UiNode>,
+    close_btn_text: Handle<Text>,
+    close_btn_rect: UiRect,
+    image_area_bg: Handle<UiNode>,
+    path_left_bg: Handle<UiNode>,
+    path_left_text: Handle<Text>,
+    path_left_rect: UiRect,
+    path_right_bg: Handle<UiNode>,
+    path_right_text: Handle<Text>,
+    path_right_rect: UiRect,
+    path_name_label: Handle<Text>,
+    level_section_bg: Handle<UiNode>,
+    level_title_bar_bg: Handle<UiNode>,
+    level_badge_bg: Handle<UiNode>,
+    level_num_text: Handle<Text>,
+    level_label_text: Handle<Text>,
+    flavor_text_node: Handle<Text>,
+    upgrade_section_bg: Handle<UiNode>,
+    unlock_title_bar_bg: Handle<UiNode>,
+    unlock_label_text: Handle<Text>,
+    upgrade_green_bg: Handle<UiNode>,
+    upgrade_green_price: Handle<Text>,
+    upgrade_green_rect: UiRect,
+    upgrade_path_btn_bg: Handle<UiNode>,
+    upgrade_path_btn_text: Handle<Text>,
+    next_effect_text: Handle<Text>,
+    sell_section_bg: Handle<UiNode>,
+    sell_top_mask: Handle<UiNode>,
+    sell_coin_icon: Handle<UiNode>,
+    sell_coin_text: Handle<Text>,
+    sell_red_bg: Handle<UiNode>,
+    sell_red_text: Handle<Text>,
+    sell_red_rect: UiRect,
+    selected_path: u8,
+    btd6_tower_icon: Handle<UiNode>,
 }
 
 fn load_texture_from_candidate_paths(candidate_paths: Vec<String>) -> Option<TextureResource> {
@@ -2660,6 +2718,36 @@ impl Plugin for Game {
                 bg_builder = bg_builder.with_texture(tex);
             }
             self.ui_td_selected_panel.bg = bg_builder.build(&mut ui.build_ctx()).transmute();
+            // Unified body background (full panel height) — brown, square corners
+            self.ui_td_selected_panel.body_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(145, 100, 55, 255)).into())
+                    .with_width(380.0)
+                    .with_height(650.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
+            // Dark header strip — sits above body_bg, square corners
+            self.ui_td_selected_panel.header_strip_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(75, 40, 12, 255)).into())
+                    .with_width(380.0)
+                    .with_height(62.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
+            // Mask covering header_strip_bg's rounded bottom corners → makes strip look flat-bottomed
+            self.ui_td_selected_panel.header_strip_bottom_mask = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(75, 40, 12, 255)).into())
+                    .with_width(380.0)
+                    .with_height(20.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
 
             self.ui_td_selected_panel.tower_card_bg = {
                 let mut builder = ImageBuilder::new(
@@ -2784,6 +2872,358 @@ impl Plugin for Game {
                 .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .build(&mut ui.build_ctx());
             }
+        }
+
+        // BTD6-style selected tower panel 新增元素
+        {
+            // Purple bar: full width, centered in dark strip
+            self.ui_td_selected_panel.header_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(118, 66, 190, 255)).into())
+                    .with_width(380.0)
+                    .with_height(46.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
+            // Title: white with black outline (shadow at offset 0 = all-around glow)
+            self.ui_td_selected_panel.header_title = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(320.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(38.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .with_shadow(true)
+            .with_shadow_brush(Brush::Solid(Color::BLACK))
+            .with_shadow_dilation(2.0)
+            .with_shadow_offset(Vector2::new(0.0, 0.0))
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.close_btn_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(0, 0, 0, 0)).into())
+                    .with_width(40.0)
+                    .with_height(40.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(0.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.close_btn_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(40.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("X".to_string())
+            .with_font_size(26.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.image_area_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(245, 195, 55, 255)).into())
+                    .with_width(380.0)
+                    .with_height(270.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.path_left_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(50, 30, 10, 160)).into())
+                    .with_width(36.0)
+                    .with_height(36.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(8.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.path_left_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(36.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("<".to_string())
+            .with_font_size(32.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.path_right_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(50, 30, 10, 160)).into())
+                    .with_width(36.0)
+                    .with_height(36.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(8.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.path_right_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(36.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(">".to_string())
+            .with_font_size(32.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.path_name_label = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(380.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(34.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.level_section_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(90, 55, 18, 255)).into())
+                    .with_width(364.0)
+                    .with_height(128.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.level_title_bar_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(50, 27, 8, 230)).into())
+                    .with_width(380.0)
+                    .with_height(42.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.level_badge_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(70, 130, 200, 255)).into())
+                    .with_width(65.0)
+                    .with_height(65.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(8.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.level_num_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(36.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(22.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.level_label_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(270.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(36.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.flavor_text_node = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(350.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(210, 185, 155, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(28.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.upgrade_section_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(90, 55, 18, 255)).into())
+                    .with_width(364.0)
+                    .with_height(208.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.unlock_title_bar_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(50, 27, 8, 230)).into())
+                    .with_width(364.0)
+                    .with_height(48.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.unlock_label_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(350.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(36.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.upgrade_green_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::LinearGradient {
+                        from: Vector2::new(0.0, 0.0),
+                        to: Vector2::new(0.0, 58.0),
+                        stops: vec![
+                            GradientPoint { stop: 0.0, color: Color::from_rgba(115, 210, 70, 255) },
+                            GradientPoint { stop: 1.0, color: Color::from_rgba(50, 145, 40, 255) },
+                        ],
+                    }.into())
+                    .with_width(164.0)
+                    .with_height(58.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(10.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.upgrade_green_price = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(164.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(38.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.upgrade_path_btn_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(255, 152, 0, 255)).into())
+                    .with_width(84.0)
+                    .with_height(58.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(10.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.upgrade_path_btn_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(84.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(34.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.next_effect_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(350.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(240, 220, 185, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(28.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.sell_section_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(40, 22, 8, 255)).into())
+                    .with_width(380.0)
+                    .with_height(100.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(20.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            // mask the top two rounded corners of sell_section_bg with body_bg color
+            self.ui_td_selected_panel.sell_top_mask = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::Solid(Color::from_rgba(145, 100, 55, 255)).into())
+                    .with_width(380.0)
+                    .with_height(22.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.sell_coin_icon = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::LinearGradient {
+                        from: Vector2::new(0.0, 0.0),
+                        to: Vector2::new(0.0, 28.0),
+                        stops: vec![
+                            GradientPoint { stop: 0.0, color: Color::from_rgba(255, 230, 80, 255) },
+                            GradientPoint { stop: 1.0, color: Color::from_rgba(210, 155, 20, 255) },
+                        ],
+                    }.into())
+                    .with_width(28.0)
+                    .with_height(28.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(14.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.sell_coin_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(145.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 100, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(30.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Left)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_td_selected_panel.sell_red_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_background(Brush::LinearGradient {
+                        from: Vector2::new(0.0, 0.0),
+                        to: Vector2::new(0.0, 65.0),
+                        stops: vec![
+                            GradientPoint { stop: 0.0, color: Color::from_rgba(235, 130, 40, 255) },
+                            GradientPoint { stop: 1.0, color: Color::from_rgba(195, 35, 15, 255) },
+                        ],
+                    }.into())
+                    .with_width(155.0)
+                    .with_height(65.0),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(10.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            self.ui_td_selected_panel.sell_red_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(155.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("賣出".to_string())
+            .with_font_size(36.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            // btd6_tower_icon 最後建立，確保 z-order 高於所有背景
+            self.ui_td_selected_panel.btd6_tower_icon = {
+                let builder = ImageBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(200.0)
+                        .with_height(200.0),
+                );
+                builder.build(&mut ui.build_ctx()).transmute()
+            };
         }
 
         // BTD-style 右側 shop/control panel：買塔常駐，Start/Pause 固定右側。
@@ -5108,404 +5548,320 @@ impl Plugin for Game {
                     let selected_x = self
                         .selected_tower_screen_x()
                         .unwrap_or(self.window_size.x * 0.5);
-                    let anchor_x_ref = if selected_x < self.window_size.x * 0.5 {
-                        1053.0
-                    } else {
-                        24.0
+                    let anchor_x_ref: f32 = 24.0;
+                    let ws = self.window_size;
+                    let rr = |dx: f32, dy: f32, w: f32, h: f32| -> UiRect {
+                        td_ui_ref_rect(ws, anchor_x_ref + dx, 45.0 + dy, w, h)
                     };
-                    let anchor_delta_ref = anchor_x_ref - 24.0;
-                    let panel = td_ui_ref_rect(self.window_size, anchor_x_ref, 45.0, 426.0, 990.0);
-                    let tower_card = td_ui_ref_rect(
-                        self.window_size,
-                        62.0 + anchor_delta_ref,
-                        145.0,
-                        350.0,
-                        260.0,
-                    );
-                    self.ui_td_selected_panel.panel_rect = panel;
-                    self.ui_td_selected_panel.tower_card_rect = tower_card;
-
-                    ui.send(
-                        self.ui_td_selected_panel.bg,
-                        WidgetMessage::DesiredPosition(panel.pos()),
-                    );
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Width(panel.w));
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Height(panel.h));
-                    ui.send(
-                        self.ui_td_selected_panel.tower_card_bg,
-                        WidgetMessage::DesiredPosition(tower_card.pos()),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.tower_card_bg,
-                        WidgetMessage::Width(tower_card.w),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.tower_card_bg,
-                        WidgetMessage::Height(tower_card.h),
-                    );
+                    let panel_rect = rr(0.0, 0.0, 380.0, 852.0);
+                    self.ui_td_selected_panel.panel_rect = panel_rect;
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::DesiredPosition(panel_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Width(panel_rect.w));
+                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Height(panel_rect.h));
+                    // Unified body background: full panel, brown background behind everything
+                    let body_bg_rect = rr(0.0, 0.0, 380.0, 722.0);
+                    ui.send(self.ui_td_selected_panel.body_bg, WidgetMessage::DesiredPosition(body_bg_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.body_bg, WidgetMessage::Width(body_bg_rect.w));
+                    ui.send(self.ui_td_selected_panel.body_bg, WidgetMessage::Height(body_bg_rect.h));
+                    // Dark header strip — covers only the top section behind the purple inset
+                    let header_strip_rect = rr(0.0, 0.0, 380.0, 62.0);
+                    ui.send(self.ui_td_selected_panel.header_strip_bg, WidgetMessage::DesiredPosition(header_strip_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.header_strip_bg, WidgetMessage::Width(header_strip_rect.w));
+                    ui.send(self.ui_td_selected_panel.header_strip_bg, WidgetMessage::Height(header_strip_rect.h));
+                    // Flat mask covering header_strip_bg's bottom rounded corners (corner_radius=20 → rounding starts at y=42)
+                    let hstrip_mask_rect = rr(0.0, 42.0, 380.0, 20.0);
+                    ui.send(self.ui_td_selected_panel.header_strip_bottom_mask, WidgetMessage::DesiredPosition(hstrip_mask_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.header_strip_bottom_mask, WidgetMessage::Width(hstrip_mask_rect.w));
+                    ui.send(self.ui_td_selected_panel.header_strip_bottom_mask, WidgetMessage::Height(hstrip_mask_rect.h));
+                    // ── Header (purple, full width, centered in dark strip) ──
+                    let header_rect = rr(0.0, 8.0, 380.0, 46.0);
+                    ui.send(self.ui_td_selected_panel.header_bg, WidgetMessage::DesiredPosition(header_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.header_bg, WidgetMessage::Width(header_rect.w));
+                    ui.send(self.ui_td_selected_panel.header_bg, WidgetMessage::Height(header_rect.h));
+                    let title_rect = rr(0.0, 8.0, 340.0, 46.0);
+                    ui.send(self.ui_td_selected_panel.header_title, WidgetMessage::DesiredPosition(title_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.header_title, WidgetMessage::Width(title_rect.w));
+                    ui.send(self.ui_td_selected_panel.header_title, WidgetMessage::Height(title_rect.h));
+                    ui.send(self.ui_td_selected_panel.header_title, TextMessage::Text(label.clone()));
+                    let close_rect = rr(342.0, 11.0, 30.0, 30.0);
+                    self.ui_td_selected_panel.close_btn_rect = close_rect;
+                    ui.send(self.ui_td_selected_panel.close_btn_bg, WidgetMessage::DesiredPosition(close_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.close_btn_bg, WidgetMessage::Width(close_rect.w));
+                    ui.send(self.ui_td_selected_panel.close_btn_bg, WidgetMessage::Height(close_rect.h));
+                    ui.send(self.ui_td_selected_panel.close_btn_text, WidgetMessage::DesiredPosition(close_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.close_btn_text, WidgetMessage::Width(close_rect.w));
+                    ui.send(self.ui_td_selected_panel.close_btn_text, WidgetMessage::Height(close_rect.h));
+                    // ── Image area (yellow card, 20px margin all sides) ──
+                    // card: x=20..360, y=70..300 (16px from header bottom at y=54, 20px margin)
+                    let img_area_rect = rr(20.0, 70.0, 340.0, 230.0);
+                    ui.send(self.ui_td_selected_panel.image_area_bg, WidgetMessage::DesiredPosition(img_area_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.image_area_bg, WidgetMessage::Width(img_area_rect.w));
+                    ui.send(self.ui_td_selected_panel.image_area_bg, WidgetMessage::Height(img_area_rect.h));
                     let tower_tex = self
                         .td_ui_texture(&format!("{}.png", kind_key))
                         .or_else(|| self.td_ui_texture("tower_fallback.png"));
-                    let tower_icon = td_ui_ref_rect(
-                        self.window_size,
-                        116.0 + anchor_delta_ref,
-                        172.0,
-                        242.0,
-                        210.0,
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.tower_icon,
-                        WidgetMessage::DesiredPosition(tower_icon.pos()),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.tower_icon,
-                        WidgetMessage::Width(tower_icon.w),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.tower_icon,
-                        WidgetMessage::Height(tower_icon.h),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.tower_icon,
-                        ImageMessage::Texture(tower_tex),
-                    );
-                    ui.send(
-                        self.ui_td_sell_name_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(
-                            panel.x + 76.0 * sx,
-                            panel.y + 78.0 * sy,
-                        )),
-                    );
-                    ui.send(
-                        self.ui_td_sell_name_text,
-                        WidgetMessage::Width(panel.w - 152.0 * sx),
-                    );
-                    ui.send(self.ui_td_sell_name_text, TextMessage::Text(label.clone()));
-                    ui.send(
-                        self.ui_td_selected_panel.summary_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(
-                            panel.x + 48.0 * sx,
-                            panel.y + 370.0 * sy,
-                        )),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.summary_text,
-                        WidgetMessage::Width(panel.w - 96.0 * sx),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.summary_text,
-                        TextMessage::Text(format!(
-                            "等級 {} / {} / {}   射程 {:.0}\n目標 {}",
-                            levels[0],
-                            levels[1],
-                            levels[2],
-                            range,
-                            tower_priority_label(&target_priority)
-                        )),
-                    );
-                    let target_priority_rect = td_ui_ref_rect(
-                        self.window_size,
-                        58.0 + anchor_delta_ref,
-                        395.0,
-                        354.0,
-                        36.0,
-                    );
-                    self.td_target_priority_button_rect = target_priority_rect.tuple();
-
-                    for path in 0u8..3 {
-                        let idx = path as usize;
-                        let upgrade_rect = td_ui_ref_rect(
-                            self.window_size,
-                            58.0 + anchor_delta_ref,
-                            430.0 + idx as f32 * 150.0,
-                            354.0,
-                            140.0,
-                        );
-                        let upgrade_button_rect = td_ui_ref_rect(
-                            self.window_size,
-                            248.0 + anchor_delta_ref,
-                            436.0 + idx as f32 * 150.0,
-                            150.0,
-                            128.0,
-                        );
-                        self.ui_td_selected_panel.upgrade_rects[idx] = upgrade_rect;
-                        let level = levels[idx];
-                        let next_level = (level + 1).min(TD_UI_MAX_UPGRADE_LEVEL);
-                        let pip_text = (0..TD_UI_MAX_UPGRADE_LEVEL)
-                            .map(|i| if i < level { "X" } else { "O" })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let (card_title_text, price_text) = if level >= TD_UI_MAX_UPGRADE_LEVEL {
-                            (format!("路線 {}", path + 1), "MAX".to_string())
-                        } else {
-                            let (next_name, next_cost) = self
-                                .td_upgrade_defs
-                                .get(&(kind_key.clone(), path, next_level))
-                                .map(|(n, _, c)| (n.as_str(), *c))
-                                .unwrap_or(("?", 0));
-                            (td_upgrade_title_text(next_name), format!("${}", next_cost))
-                        };
-                        let effect_text = if level >= TD_UI_MAX_UPGRADE_LEVEL {
-                            "已滿級".to_string()
-                        } else {
-                            self.td_upgrade_defs
-                                .get(&(kind_key.clone(), path, next_level))
-                                .map(|(_, desc, _)| td_upgrade_effect_text(desc))
-                                .unwrap_or_else(|| "效果待補".to_string())
-                        };
-                        let icon_tex = self
-                            .td_ui_texture(&format!("{}_p{}.png", kind_key, path + 1))
-                            .or_else(|| self.td_ui_texture(&format!("upgrade_p{}.png", path + 1)));
-                        let bg_tex = self
-                            .td_ui_texture("shop_card_selected.png")
-                            .or_else(|| self.td_ui_texture("shop_card.png"));
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_bgs[idx],
-                            WidgetMessage::DesiredPosition(upgrade_button_rect.pos()),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_bgs[idx],
-                            WidgetMessage::Width(upgrade_button_rect.w),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_bgs[idx],
-                            WidgetMessage::Height(upgrade_button_rect.h),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_bgs[idx],
-                            ImageMessage::Texture(bg_tex),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_icons[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                upgrade_button_rect.x + (upgrade_button_rect.w - 76.0 * sx) * 0.5,
-                                upgrade_button_rect.y + 42.0 * sy,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_icons[idx],
-                            WidgetMessage::Width(76.0 * sx),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_icons[idx],
-                            WidgetMessage::Height(50.0 * sy),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_icons[idx],
-                            ImageMessage::Texture(icon_tex),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_pip_texts[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                upgrade_rect.x + 8.0 * sx,
-                                upgrade_rect.y + 18.0 * sy,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_pip_texts[idx],
-                            WidgetMessage::Width(42.0 * sx),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_pip_texts[idx],
-                            TextMessage::Text(pip_text),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_status_texts[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                upgrade_rect.x + 50.0 * sx,
-                                upgrade_rect.y + 24.0 * sy,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_status_texts[idx],
-                            WidgetMessage::Width(136.0 * sx),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_status_texts[idx],
-                            TextMessage::Text(effect_text),
-                        );
-                        ui.send(
-                            self.ui_td_upgrade_buttons[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                upgrade_button_rect.x + 10.0 * sx,
-                                upgrade_button_rect.y + 8.0 * sy,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_upgrade_buttons[idx],
-                            WidgetMessage::Width(upgrade_button_rect.w - 20.0 * sx),
-                        );
-                        ui.send(
-                            self.ui_td_upgrade_buttons[idx],
-                            TextMessage::Text(card_title_text),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_price_texts[idx],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                upgrade_button_rect.x,
-                                upgrade_button_rect.y + 92.0 * sy,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_price_texts[idx],
-                            WidgetMessage::Width(upgrade_button_rect.w),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_price_texts[idx],
-                            TextMessage::Text(price_text),
-                        );
-                        self.td_upgrade_button_rects[idx] = upgrade_button_rect.tuple();
+                    // btd6_tower_icon 建立晚於所有背景，z-order 高，不會被遮
+                    ui.send(self.ui_td_selected_panel.tower_icon, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    // tower icon centered in card (card top y=70, center y=185 → icon top-left = 90,85)
+                    let icon_rect = rr(90.0, 85.0, 200.0, 185.0);
+                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, WidgetMessage::DesiredPosition(icon_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, WidgetMessage::Width(icon_rect.w));
+                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, WidgetMessage::Height(icon_rect.h));
+                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, ImageMessage::Texture(tower_tex));
+                    // arrows at bottom of yellow card, same row as path name (card bottom y=300)
+                    let left_arrow_rect = rr(24.0, 262.0, 36.0, 36.0);
+                    self.ui_td_selected_panel.path_left_rect = left_arrow_rect;
+                    ui.send(self.ui_td_selected_panel.path_left_bg, WidgetMessage::DesiredPosition(left_arrow_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.path_left_bg, WidgetMessage::Width(left_arrow_rect.w));
+                    ui.send(self.ui_td_selected_panel.path_left_bg, WidgetMessage::Height(left_arrow_rect.h));
+                    ui.send(self.ui_td_selected_panel.path_left_text, WidgetMessage::DesiredPosition(left_arrow_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.path_left_text, WidgetMessage::Width(left_arrow_rect.w));
+                    ui.send(self.ui_td_selected_panel.path_left_text, WidgetMessage::Height(left_arrow_rect.h));
+                    let right_arrow_rect = rr(320.0, 262.0, 36.0, 36.0);
+                    self.ui_td_selected_panel.path_right_rect = right_arrow_rect;
+                    ui.send(self.ui_td_selected_panel.path_right_bg, WidgetMessage::DesiredPosition(right_arrow_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.path_right_bg, WidgetMessage::Width(right_arrow_rect.w));
+                    ui.send(self.ui_td_selected_panel.path_right_bg, WidgetMessage::Height(right_arrow_rect.h));
+                    ui.send(self.ui_td_selected_panel.path_right_text, WidgetMessage::DesiredPosition(right_arrow_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.path_right_text, WidgetMessage::Width(right_arrow_rect.w));
+                    ui.send(self.ui_td_selected_panel.path_right_text, WidgetMessage::Height(right_arrow_rect.h));
+                    let path = self.ui_td_selected_panel.selected_path as usize;
+                    let path_names = ["第一個", "第二個", "第三個"];
+                    // path name near bottom of yellow card
+                    let name_rect = rr(20.0, 256.0, 340.0, 34.0);
+                    ui.send(self.ui_td_selected_panel.path_name_label, WidgetMessage::DesiredPosition(name_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.path_name_label, WidgetMessage::Width(name_rect.w));
+                    ui.send(self.ui_td_selected_panel.path_name_label, WidgetMessage::Height(name_rect.h));
+                    ui.send(self.ui_td_selected_panel.path_name_label, TextMessage::Text(path_names[path].to_string()));
+                    // ── Level section box ──
+                    let level_section_rect = rr(8.0, 308.0, 364.0, 128.0);
+                    ui.send(self.ui_td_selected_panel.level_section_bg, WidgetMessage::DesiredPosition(level_section_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.level_section_bg, WidgetMessage::Width(level_section_rect.w));
+                    ui.send(self.ui_td_selected_panel.level_section_bg, WidgetMessage::Height(level_section_rect.h));
+                    // Title bar sits inside the box (inset so it doesn't touch rounded corners)
+                    let level_bar_rect = rr(20.0, 316.0, 324.0, 50.0);
+                    ui.send(self.ui_td_selected_panel.level_title_bar_bg, WidgetMessage::DesiredPosition(level_bar_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.level_title_bar_bg, WidgetMessage::Width(level_bar_rect.w));
+                    ui.send(self.ui_td_selected_panel.level_title_bar_bg, WidgetMessage::Height(level_bar_rect.h));
+                    let current_level = levels[path];
+                    // "級別 X" label — full width, centered in title bar (badge removed)
+                    let level_label_rect = rr(20.0, 316.0, 324.0, 50.0);
+                    ui.send(self.ui_td_selected_panel.level_label_text, WidgetMessage::DesiredPosition(level_label_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.level_label_text, WidgetMessage::Width(level_label_rect.w));
+                    ui.send(self.ui_td_selected_panel.level_label_text, WidgetMessage::Height(level_label_rect.h));
+                    let level_display = if current_level == 0 { "尚未升級".to_string() } else { format!("級別 {}", current_level) };
+                    ui.send(self.ui_td_selected_panel.level_label_text, TextMessage::Text(level_display));
+                    // Description text below title bar, inside box
+                    let flavor_rect = rr(20.0, 364.0, 324.0, 72.0);
+                    ui.send(self.ui_td_selected_panel.flavor_text_node, WidgetMessage::DesiredPosition(flavor_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.flavor_text_node, WidgetMessage::Width(flavor_rect.w));
+                    ui.send(self.ui_td_selected_panel.flavor_text_node, WidgetMessage::Height(flavor_rect.h));
+                    ui.send(self.ui_td_selected_panel.flavor_text_node, TextMessage::Text(format!("射程 {:.0}　路線 {}/3", range, path + 1)));
+                    // ── Upgrade section box ──
+                    let upgrade_section_rect = rr(8.0, 440.0, 364.0, 280.0);
+                    ui.send(self.ui_td_selected_panel.upgrade_section_bg, WidgetMessage::DesiredPosition(upgrade_section_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.upgrade_section_bg, WidgetMessage::Width(upgrade_section_rect.w));
+                    ui.send(self.ui_td_selected_panel.upgrade_section_bg, WidgetMessage::Height(upgrade_section_rect.h));
+                    let next_level = (current_level + 1).min(TD_UI_MAX_UPGRADE_LEVEL);
+                    let is_maxed = current_level >= TD_UI_MAX_UPGRADE_LEVEL;
+                    let unlock_str = if is_maxed {
+                        format!("路線 {} 已滿級", path + 1)
+                    } else {
+                        format!("解鎖級別 {}", next_level)
+                    };
+                    let unlock_bar_rect = rr(20.0, 448.0, 324.0, 48.0);
+                    ui.send(self.ui_td_selected_panel.unlock_title_bar_bg, WidgetMessage::DesiredPosition(unlock_bar_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.unlock_title_bar_bg, WidgetMessage::Width(unlock_bar_rect.w));
+                    ui.send(self.ui_td_selected_panel.unlock_title_bar_bg, WidgetMessage::Height(unlock_bar_rect.h));
+                    let unlock_rect = rr(20.0, 448.0, 324.0, 48.0);
+                    ui.send(self.ui_td_selected_panel.unlock_label_text, WidgetMessage::DesiredPosition(unlock_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.unlock_label_text, WidgetMessage::Width(unlock_rect.w));
+                    ui.send(self.ui_td_selected_panel.unlock_label_text, WidgetMessage::Height(unlock_rect.h));
+                    ui.send(self.ui_td_selected_panel.unlock_label_text, TextMessage::Text(unlock_str));
+                    let green_rect = rr(20.0, 524.0, 164.0, 58.0);
+                    self.ui_td_selected_panel.upgrade_green_rect = green_rect;
+                    ui.send(self.ui_td_selected_panel.upgrade_green_bg, WidgetMessage::DesiredPosition(green_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.upgrade_green_bg, WidgetMessage::Width(green_rect.w));
+                    ui.send(self.ui_td_selected_panel.upgrade_green_bg, WidgetMessage::Height(green_rect.h));
+                    let price_str = if is_maxed {
+                        "MAX".to_string()
+                    } else {
+                        let cost = self
+                            .td_upgrade_defs
+                            .get(&(kind_key.clone(), path as u8, next_level))
+                            .map(|(_, _, c)| *c)
+                            .unwrap_or(0);
+                        format!("${}", cost)
+                    };
+                    ui.send(self.ui_td_selected_panel.upgrade_green_price, WidgetMessage::DesiredPosition(green_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.upgrade_green_price, WidgetMessage::Width(green_rect.w));
+                    ui.send(self.ui_td_selected_panel.upgrade_green_price, WidgetMessage::Height(green_rect.h));
+                    ui.send(self.ui_td_selected_panel.upgrade_green_price, TextMessage::Text(price_str));
+                    let orange_rect = rr(226.0, 524.0, 84.0, 58.0);
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_bg, WidgetMessage::DesiredPosition(orange_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_bg, WidgetMessage::Width(orange_rect.w));
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_bg, WidgetMessage::Height(orange_rect.h));
+                    let remaining = TD_UI_MAX_UPGRADE_LEVEL.saturating_sub(current_level);
+                    let path_btn_str = if is_maxed { "OK".to_string() } else { format!("▲{}", remaining) };
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, WidgetMessage::DesiredPosition(orange_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, WidgetMessage::Width(orange_rect.w));
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, WidgetMessage::Height(orange_rect.h));
+                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, TextMessage::Text(path_btn_str));
+                    let effect_str = if is_maxed {
+                        "已達最高等級".to_string()
+                    } else {
+                        self.td_upgrade_defs
+                            .get(&(kind_key.clone(), path as u8, next_level))
+                            .map(|(_, desc, _)| td_upgrade_effect_text(desc))
+                            .unwrap_or_else(|| "效果待補".to_string())
+                    };
+                    let effect_rect = rr(20.0, 584.0, 324.0, 118.0);
+                    ui.send(self.ui_td_selected_panel.next_effect_text, WidgetMessage::DesiredPosition(effect_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.next_effect_text, WidgetMessage::Width(effect_rect.w));
+                    ui.send(self.ui_td_selected_panel.next_effect_text, WidgetMessage::Height(effect_rect.h));
+                    ui.send(self.ui_td_selected_panel.next_effect_text, TextMessage::Text(effect_str));
+                    // ── Sell section (dark) ──
+                    // section: y=650 to y=780 (h=130), corner_radius=20 → corner starts at y=760
+                    // mask: y=650 to y=672 (22px) covers top two rounded corners with body_bg color
+                    // visible dark area: y=672 to y=760 (88px usable before corner)
+                    // button centered in dark area: top margin ~18px, bottom margin ~5px
+                    let sell_section_rect = rr(0.0, 722.0, 380.0, 130.0);
+                    ui.send(self.ui_td_selected_panel.sell_section_bg, WidgetMessage::DesiredPosition(sell_section_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.sell_section_bg, WidgetMessage::Width(sell_section_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_section_bg, WidgetMessage::Height(sell_section_rect.h));
+                    let sell_mask_rect = rr(0.0, 722.0, 380.0, 22.0);
+                    ui.send(self.ui_td_selected_panel.sell_top_mask, WidgetMessage::DesiredPosition(sell_mask_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.sell_top_mask, WidgetMessage::Width(sell_mask_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_top_mask, WidgetMessage::Height(sell_mask_rect.h));
+                    // coin icon (gold circle) + price text side by side
+                    let coin_icon_rect = rr(60.0, 787.0, 28.0, 28.0);
+                    ui.send(self.ui_td_selected_panel.sell_coin_icon, WidgetMessage::DesiredPosition(coin_icon_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.sell_coin_icon, WidgetMessage::Width(coin_icon_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_coin_icon, WidgetMessage::Height(coin_icon_rect.h));
+                    let coin_rect = rr(92.0, 772.0, 100.0, 58.0);
+                    ui.send(self.ui_td_selected_panel.sell_coin_text, WidgetMessage::DesiredPosition(coin_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.sell_coin_text, WidgetMessage::Width(coin_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_coin_text, WidgetMessage::Height(coin_rect.h));
+                    ui.send(self.ui_td_selected_panel.sell_coin_text, TextMessage::Text(format!("${}", refund)));
+                    // button: shifted +72 total from original y=700
+                    let sell_red_rect = rr(210.0, 772.0, 155.0, 58.0);
+                    self.ui_td_selected_panel.sell_red_rect = sell_red_rect;
+                    self.td_sell_button_rect = sell_red_rect.tuple();
+                    ui.send(self.ui_td_selected_panel.sell_red_bg, WidgetMessage::DesiredPosition(sell_red_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.sell_red_bg, WidgetMessage::Width(sell_red_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_red_bg, WidgetMessage::Height(sell_red_rect.h));
+                    let sell_text_rect = rr(210.0, 768.0, 155.0, 58.0);
+                    ui.send(self.ui_td_selected_panel.sell_red_text, WidgetMessage::DesiredPosition(sell_text_rect.pos()));
+                    ui.send(self.ui_td_selected_panel.sell_red_text, WidgetMessage::Width(sell_text_rect.w));
+                    ui.send(self.ui_td_selected_panel.sell_red_text, WidgetMessage::Height(sell_text_rect.h));
+                    // Only active path's green button responds to clicks
+                    for p in 0..3 {
+                        self.td_upgrade_button_rects[p] = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
                     }
-
-                    let gold_rect = td_ui_ref_rect(
-                        self.window_size,
-                        57.0 + anchor_delta_ref,
-                        905.0,
-                        190.0,
-                        88.0,
-                    );
-                    self.ui_td_selected_panel.refund_rect = gold_rect;
-                    ui.send(
+                    if !is_maxed {
+                        self.td_upgrade_button_rects[path] = green_rect.tuple();
+                    }
+                    // Hide legacy elements
+                    for node in [
+                        self.ui_td_selected_panel.tower_card_bg,
                         self.ui_td_selected_panel.refund_bg,
-                        WidgetMessage::DesiredPosition(gold_rect.pos()),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.refund_bg,
-                        WidgetMessage::Width(gold_rect.w),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.refund_bg,
-                        WidgetMessage::Height(gold_rect.h),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.gold_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(
-                            gold_rect.x + 8.0 * sx,
-                            gold_rect.y + 10.0 * sy,
-                        )),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.gold_text,
-                        WidgetMessage::Width(gold_rect.w - 16.0 * sx),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.gold_text,
-                        TextMessage::Text(format!("${}\n退 ${}", self.hero_state.gold, refund)),
-                    );
-                    let sell_rect = td_ui_ref_rect(
-                        self.window_size,
-                        272.0 + anchor_delta_ref,
-                        900.0,
-                        174.0,
-                        99.0,
-                    );
-                    self.ui_td_selected_panel.sell_rect = sell_rect;
-                    ui.send(
                         self.ui_td_selected_panel.sell_icon,
-                        WidgetMessage::DesiredPosition(sell_rect.pos()),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.sell_icon,
-                        WidgetMessage::Width(sell_rect.w),
-                    );
-                    ui.send(
-                        self.ui_td_selected_panel.sell_icon,
-                        WidgetMessage::Height(sell_rect.h),
-                    );
-                    ui.send(
-                        self.ui_td_sell_button_text,
-                        WidgetMessage::DesiredPosition(Vector2::new(
-                            sell_rect.x,
-                            sell_rect.y + 24.0 * sy,
-                        )),
-                    );
-                    ui.send(
-                        self.ui_td_sell_button_text,
-                        WidgetMessage::Width(sell_rect.w),
-                    );
-                    ui.send(
-                        self.ui_td_sell_button_text,
-                        TextMessage::Text(format!("出售\n${}", refund)),
-                    );
-                    self.td_sell_button_rect = sell_rect.tuple();
+                    ] {
+                        ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    }
+                    for text in [
+                        self.ui_td_selected_panel.summary_text,
+                        self.ui_td_selected_panel.gold_text,
+                    ] {
+                        ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    }
+                    for text in [self.ui_td_sell_name_text, self.ui_td_sell_button_text] {
+                        ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    }
+                    for i in 0..3 {
+                        for node in [self.ui_td_selected_panel.upgrade_bgs[i], self.ui_td_selected_panel.upgrade_icons[i]] {
+                            ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        }
+                        for text in [
+                            self.ui_td_selected_panel.upgrade_pip_texts[i],
+                            self.ui_td_selected_panel.upgrade_status_texts[i],
+                            self.ui_td_selected_panel.upgrade_price_texts[i],
+                        ] {
+                            ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        }
+                        ui.send(self.ui_td_upgrade_buttons[i], WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    }
                 } else {
                     for node in [
                         self.ui_td_selected_panel.bg,
-                        self.ui_td_selected_panel.tower_card_bg,
+                        self.ui_td_selected_panel.body_bg,
+                        self.ui_td_selected_panel.header_strip_bg,
+                        self.ui_td_selected_panel.header_strip_bottom_mask,
+                        self.ui_td_selected_panel.header_bg,
+                        self.ui_td_selected_panel.close_btn_bg,
+                        self.ui_td_selected_panel.image_area_bg,
+                        self.ui_td_selected_panel.path_left_bg,
+                        self.ui_td_selected_panel.path_right_bg,
                         self.ui_td_selected_panel.tower_icon,
+                        self.ui_td_selected_panel.level_section_bg,
+                        self.ui_td_selected_panel.level_title_bar_bg,
+                        self.ui_td_selected_panel.level_badge_bg,
+                        self.ui_td_selected_panel.upgrade_section_bg,
+                        self.ui_td_selected_panel.unlock_title_bar_bg,
+                        self.ui_td_selected_panel.upgrade_green_bg,
+                        self.ui_td_selected_panel.upgrade_path_btn_bg,
+                        self.ui_td_selected_panel.sell_section_bg,
+                        self.ui_td_selected_panel.sell_top_mask,
+                        self.ui_td_selected_panel.sell_coin_icon,
+                        self.ui_td_selected_panel.sell_red_bg,
+                        self.ui_td_selected_panel.tower_card_bg,
                         self.ui_td_selected_panel.refund_bg,
                         self.ui_td_selected_panel.sell_icon,
+                        self.ui_td_selected_panel.btd6_tower_icon,
                     ] {
-                        ui.send(
-                            node,
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
+                        ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
                     }
                     for text in [
-                        self.ui_td_sell_name_text,
-                        self.ui_td_sell_button_text,
+                        self.ui_td_selected_panel.header_title,
+                        self.ui_td_selected_panel.close_btn_text,
+                        self.ui_td_selected_panel.path_left_text,
+                        self.ui_td_selected_panel.path_right_text,
+                        self.ui_td_selected_panel.path_name_label,
+                        self.ui_td_selected_panel.level_num_text,
+                        self.ui_td_selected_panel.level_label_text,
+                        self.ui_td_selected_panel.flavor_text_node,
+                        self.ui_td_selected_panel.unlock_label_text,
+                        self.ui_td_selected_panel.upgrade_green_price,
+                        self.ui_td_selected_panel.upgrade_path_btn_text,
+                        self.ui_td_selected_panel.next_effect_text,
+                        self.ui_td_selected_panel.sell_coin_text,
+                        self.ui_td_selected_panel.sell_red_text,
                         self.ui_td_selected_panel.summary_text,
                         self.ui_td_selected_panel.gold_text,
+                        self.ui_td_sell_name_text,
+                        self.ui_td_sell_button_text,
                     ] {
-                        ui.send(
-                            text,
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
+                        ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    }
+                    for i in 0..3 {
+                        for node in [self.ui_td_selected_panel.upgrade_bgs[i], self.ui_td_selected_panel.upgrade_icons[i]] {
+                            ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        }
+                        for text in [
+                            self.ui_td_selected_panel.upgrade_pip_texts[i],
+                            self.ui_td_selected_panel.upgrade_status_texts[i],
+                            self.ui_td_selected_panel.upgrade_price_texts[i],
+                        ] {
+                            ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        }
+                        ui.send(self.ui_td_upgrade_buttons[i], WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        self.td_upgrade_button_rects[i] = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
                     }
                     self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
                     self.td_target_priority_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
-                    for path in 0..3 {
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_bgs[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_upgrade_buttons[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_icons[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_pip_texts[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_status_texts[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
-                        ui.send(
-                            self.ui_td_selected_panel.upgrade_price_texts[path],
-                            WidgetMessage::DesiredPosition(Vector2::new(
-                                UI_HIDDEN_POS,
-                                UI_HIDDEN_POS,
-                            )),
-                        );
-                        self.td_upgrade_button_rects[path] =
-                            (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
-                    }
+                    self.ui_td_selected_panel.close_btn_rect = UiRect::default();
+                    self.ui_td_selected_panel.path_left_rect = UiRect::default();
+                    self.ui_td_selected_panel.path_right_rect = UiRect::default();
                 }
             }
 
@@ -5769,9 +6125,9 @@ impl Plugin for Game {
                     ability_lines,
                     buff_lines,
                 );
-                // 選中塔時左側 context panel 會展開，英雄屬性暫時右移避免文字重疊。
+                // 選中塔時隱藏英雄屬性面板，避免文字在面板旁邊穿透顯示。
                 let panel_x = if self.selected_tower_entity.is_some() {
-                    360.0
+                    UI_HIDDEN_POS
                 } else {
                     10.0
                 };
@@ -6130,7 +6486,38 @@ impl Plugin for Game {
                         let uid = self.td_template_order[i].clone();
                         self.selected_tower_kind = Some(uid.clone());
                         self.selected_tower_entity = None;
+                        self.ui_td_selected_panel.selected_path = 0;
                         log::info!("選中塔: {}", uid);
+                        hit_ui = true;
+                    }
+                }
+
+                // BTD6 close 按鈕
+                if !hit_ui && self.selected_tower_entity.is_some() {
+                    let cr = self.ui_td_selected_panel.close_btn_rect;
+                    if cr.w > 0.0 && cr.contains(screen) {
+                        self.selected_tower_entity = None;
+                        self.ui_td_selected_panel.selected_path = 0;
+                        hit_ui = true;
+                    }
+                }
+
+                // BTD6 路線切換箭頭 ◀ ▶
+                if !hit_ui && self.selected_tower_entity.is_some() {
+                    let lr = self.ui_td_selected_panel.path_left_rect;
+                    let rr2 = self.ui_td_selected_panel.path_right_rect;
+                    log::info!("[arrow] scr=({:.0},{:.0}) L=[{:.0},{:.0} {}x{}] R=[{:.0},{:.0} {}x{}]",
+                        screen.x, screen.y, lr.x, lr.y, lr.w as u32, lr.h as u32,
+                        rr2.x, rr2.y, rr2.w as u32, rr2.h as u32);
+                    if lr.w > 0.0 && lr.contains(screen) {
+                        if self.ui_td_selected_panel.selected_path > 0 {
+                            self.ui_td_selected_panel.selected_path -= 1;
+                        }
+                        hit_ui = true;
+                    } else if rr2.w > 0.0 && rr2.contains(screen) {
+                        if self.ui_td_selected_panel.selected_path < 2 {
+                            self.ui_td_selected_panel.selected_path += 1;
+                        }
                         hit_ui = true;
                     }
                 }
@@ -6196,6 +6583,7 @@ impl Plugin for Game {
                                 );
                                 log::info!("Tower sell lockstep input submitted: eid={}", tid);
                                 self.selected_tower_entity = None;
+                                self.ui_td_selected_panel.selected_path = 0;
                             }
                         }
                         hit_ui = true;
@@ -6268,6 +6656,10 @@ impl Plugin for Game {
                                     "Tower upgrade lockstep input submitted: eid={} path={} level={}",
                                     tid, path, target_level
                                 );
+                                // 樂觀更新：立即更新本機快取讓 UI 即時反應，不用等 server snapshot
+                                if let Some(ent) = self.network_entities.get_mut(&tid) {
+                                    ent.upgrade_levels[path as usize] = ent.upgrade_levels[path as usize].saturating_add(1);
+                                }
                             }
                             hit_ui = true;
                             break;
@@ -6343,6 +6735,14 @@ impl Plugin for Game {
                     }
                 }
 
+                // 面板吸收：面板可見時，落在 panel_rect 內的點擊不穿透到地圖（防止箭頭旁邊的空白區誤重選塔）
+                if !hit_ui && self.selected_tower_entity.is_some() {
+                    let panel = self.ui_td_selected_panel.panel_rect;
+                    if panel.w > 0.0 && panel.contains(screen) {
+                        hit_ui = true;
+                    }
+                }
+
                 // 5. 點選已蓋塔（只有非選塔模式時生效）
                 if !hit_ui && self.selected_tower_kind.is_none() {
                     let mwp = self.mouse_world_pos;
@@ -6370,9 +6770,11 @@ impl Plugin for Game {
                             .unwrap_or(false);
                         if owned_by_local {
                             self.selected_tower_entity = Some(id);
+                            self.ui_td_selected_panel.selected_path = 0;
                             log::info!("點選中塔 id={}", id);
                         } else {
                             self.selected_tower_entity = None;
+                            self.ui_td_selected_panel.selected_path = 0;
                             log::info!(
                                 "點選非本地玩家塔 id={} owner={:?}; 不顯示升級/出售 UI",
                                 id,
@@ -6385,6 +6787,7 @@ impl Plugin for Game {
                         // 點空地 → 清掉選取
                         if self.selected_tower_entity.is_some() {
                             self.selected_tower_entity = None;
+                            self.ui_td_selected_panel.selected_path = 0;
                         }
                     }
                 }
@@ -6404,6 +6807,7 @@ impl Plugin for Game {
                     log::info!("RMB 取消放塔預覽");
                 } else if self.selected_tower_entity.is_some() {
                     self.selected_tower_entity = None;
+                    self.ui_td_selected_panel.selected_path = 0;
                     log::info!("RMB 取消選中塔");
                 } else {
                     // 階段 5.1：刪除舊版 NetCommand::HeroMove；步調一致
