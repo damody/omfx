@@ -50,6 +50,7 @@ use fyrox::{
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,8 +58,12 @@ use omoba_core::lockstep_timing::{LockstepTiming, LOCKSTEP_ONE_SECOND_TICKS_U32,
 
 pub use fyrox;
 
+#[path = "backend_session.rs"]
+pub(crate) mod backend_session;
 #[path = "lockstep_client.rs"]
 pub(crate) mod lockstep_client;
+#[path = "pregame.rs"]
+pub(crate) mod pregame;
 #[path = "render_bridge.rs"]
 pub(crate) mod render_bridge;
 #[path = "sim_runner.rs"]
@@ -77,6 +82,7 @@ const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
 const RENDER_FX_SEEN_RETENTION_TICKS: u32 = LOCKSTEP_ONE_SECOND_TICKS_U32 / 2;
+static AUTO_MOVE_SENT: AtomicBool = AtomicBool::new(false);
 
 type TowerFireFxKey = (u32, u32, u32);
 type AttackPhaseFxKey = (u32, u32, u32, u32);
@@ -163,6 +169,17 @@ fn frontend_config_f32(env_key: &str, section: &str, key: &str) -> Option<(Strin
     raw.parse::<f32>().ok().map(|parsed| (raw, parsed))
 }
 
+fn frontend_env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn frontend_config_u32_or_default(env_key: &str, section: &str, key: &str, default: u32) -> u32 {
     let Some(raw) = frontend_config_env_or_section_value(env_key, section, key) else {
         return default;
@@ -197,6 +214,21 @@ fn resolve_frontend_config_path(value: String) -> PathBuf {
 
 fn frontend_config_path(section: &str, key: &str) -> Option<PathBuf> {
     frontend_config_section_value(section, key).map(resolve_frontend_config_path)
+}
+
+fn absolute_existing_or_joined_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path.canonicalize().unwrap_or(path);
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or_else(|_| path.clone())
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path))
+                .unwrap_or(path)
+        })
 }
 
 fn frontend_server_addr() -> String {
@@ -652,6 +684,22 @@ impl UiRect {
     }
 }
 
+#[derive(Debug, Default)]
+struct PregameButtonUi {
+    bg: Handle<UiNode>,
+    text: Handle<Text>,
+}
+
+#[derive(Debug, Default)]
+struct PregameUi {
+    background: Handle<UiNode>,
+    panel: Handle<UiNode>,
+    title: Handle<Text>,
+    subtitle: Handle<Text>,
+    status: Handle<Text>,
+    buttons: Vec<PregameButtonUi>,
+}
+
 fn td_ui_ref_scale(window_size: Vector2<f32>) -> (f32, f32) {
     (
         (window_size.x.max(1.0) / TD_UI_REF_W).max(0.01),
@@ -719,7 +767,10 @@ fn td_wrap_ui_text(text: &str, max_units: usize, max_lines: usize) -> String {
                     return lines.join("\n");
                 }
                 line = carry.unwrap_or_default();
-                units = line.chars().map(|c| if c.is_ascii() { 1usize } else { 2 }).sum();
+                units = line
+                    .chars()
+                    .map(|c| if c.is_ascii() { 1usize } else { 2 })
+                    .sum();
                 if ch.is_whitespace() {
                     continue;
                 }
@@ -1185,6 +1236,7 @@ fn resolve_scripts_lua_data_asset_path(asset_path: &str) -> Option<PathBuf> {
     scripts_lua_data_candidate_paths(asset_path)
         .into_iter()
         .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
 }
 
 fn load_scripts_lua_data_texture(asset_path: &str) -> Option<TextureResource> {
@@ -1783,6 +1835,18 @@ pub struct Game {
     camera: Handle<Node>,
     #[visit(skip)]
     #[reflect(hidden)]
+    pregame_runtime: pregame::PregameRuntime,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    backend_session: Option<backend_session::BackendSession>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_pregame: PregameUi,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    pregame_button_rects: Vec<(UiRect, pregame::PregameAction)>,
+    #[visit(skip)]
+    #[reflect(hidden)]
     mouse_world_pos: Vector2<f32>,
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2155,7 +2219,7 @@ pub struct Game {
 
     /// 第一幀的掛鐘時間戳；所使用的
     /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` 煙霧循環
-    /// 因此，單一「cargo run」可以重現「開始-回合-然後-死亡」的場景
+    /// 因此，單一 executor run 可以重現「開始-回合-然後-死亡」的場景
     /// 無需手動點擊。直到第一次 update() 勾選為止。
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2492,6 +2556,90 @@ impl Plugin for Game {
             }
         }
 
+        self.pregame_runtime =
+            pregame::PregameRuntime::new_for_menu(pregame::PregameCatalog::load());
+        for diagnostic in &self.pregame_runtime.catalog.diagnostics {
+            log::warn!("pregame catalog: {}", diagnostic);
+        }
+        self.ui_pregame.background = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(0.0, 0.0))
+                .with_width(800.0)
+                .with_height(600.0)
+                .with_background(Brush::Solid(Color::from_rgba(118, 202, 132, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .build(&mut ui.build_ctx())
+        .transmute();
+        self.ui_pregame.panel = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(80.0, 80.0))
+                .with_width(640.0)
+                .with_height(420.0)
+                .with_background(Brush::Solid(Color::from_rgba(255, 246, 210, 238)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(8.0_f32.into())
+        .build(&mut ui.build_ctx())
+        .transmute();
+        self.ui_pregame.title = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(120.0, 108.0))
+                .with_width(560.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(35, 62, 42, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(48.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        self.ui_pregame.subtitle = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(140.0, 168.0))
+                .with_width(520.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(70, 80, 58, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(22.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        self.ui_pregame.status = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(140.0, 470.0))
+                .with_width(520.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(120, 40, 30, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(20.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        self.ui_pregame.buttons.clear();
+        for _ in 0..12 {
+            let bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(260.0)
+                    .with_height(72.0)
+                    .with_background(Brush::Solid(Color::from_rgba(245, 178, 54, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(8.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            let text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(260.0)
+                    .with_height(72.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(55, 32, 12, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(26.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_pregame.buttons.push(PregameButtonUi { bg, text });
+        }
+
         // 先用通用 placeholder 建立 4 個 Image node；實際技能 icon 會在收到
         // AbilityRegistry snapshot 後依 AbilityDef.icon 置換。
         // 實際位置在 update() 依當前 window_size 置底中央。
@@ -2727,7 +2875,8 @@ impl Plugin for Game {
                     .with_height(650.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             // Dark header strip — sits above body_bg, square corners
             self.ui_td_selected_panel.header_strip_bg = BorderBuilder::new(
                 WidgetBuilder::new()
@@ -2737,7 +2886,8 @@ impl Plugin for Game {
                     .with_height(62.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             // Mask covering header_strip_bg's rounded bottom corners → makes strip look flat-bottomed
             self.ui_td_selected_panel.header_strip_bottom_mask = BorderBuilder::new(
                 WidgetBuilder::new()
@@ -2747,7 +2897,8 @@ impl Plugin for Game {
                     .with_height(20.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
 
             self.ui_td_selected_panel.tower_card_bg = {
                 let mut builder = ImageBuilder::new(
@@ -2885,7 +3036,8 @@ impl Plugin for Game {
                     .with_height(46.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             // Title: white with black outline (shadow at offset 0 = all-around glow)
             self.ui_td_selected_panel.header_title = TextBuilder::new(
                 WidgetBuilder::new()
@@ -2911,7 +3063,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(0.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.close_btn_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -2932,7 +3085,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(12.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.path_left_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -2942,7 +3096,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(8.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.path_left_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -2963,7 +3118,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(8.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.path_right_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -2995,7 +3151,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(12.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.level_title_bar_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3004,7 +3161,8 @@ impl Plugin for Game {
                     .with_height(42.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.level_badge_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3014,7 +3172,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(8.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.level_num_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3057,7 +3216,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(12.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.unlock_title_bar_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3066,7 +3226,8 @@ impl Plugin for Game {
                     .with_height(48.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.unlock_label_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3081,20 +3242,30 @@ impl Plugin for Game {
             self.ui_td_selected_panel.upgrade_green_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                    .with_background(Brush::LinearGradient {
-                        from: Vector2::new(0.0, 0.0),
-                        to: Vector2::new(0.0, 58.0),
-                        stops: vec![
-                            GradientPoint { stop: 0.0, color: Color::from_rgba(115, 210, 70, 255) },
-                            GradientPoint { stop: 1.0, color: Color::from_rgba(50, 145, 40, 255) },
-                        ],
-                    }.into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 58.0),
+                            stops: vec![
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(115, 210, 70, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(50, 145, 40, 255),
+                                },
+                            ],
+                        }
+                        .into(),
+                    )
                     .with_width(164.0)
                     .with_height(58.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(10.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.upgrade_green_price = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3115,7 +3286,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(10.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.upgrade_path_btn_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3147,7 +3319,8 @@ impl Plugin for Game {
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(20.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             // mask the top two rounded corners of sell_section_bg with body_bg color
             self.ui_td_selected_panel.sell_top_mask = BorderBuilder::new(
                 WidgetBuilder::new()
@@ -3157,24 +3330,35 @@ impl Plugin for Game {
                     .with_height(22.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.sell_coin_icon = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                    .with_background(Brush::LinearGradient {
-                        from: Vector2::new(0.0, 0.0),
-                        to: Vector2::new(0.0, 28.0),
-                        stops: vec![
-                            GradientPoint { stop: 0.0, color: Color::from_rgba(255, 230, 80, 255) },
-                            GradientPoint { stop: 1.0, color: Color::from_rgba(210, 155, 20, 255) },
-                        ],
-                    }.into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 28.0),
+                            stops: vec![
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(255, 230, 80, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(210, 155, 20, 255),
+                                },
+                            ],
+                        }
+                        .into(),
+                    )
                     .with_width(28.0)
                     .with_height(28.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(14.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.sell_coin_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3189,20 +3373,30 @@ impl Plugin for Game {
             self.ui_td_selected_panel.sell_red_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                    .with_background(Brush::LinearGradient {
-                        from: Vector2::new(0.0, 0.0),
-                        to: Vector2::new(0.0, 65.0),
-                        stops: vec![
-                            GradientPoint { stop: 0.0, color: Color::from_rgba(235, 130, 40, 255) },
-                            GradientPoint { stop: 1.0, color: Color::from_rgba(195, 35, 15, 255) },
-                        ],
-                    }.into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 65.0),
+                            stops: vec![
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(235, 130, 40, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(195, 35, 15, 255),
+                                },
+                            ],
+                        }
+                        .into(),
+                    )
                     .with_width(155.0)
                     .with_height(65.0),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .with_corner_radius(10.0_f32.into())
-            .build(&mut ui.build_ctx()).transmute();
+            .build(&mut ui.build_ctx())
+            .transmute();
             self.ui_td_selected_panel.sell_red_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3374,102 +3568,16 @@ impl Plugin for Game {
         self.hero_state.inventory = vec![None; 6];
 
         apply_frontend_runtime_env_from_config();
-
-        // 網路初始化
-        let server_addr = frontend_server_addr();
-        let player_name =
-            frontend_config_env_or_section_value("OMB_PLAYER_NAME", "client", "PLAYER_NAME")
-                .unwrap_or_else(|| "omfx_player".to_string());
-
-        // 階段 5.1：NetworkBridge 消費者削減。階段 4.5 翻轉 omb
-        // `legacy_broadcast` 預設關閉，因此 0x02 GameEvent 串流是
-        // 沉默的。鎖步（KCP 標籤 0x10–0x16）現在是唯一的輸入/狀態
-        // 線 — 由下面的 `lockstep_handle` + sim_runner + render_bridge 驅動。
-        self.connection_status = ConnectionStatus::Connected;
-
-        // 鎖步接線。作為後台線程在其自己的 KCP 上運行
-        // 聯繫。 TickBatch / StateHash驅動本地sim_runner
-        // （階段 3.x）透過 render_bridge 渲染（階段 4.2）。
-        let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME").unwrap_or_else(|_| {
-            let suffix = frontend_config_value("LOCKSTEP_PLAYER_SUFFIX")
-                .unwrap_or_else(|| "_lockstep".to_string());
-            format!("{}{}", player_name, suffix)
-        });
-        let local_player_id =
-            frontend_config_u32_or_default("OMB_PLAYER_ID", "client", "PLAYER_ID", 1);
-        self.local_player_id = local_player_id;
-        log::info!(
-            "frontend identity: player_name='{}' lockstep_player_name='{}' player_id={}",
-            player_name,
-            lockstep_player_name,
-            local_player_id
-        );
-        self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
-            server_addr,
-            lockstep_player_name,
-            local_player_id,
-        ));
-
-        // 階段 3.2：產生本地 sim_runner 工作執行緒。它阻止
-        // master_seed 頻道 — 第 3.3 階段將連接 LockstepClient
-        // 透過「sim_runner_handle.master_seed_tx」傳送的 GameStart 處理程序。
-        // 對於第 3.2 階段，工人只需停車直至關閉，這
-        // 驗證工作執行緒產生+符號解析。
-        {
-            use std::path::PathBuf;
-            // 預設為 scripts/，其中 run.bat 複製新建的 DLL
-            // （調試或發布 - 無論 run.bat 使用哪個設定檔）。載入腳本目錄
-            // 取得父目錄並掃描 .dll，因此這對兩者都適用。
-            let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    frontend_config_path("content", "DLL_PATH")
-                        .or_else(|| frontend_config_path("client", "DLL_PATH"))
-                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DLL_PATH))
-                });
-            // 透過 OMB_STORY/omfx game.toml 的 STORY 將 sim_runner 的場景與 omb 同步。
-            // 否則 sim_runner 載入 MVP_1，而 omb 載入 TD_1，兩個 ECS 世界分歧，sim_runner
-            // 最終以 MVP_1 的訓練敵人/阻擋者結束（~410 個幽靈
-            // 實體），而蠕變路徑/波與 omb 不符。
-            let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    let story = std::env::var("OMB_STORY")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| frontend_config_section_value("server", "STORY"))
-                        .or_else(|| frontend_config_section_value("client", "STORY"))
-                        .unwrap_or_else(|| {
-                            log::warn!("omfx game.toml missing STORY; falling back to MVP_1");
-                            "MVP_1".to_string()
-                        });
-                    log::info!("sim_runner: scene STORY={}", story);
-                    let data_root = std::env::var("OMB_STORY_DATA_DIR")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|_| {
-                            frontend_config_path("content", "STORY_DATA_DIR")
-                                .or_else(|| frontend_config_path("client", "STORY_DATA_DIR"))
-                                .unwrap_or_else(|| PathBuf::from(DEFAULT_STORY_DATA_DIR))
-                        });
-                    data_root.join(story)
-                });
-            let extract_data_for_render_every_ticks = frontend_config_u32_or_default(
-                "OMFX_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS",
-                "client",
-                "EXTRACT_DATA_FOR_RENDER_EVERY_TICKS",
-                sim_runner::DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS,
-            );
-            log::info!(
-                "Phase 3.2 sim_runner spawn: dll={:?} scene={:?} extract_data_for_render_every_ticks={}",
-                dll_path,
-                scene_path,
-                extract_data_for_render_every_ticks
-            );
-            self.sim_runner_handle = Some(sim_runner::spawn_sim_runner_with_render_extract_rate(
-                dll_path,
-                scene_path,
-                extract_data_for_render_every_ticks,
-            ));
+        self.connection_status = ConnectionStatus::Disconnected;
+        if frontend_env_truthy("OMFX_LEGACY_AUTOSTART") {
+            if let Some(selection) = self.default_session_selection() {
+                log::info!("OMFX_LEGACY_AUTOSTART enabled; starting default pregame session");
+                if let Err(err) = self.start_game_session(selection) {
+                    log::error!("legacy autostart failed: {}", err);
+                    self.pregame_runtime.recover_to_difficulty(err.clone());
+                    self.connection_status = ConnectionStatus::Failed(err);
+                }
+            }
         }
 
         // 階段 5.1：遺留 NetworkBridge/EventBuffer/network_entities/
@@ -3480,15 +3588,7 @@ impl Plugin for Game {
     }
 
     fn on_deinit(&mut self, _context: PluginContext) -> GameResult {
-        // 階段5.1：不再擁有NetworkBridge；這裡沒有什麼好掉的。
-        // 刪除鎖步客戶端（input_tx drop + events_rx drop → bg thread
-        // 當其選擇看到斷開連接的通道時，將在下一次迭代中退出）。
-        self.lockstep_handle = None;
-        // 刪除 sim_runner.通道斷開向工作人員發出訊號
-        // 退出（是否仍被 master_seed_rx.recv() 或
-        // 在 tick_input_rx.recv() 上循環。
-        self.sim_runner_handle = None;
-
+        self.shutdown_game_session(false);
         Ok(())
     }
 
@@ -3508,6 +3608,23 @@ impl Plugin for Game {
         // 每 frame 清掉 drawing_context 的 line buffer，避免累積到無限大導致 FPS 為 0。
         // 後續 phase（爆炸 / 路徑 debug 等）會 push 新的 line 進來。
         scene.drawing_context.clear_lines();
+        if self.pregame_runtime.is_pregame() {
+            let ui = context.user_interfaces.first_mut();
+            self.update_pregame_ui(ui);
+            drop(frame_span);
+            return Ok(());
+        }
+        {
+            let ui = context.user_interfaces.first_mut();
+            self.hide_pregame_ui(ui);
+        }
+        if self.game_ended {
+            log::info!("game ended; tearing down active session");
+            self.shutdown_game_session(false);
+            self.pregame_runtime.state = pregame::PregameState::SessionEnded;
+            drop(frame_span);
+            return Ok(());
+        }
         let frame_t0 = std::time::Instant::now();
         let frame_interval = self
             .render_pacing_last_frame_at
@@ -3599,6 +3716,42 @@ impl Plugin for Game {
                         self.auto_noop_next_at_s = Some(next_at);
                     }
                 }
+            }
+        }
+        if let Some((raw, threshold)) =
+            frontend_config_f32("OMFX_AUTO_MOVE_AFTER_SEC", "client", "AUTO_MOVE_AFTER_SEC")
+        {
+            if elapsed_s >= threshold && !AUTO_MOVE_SENT.swap(true, AtomicOrdering::Relaxed) {
+                let x = frontend_config_f32("OMFX_AUTO_MOVE_X", "client", "AUTO_MOVE_X")
+                    .map(|(_, v)| v)
+                    .unwrap_or(120.0);
+                let y = frontend_config_f32("OMFX_AUTO_MOVE_Y", "client", "AUTO_MOVE_Y")
+                    .map(|(_, v)| v)
+                    .unwrap_or(0.0);
+                let input = omoba_core::kcp::game_proto::PlayerInput {
+                    action: Some(omoba_core::kcp::game_proto::player_input::Action::MoveTo(
+                        omoba_core::kcp::game_proto::MoveTo {
+                            target: Some(omoba_core::kcp::game_proto::Vec2I {
+                                x: (x * FIXED32_ONE) as i32,
+                                y: (y * FIXED32_ONE) as i32,
+                            }),
+                            queued: false,
+                        },
+                    )),
+                };
+                let origin_us = wall_clock_us();
+                self.send_lockstep_input_from(
+                    input,
+                    lockstep_client::InputOriginKind::Auto,
+                    origin_us,
+                );
+                log::info!(
+                    "[auto-smoke] MoveTo sent at t={:.2}s (AUTO_MOVE_AFTER_SEC={}, target=({}, {}))",
+                    elapsed_s,
+                    raw,
+                    x,
+                    y
+                );
             }
         }
         if let Some((raw, threshold)) =
@@ -5555,113 +5708,315 @@ impl Plugin for Game {
                     };
                     let panel_rect = rr(0.0, 0.0, 380.0, 852.0);
                     self.ui_td_selected_panel.panel_rect = panel_rect;
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::DesiredPosition(panel_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Width(panel_rect.w));
-                    ui.send(self.ui_td_selected_panel.bg, WidgetMessage::Height(panel_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.bg,
+                        WidgetMessage::DesiredPosition(panel_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.bg,
+                        WidgetMessage::Width(panel_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.bg,
+                        WidgetMessage::Height(panel_rect.h),
+                    );
                     // Unified body background: full panel, brown background behind everything
                     let body_bg_rect = rr(0.0, 0.0, 380.0, 722.0);
-                    ui.send(self.ui_td_selected_panel.body_bg, WidgetMessage::DesiredPosition(body_bg_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.body_bg, WidgetMessage::Width(body_bg_rect.w));
-                    ui.send(self.ui_td_selected_panel.body_bg, WidgetMessage::Height(body_bg_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.body_bg,
+                        WidgetMessage::DesiredPosition(body_bg_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.body_bg,
+                        WidgetMessage::Width(body_bg_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.body_bg,
+                        WidgetMessage::Height(body_bg_rect.h),
+                    );
                     // Dark header strip — covers only the top section behind the purple inset
                     let header_strip_rect = rr(0.0, 0.0, 380.0, 62.0);
-                    ui.send(self.ui_td_selected_panel.header_strip_bg, WidgetMessage::DesiredPosition(header_strip_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.header_strip_bg, WidgetMessage::Width(header_strip_rect.w));
-                    ui.send(self.ui_td_selected_panel.header_strip_bg, WidgetMessage::Height(header_strip_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.header_strip_bg,
+                        WidgetMessage::DesiredPosition(header_strip_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_strip_bg,
+                        WidgetMessage::Width(header_strip_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_strip_bg,
+                        WidgetMessage::Height(header_strip_rect.h),
+                    );
                     // Flat mask covering header_strip_bg's bottom rounded corners (corner_radius=20 → rounding starts at y=42)
                     let hstrip_mask_rect = rr(0.0, 42.0, 380.0, 20.0);
-                    ui.send(self.ui_td_selected_panel.header_strip_bottom_mask, WidgetMessage::DesiredPosition(hstrip_mask_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.header_strip_bottom_mask, WidgetMessage::Width(hstrip_mask_rect.w));
-                    ui.send(self.ui_td_selected_panel.header_strip_bottom_mask, WidgetMessage::Height(hstrip_mask_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.header_strip_bottom_mask,
+                        WidgetMessage::DesiredPosition(hstrip_mask_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_strip_bottom_mask,
+                        WidgetMessage::Width(hstrip_mask_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_strip_bottom_mask,
+                        WidgetMessage::Height(hstrip_mask_rect.h),
+                    );
                     // ── Header (purple, full width, centered in dark strip) ──
                     let header_rect = rr(0.0, 8.0, 380.0, 46.0);
-                    ui.send(self.ui_td_selected_panel.header_bg, WidgetMessage::DesiredPosition(header_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.header_bg, WidgetMessage::Width(header_rect.w));
-                    ui.send(self.ui_td_selected_panel.header_bg, WidgetMessage::Height(header_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.header_bg,
+                        WidgetMessage::DesiredPosition(header_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_bg,
+                        WidgetMessage::Width(header_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_bg,
+                        WidgetMessage::Height(header_rect.h),
+                    );
                     let title_rect = rr(0.0, 8.0, 340.0, 46.0);
-                    ui.send(self.ui_td_selected_panel.header_title, WidgetMessage::DesiredPosition(title_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.header_title, WidgetMessage::Width(title_rect.w));
-                    ui.send(self.ui_td_selected_panel.header_title, WidgetMessage::Height(title_rect.h));
-                    ui.send(self.ui_td_selected_panel.header_title, TextMessage::Text(label.clone()));
+                    ui.send(
+                        self.ui_td_selected_panel.header_title,
+                        WidgetMessage::DesiredPosition(title_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_title,
+                        WidgetMessage::Width(title_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_title,
+                        WidgetMessage::Height(title_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.header_title,
+                        TextMessage::Text(label.clone()),
+                    );
                     let close_rect = rr(342.0, 11.0, 30.0, 30.0);
                     self.ui_td_selected_panel.close_btn_rect = close_rect;
-                    ui.send(self.ui_td_selected_panel.close_btn_bg, WidgetMessage::DesiredPosition(close_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.close_btn_bg, WidgetMessage::Width(close_rect.w));
-                    ui.send(self.ui_td_selected_panel.close_btn_bg, WidgetMessage::Height(close_rect.h));
-                    ui.send(self.ui_td_selected_panel.close_btn_text, WidgetMessage::DesiredPosition(close_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.close_btn_text, WidgetMessage::Width(close_rect.w));
-                    ui.send(self.ui_td_selected_panel.close_btn_text, WidgetMessage::Height(close_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.close_btn_bg,
+                        WidgetMessage::DesiredPosition(close_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.close_btn_bg,
+                        WidgetMessage::Width(close_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.close_btn_bg,
+                        WidgetMessage::Height(close_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.close_btn_text,
+                        WidgetMessage::DesiredPosition(close_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.close_btn_text,
+                        WidgetMessage::Width(close_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.close_btn_text,
+                        WidgetMessage::Height(close_rect.h),
+                    );
                     // ── Image area (yellow card, 20px margin all sides) ──
                     // card: x=20..360, y=70..300 (16px from header bottom at y=54, 20px margin)
                     let img_area_rect = rr(20.0, 70.0, 340.0, 230.0);
-                    ui.send(self.ui_td_selected_panel.image_area_bg, WidgetMessage::DesiredPosition(img_area_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.image_area_bg, WidgetMessage::Width(img_area_rect.w));
-                    ui.send(self.ui_td_selected_panel.image_area_bg, WidgetMessage::Height(img_area_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.image_area_bg,
+                        WidgetMessage::DesiredPosition(img_area_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.image_area_bg,
+                        WidgetMessage::Width(img_area_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.image_area_bg,
+                        WidgetMessage::Height(img_area_rect.h),
+                    );
                     let tower_tex = self
                         .td_ui_texture(&format!("{}.png", kind_key))
                         .or_else(|| self.td_ui_texture("tower_fallback.png"));
                     // btd6_tower_icon 建立晚於所有背景，z-order 高，不會被遮
-                    ui.send(self.ui_td_selected_panel.tower_icon, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                    ui.send(
+                        self.ui_td_selected_panel.tower_icon,
+                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                    );
                     // tower icon centered in card (card top y=70, center y=185 → icon top-left = 90,85)
                     let icon_rect = rr(90.0, 85.0, 200.0, 185.0);
-                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, WidgetMessage::DesiredPosition(icon_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, WidgetMessage::Width(icon_rect.w));
-                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, WidgetMessage::Height(icon_rect.h));
-                    ui.send(self.ui_td_selected_panel.btd6_tower_icon, ImageMessage::Texture(tower_tex));
+                    ui.send(
+                        self.ui_td_selected_panel.btd6_tower_icon,
+                        WidgetMessage::DesiredPosition(icon_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.btd6_tower_icon,
+                        WidgetMessage::Width(icon_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.btd6_tower_icon,
+                        WidgetMessage::Height(icon_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.btd6_tower_icon,
+                        ImageMessage::Texture(tower_tex),
+                    );
                     // arrows at bottom of yellow card, same row as path name (card bottom y=300)
                     let left_arrow_rect = rr(24.0, 262.0, 36.0, 36.0);
                     self.ui_td_selected_panel.path_left_rect = left_arrow_rect;
-                    ui.send(self.ui_td_selected_panel.path_left_bg, WidgetMessage::DesiredPosition(left_arrow_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.path_left_bg, WidgetMessage::Width(left_arrow_rect.w));
-                    ui.send(self.ui_td_selected_panel.path_left_bg, WidgetMessage::Height(left_arrow_rect.h));
-                    ui.send(self.ui_td_selected_panel.path_left_text, WidgetMessage::DesiredPosition(left_arrow_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.path_left_text, WidgetMessage::Width(left_arrow_rect.w));
-                    ui.send(self.ui_td_selected_panel.path_left_text, WidgetMessage::Height(left_arrow_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.path_left_bg,
+                        WidgetMessage::DesiredPosition(left_arrow_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_left_bg,
+                        WidgetMessage::Width(left_arrow_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_left_bg,
+                        WidgetMessage::Height(left_arrow_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_left_text,
+                        WidgetMessage::DesiredPosition(left_arrow_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_left_text,
+                        WidgetMessage::Width(left_arrow_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_left_text,
+                        WidgetMessage::Height(left_arrow_rect.h),
+                    );
                     let right_arrow_rect = rr(320.0, 262.0, 36.0, 36.0);
                     self.ui_td_selected_panel.path_right_rect = right_arrow_rect;
-                    ui.send(self.ui_td_selected_panel.path_right_bg, WidgetMessage::DesiredPosition(right_arrow_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.path_right_bg, WidgetMessage::Width(right_arrow_rect.w));
-                    ui.send(self.ui_td_selected_panel.path_right_bg, WidgetMessage::Height(right_arrow_rect.h));
-                    ui.send(self.ui_td_selected_panel.path_right_text, WidgetMessage::DesiredPosition(right_arrow_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.path_right_text, WidgetMessage::Width(right_arrow_rect.w));
-                    ui.send(self.ui_td_selected_panel.path_right_text, WidgetMessage::Height(right_arrow_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.path_right_bg,
+                        WidgetMessage::DesiredPosition(right_arrow_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_right_bg,
+                        WidgetMessage::Width(right_arrow_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_right_bg,
+                        WidgetMessage::Height(right_arrow_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_right_text,
+                        WidgetMessage::DesiredPosition(right_arrow_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_right_text,
+                        WidgetMessage::Width(right_arrow_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_right_text,
+                        WidgetMessage::Height(right_arrow_rect.h),
+                    );
                     let path = self.ui_td_selected_panel.selected_path as usize;
                     let path_names = ["第一個", "第二個", "第三個"];
                     // path name near bottom of yellow card
                     let name_rect = rr(20.0, 256.0, 340.0, 34.0);
-                    ui.send(self.ui_td_selected_panel.path_name_label, WidgetMessage::DesiredPosition(name_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.path_name_label, WidgetMessage::Width(name_rect.w));
-                    ui.send(self.ui_td_selected_panel.path_name_label, WidgetMessage::Height(name_rect.h));
-                    ui.send(self.ui_td_selected_panel.path_name_label, TextMessage::Text(path_names[path].to_string()));
+                    ui.send(
+                        self.ui_td_selected_panel.path_name_label,
+                        WidgetMessage::DesiredPosition(name_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_name_label,
+                        WidgetMessage::Width(name_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_name_label,
+                        WidgetMessage::Height(name_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.path_name_label,
+                        TextMessage::Text(path_names[path].to_string()),
+                    );
                     // ── Level section box ──
                     let level_section_rect = rr(8.0, 308.0, 364.0, 128.0);
-                    ui.send(self.ui_td_selected_panel.level_section_bg, WidgetMessage::DesiredPosition(level_section_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.level_section_bg, WidgetMessage::Width(level_section_rect.w));
-                    ui.send(self.ui_td_selected_panel.level_section_bg, WidgetMessage::Height(level_section_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.level_section_bg,
+                        WidgetMessage::DesiredPosition(level_section_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.level_section_bg,
+                        WidgetMessage::Width(level_section_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.level_section_bg,
+                        WidgetMessage::Height(level_section_rect.h),
+                    );
                     // Title bar sits inside the box (inset so it doesn't touch rounded corners)
                     let level_bar_rect = rr(20.0, 316.0, 324.0, 50.0);
-                    ui.send(self.ui_td_selected_panel.level_title_bar_bg, WidgetMessage::DesiredPosition(level_bar_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.level_title_bar_bg, WidgetMessage::Width(level_bar_rect.w));
-                    ui.send(self.ui_td_selected_panel.level_title_bar_bg, WidgetMessage::Height(level_bar_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.level_title_bar_bg,
+                        WidgetMessage::DesiredPosition(level_bar_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.level_title_bar_bg,
+                        WidgetMessage::Width(level_bar_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.level_title_bar_bg,
+                        WidgetMessage::Height(level_bar_rect.h),
+                    );
                     let current_level = levels[path];
                     // "級別 X" label — full width, centered in title bar (badge removed)
                     let level_label_rect = rr(20.0, 316.0, 324.0, 50.0);
-                    ui.send(self.ui_td_selected_panel.level_label_text, WidgetMessage::DesiredPosition(level_label_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.level_label_text, WidgetMessage::Width(level_label_rect.w));
-                    ui.send(self.ui_td_selected_panel.level_label_text, WidgetMessage::Height(level_label_rect.h));
-                    let level_display = if current_level == 0 { "尚未升級".to_string() } else { format!("級別 {}", current_level) };
-                    ui.send(self.ui_td_selected_panel.level_label_text, TextMessage::Text(level_display));
+                    ui.send(
+                        self.ui_td_selected_panel.level_label_text,
+                        WidgetMessage::DesiredPosition(level_label_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.level_label_text,
+                        WidgetMessage::Width(level_label_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.level_label_text,
+                        WidgetMessage::Height(level_label_rect.h),
+                    );
+                    let level_display = if current_level == 0 {
+                        "尚未升級".to_string()
+                    } else {
+                        format!("級別 {}", current_level)
+                    };
+                    ui.send(
+                        self.ui_td_selected_panel.level_label_text,
+                        TextMessage::Text(level_display),
+                    );
                     // Description text below title bar, inside box
                     let flavor_rect = rr(20.0, 364.0, 324.0, 72.0);
-                    ui.send(self.ui_td_selected_panel.flavor_text_node, WidgetMessage::DesiredPosition(flavor_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.flavor_text_node, WidgetMessage::Width(flavor_rect.w));
-                    ui.send(self.ui_td_selected_panel.flavor_text_node, WidgetMessage::Height(flavor_rect.h));
-                    ui.send(self.ui_td_selected_panel.flavor_text_node, TextMessage::Text(format!("射程 {:.0}　路線 {}/3", range, path + 1)));
+                    ui.send(
+                        self.ui_td_selected_panel.flavor_text_node,
+                        WidgetMessage::DesiredPosition(flavor_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.flavor_text_node,
+                        WidgetMessage::Width(flavor_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.flavor_text_node,
+                        WidgetMessage::Height(flavor_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.flavor_text_node,
+                        TextMessage::Text(format!("射程 {:.0}　路線 {}/3", range, path + 1)),
+                    );
                     // ── Upgrade section box ──
                     let upgrade_section_rect = rr(8.0, 440.0, 364.0, 280.0);
-                    ui.send(self.ui_td_selected_panel.upgrade_section_bg, WidgetMessage::DesiredPosition(upgrade_section_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.upgrade_section_bg, WidgetMessage::Width(upgrade_section_rect.w));
-                    ui.send(self.ui_td_selected_panel.upgrade_section_bg, WidgetMessage::Height(upgrade_section_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_section_bg,
+                        WidgetMessage::DesiredPosition(upgrade_section_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_section_bg,
+                        WidgetMessage::Width(upgrade_section_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_section_bg,
+                        WidgetMessage::Height(upgrade_section_rect.h),
+                    );
                     let next_level = (current_level + 1).min(TD_UI_MAX_UPGRADE_LEVEL);
                     let is_maxed = current_level >= TD_UI_MAX_UPGRADE_LEVEL;
                     let unlock_str = if is_maxed {
@@ -5670,19 +6025,49 @@ impl Plugin for Game {
                         format!("解鎖級別 {}", next_level)
                     };
                     let unlock_bar_rect = rr(20.0, 448.0, 324.0, 48.0);
-                    ui.send(self.ui_td_selected_panel.unlock_title_bar_bg, WidgetMessage::DesiredPosition(unlock_bar_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.unlock_title_bar_bg, WidgetMessage::Width(unlock_bar_rect.w));
-                    ui.send(self.ui_td_selected_panel.unlock_title_bar_bg, WidgetMessage::Height(unlock_bar_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_title_bar_bg,
+                        WidgetMessage::DesiredPosition(unlock_bar_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_title_bar_bg,
+                        WidgetMessage::Width(unlock_bar_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_title_bar_bg,
+                        WidgetMessage::Height(unlock_bar_rect.h),
+                    );
                     let unlock_rect = rr(20.0, 448.0, 324.0, 48.0);
-                    ui.send(self.ui_td_selected_panel.unlock_label_text, WidgetMessage::DesiredPosition(unlock_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.unlock_label_text, WidgetMessage::Width(unlock_rect.w));
-                    ui.send(self.ui_td_selected_panel.unlock_label_text, WidgetMessage::Height(unlock_rect.h));
-                    ui.send(self.ui_td_selected_panel.unlock_label_text, TextMessage::Text(unlock_str));
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_label_text,
+                        WidgetMessage::DesiredPosition(unlock_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_label_text,
+                        WidgetMessage::Width(unlock_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_label_text,
+                        WidgetMessage::Height(unlock_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.unlock_label_text,
+                        TextMessage::Text(unlock_str),
+                    );
                     let green_rect = rr(20.0, 524.0, 164.0, 58.0);
                     self.ui_td_selected_panel.upgrade_green_rect = green_rect;
-                    ui.send(self.ui_td_selected_panel.upgrade_green_bg, WidgetMessage::DesiredPosition(green_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.upgrade_green_bg, WidgetMessage::Width(green_rect.w));
-                    ui.send(self.ui_td_selected_panel.upgrade_green_bg, WidgetMessage::Height(green_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_bg,
+                        WidgetMessage::DesiredPosition(green_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_bg,
+                        WidgetMessage::Width(green_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_bg,
+                        WidgetMessage::Height(green_rect.h),
+                    );
                     let price_str = if is_maxed {
                         "MAX".to_string()
                     } else {
@@ -5693,20 +6078,57 @@ impl Plugin for Game {
                             .unwrap_or(0);
                         format!("${}", cost)
                     };
-                    ui.send(self.ui_td_selected_panel.upgrade_green_price, WidgetMessage::DesiredPosition(green_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.upgrade_green_price, WidgetMessage::Width(green_rect.w));
-                    ui.send(self.ui_td_selected_panel.upgrade_green_price, WidgetMessage::Height(green_rect.h));
-                    ui.send(self.ui_td_selected_panel.upgrade_green_price, TextMessage::Text(price_str));
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_price,
+                        WidgetMessage::DesiredPosition(green_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_price,
+                        WidgetMessage::Width(green_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_price,
+                        WidgetMessage::Height(green_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_green_price,
+                        TextMessage::Text(price_str),
+                    );
                     let orange_rect = rr(226.0, 524.0, 84.0, 58.0);
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_bg, WidgetMessage::DesiredPosition(orange_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_bg, WidgetMessage::Width(orange_rect.w));
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_bg, WidgetMessage::Height(orange_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_bg,
+                        WidgetMessage::DesiredPosition(orange_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_bg,
+                        WidgetMessage::Width(orange_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_bg,
+                        WidgetMessage::Height(orange_rect.h),
+                    );
                     let remaining = TD_UI_MAX_UPGRADE_LEVEL.saturating_sub(current_level);
-                    let path_btn_str = if is_maxed { "OK".to_string() } else { format!("▲{}", remaining) };
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, WidgetMessage::DesiredPosition(orange_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, WidgetMessage::Width(orange_rect.w));
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, WidgetMessage::Height(orange_rect.h));
-                    ui.send(self.ui_td_selected_panel.upgrade_path_btn_text, TextMessage::Text(path_btn_str));
+                    let path_btn_str = if is_maxed {
+                        "OK".to_string()
+                    } else {
+                        format!("▲{}", remaining)
+                    };
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_text,
+                        WidgetMessage::DesiredPosition(orange_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_text,
+                        WidgetMessage::Width(orange_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_text,
+                        WidgetMessage::Height(orange_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.upgrade_path_btn_text,
+                        TextMessage::Text(path_btn_str),
+                    );
                     let effect_str = if is_maxed {
                         "已達最高等級".to_string()
                     } else {
@@ -5716,44 +6138,113 @@ impl Plugin for Game {
                             .unwrap_or_else(|| "效果待補".to_string())
                     };
                     let effect_rect = rr(20.0, 584.0, 324.0, 118.0);
-                    ui.send(self.ui_td_selected_panel.next_effect_text, WidgetMessage::DesiredPosition(effect_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.next_effect_text, WidgetMessage::Width(effect_rect.w));
-                    ui.send(self.ui_td_selected_panel.next_effect_text, WidgetMessage::Height(effect_rect.h));
-                    ui.send(self.ui_td_selected_panel.next_effect_text, TextMessage::Text(effect_str));
+                    ui.send(
+                        self.ui_td_selected_panel.next_effect_text,
+                        WidgetMessage::DesiredPosition(effect_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.next_effect_text,
+                        WidgetMessage::Width(effect_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.next_effect_text,
+                        WidgetMessage::Height(effect_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.next_effect_text,
+                        TextMessage::Text(effect_str),
+                    );
                     // ── Sell section (dark) ──
                     // section: y=650 to y=780 (h=130), corner_radius=20 → corner starts at y=760
                     // mask: y=650 to y=672 (22px) covers top two rounded corners with body_bg color
                     // visible dark area: y=672 to y=760 (88px usable before corner)
                     // button centered in dark area: top margin ~18px, bottom margin ~5px
                     let sell_section_rect = rr(0.0, 722.0, 380.0, 130.0);
-                    ui.send(self.ui_td_selected_panel.sell_section_bg, WidgetMessage::DesiredPosition(sell_section_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.sell_section_bg, WidgetMessage::Width(sell_section_rect.w));
-                    ui.send(self.ui_td_selected_panel.sell_section_bg, WidgetMessage::Height(sell_section_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.sell_section_bg,
+                        WidgetMessage::DesiredPosition(sell_section_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_section_bg,
+                        WidgetMessage::Width(sell_section_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_section_bg,
+                        WidgetMessage::Height(sell_section_rect.h),
+                    );
                     let sell_mask_rect = rr(0.0, 722.0, 380.0, 22.0);
-                    ui.send(self.ui_td_selected_panel.sell_top_mask, WidgetMessage::DesiredPosition(sell_mask_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.sell_top_mask, WidgetMessage::Width(sell_mask_rect.w));
-                    ui.send(self.ui_td_selected_panel.sell_top_mask, WidgetMessage::Height(sell_mask_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.sell_top_mask,
+                        WidgetMessage::DesiredPosition(sell_mask_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_top_mask,
+                        WidgetMessage::Width(sell_mask_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_top_mask,
+                        WidgetMessage::Height(sell_mask_rect.h),
+                    );
                     // coin icon (gold circle) + price text side by side
                     let coin_icon_rect = rr(60.0, 787.0, 28.0, 28.0);
-                    ui.send(self.ui_td_selected_panel.sell_coin_icon, WidgetMessage::DesiredPosition(coin_icon_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.sell_coin_icon, WidgetMessage::Width(coin_icon_rect.w));
-                    ui.send(self.ui_td_selected_panel.sell_coin_icon, WidgetMessage::Height(coin_icon_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_icon,
+                        WidgetMessage::DesiredPosition(coin_icon_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_icon,
+                        WidgetMessage::Width(coin_icon_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_icon,
+                        WidgetMessage::Height(coin_icon_rect.h),
+                    );
                     let coin_rect = rr(92.0, 772.0, 100.0, 58.0);
-                    ui.send(self.ui_td_selected_panel.sell_coin_text, WidgetMessage::DesiredPosition(coin_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.sell_coin_text, WidgetMessage::Width(coin_rect.w));
-                    ui.send(self.ui_td_selected_panel.sell_coin_text, WidgetMessage::Height(coin_rect.h));
-                    ui.send(self.ui_td_selected_panel.sell_coin_text, TextMessage::Text(format!("${}", refund)));
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_text,
+                        WidgetMessage::DesiredPosition(coin_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_text,
+                        WidgetMessage::Width(coin_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_text,
+                        WidgetMessage::Height(coin_rect.h),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_coin_text,
+                        TextMessage::Text(format!("${}", refund)),
+                    );
                     // button: shifted +72 total from original y=700
                     let sell_red_rect = rr(210.0, 772.0, 155.0, 58.0);
                     self.ui_td_selected_panel.sell_red_rect = sell_red_rect;
                     self.td_sell_button_rect = sell_red_rect.tuple();
-                    ui.send(self.ui_td_selected_panel.sell_red_bg, WidgetMessage::DesiredPosition(sell_red_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.sell_red_bg, WidgetMessage::Width(sell_red_rect.w));
-                    ui.send(self.ui_td_selected_panel.sell_red_bg, WidgetMessage::Height(sell_red_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.sell_red_bg,
+                        WidgetMessage::DesiredPosition(sell_red_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_red_bg,
+                        WidgetMessage::Width(sell_red_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_red_bg,
+                        WidgetMessage::Height(sell_red_rect.h),
+                    );
                     let sell_text_rect = rr(210.0, 768.0, 155.0, 58.0);
-                    ui.send(self.ui_td_selected_panel.sell_red_text, WidgetMessage::DesiredPosition(sell_text_rect.pos()));
-                    ui.send(self.ui_td_selected_panel.sell_red_text, WidgetMessage::Width(sell_text_rect.w));
-                    ui.send(self.ui_td_selected_panel.sell_red_text, WidgetMessage::Height(sell_text_rect.h));
+                    ui.send(
+                        self.ui_td_selected_panel.sell_red_text,
+                        WidgetMessage::DesiredPosition(sell_text_rect.pos()),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_red_text,
+                        WidgetMessage::Width(sell_text_rect.w),
+                    );
+                    ui.send(
+                        self.ui_td_selected_panel.sell_red_text,
+                        WidgetMessage::Height(sell_text_rect.h),
+                    );
                     // Only active path's green button responds to clicks
                     for p in 0..3 {
                         self.td_upgrade_button_rects[p] = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
@@ -5767,29 +6258,68 @@ impl Plugin for Game {
                         self.ui_td_selected_panel.refund_bg,
                         self.ui_td_selected_panel.sell_icon,
                     ] {
-                        ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            node,
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                     }
                     for text in [
                         self.ui_td_selected_panel.summary_text,
                         self.ui_td_selected_panel.gold_text,
                     ] {
-                        ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            text,
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                     }
                     for text in [self.ui_td_sell_name_text, self.ui_td_sell_button_text] {
-                        ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            text,
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                     }
                     for i in 0..3 {
-                        for node in [self.ui_td_selected_panel.upgrade_bgs[i], self.ui_td_selected_panel.upgrade_icons[i]] {
-                            ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        for node in [
+                            self.ui_td_selected_panel.upgrade_bgs[i],
+                            self.ui_td_selected_panel.upgrade_icons[i],
+                        ] {
+                            ui.send(
+                                node,
+                                WidgetMessage::DesiredPosition(Vector2::new(
+                                    UI_HIDDEN_POS,
+                                    UI_HIDDEN_POS,
+                                )),
+                            );
                         }
                         for text in [
                             self.ui_td_selected_panel.upgrade_pip_texts[i],
                             self.ui_td_selected_panel.upgrade_status_texts[i],
                             self.ui_td_selected_panel.upgrade_price_texts[i],
                         ] {
-                            ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                            ui.send(
+                                text,
+                                WidgetMessage::DesiredPosition(Vector2::new(
+                                    UI_HIDDEN_POS,
+                                    UI_HIDDEN_POS,
+                                )),
+                            );
                         }
-                        ui.send(self.ui_td_upgrade_buttons[i], WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            self.ui_td_upgrade_buttons[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                     }
                 } else {
                     for node in [
@@ -5819,7 +6349,13 @@ impl Plugin for Game {
                         self.ui_td_selected_panel.sell_icon,
                         self.ui_td_selected_panel.btd6_tower_icon,
                     ] {
-                        ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            node,
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                     }
                     for text in [
                         self.ui_td_selected_panel.header_title,
@@ -5841,20 +6377,47 @@ impl Plugin for Game {
                         self.ui_td_sell_name_text,
                         self.ui_td_sell_button_text,
                     ] {
-                        ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            text,
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                     }
                     for i in 0..3 {
-                        for node in [self.ui_td_selected_panel.upgrade_bgs[i], self.ui_td_selected_panel.upgrade_icons[i]] {
-                            ui.send(node, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        for node in [
+                            self.ui_td_selected_panel.upgrade_bgs[i],
+                            self.ui_td_selected_panel.upgrade_icons[i],
+                        ] {
+                            ui.send(
+                                node,
+                                WidgetMessage::DesiredPosition(Vector2::new(
+                                    UI_HIDDEN_POS,
+                                    UI_HIDDEN_POS,
+                                )),
+                            );
                         }
                         for text in [
                             self.ui_td_selected_panel.upgrade_pip_texts[i],
                             self.ui_td_selected_panel.upgrade_status_texts[i],
                             self.ui_td_selected_panel.upgrade_price_texts[i],
                         ] {
-                            ui.send(text, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                            ui.send(
+                                text,
+                                WidgetMessage::DesiredPosition(Vector2::new(
+                                    UI_HIDDEN_POS,
+                                    UI_HIDDEN_POS,
+                                )),
+                            );
                         }
-                        ui.send(self.ui_td_upgrade_buttons[i], WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                        ui.send(
+                            self.ui_td_upgrade_buttons[i],
+                            WidgetMessage::DesiredPosition(Vector2::new(
+                                UI_HIDDEN_POS,
+                                UI_HIDDEN_POS,
+                            )),
+                        );
                         self.td_upgrade_button_rects[i] = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
                     }
                     self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
@@ -6362,6 +6925,9 @@ impl Plugin for Game {
             } => {
                 // 左鍵 UI：技能升級三角按鈕優先，避免命中後落到地圖/TD 點擊邏輯。
                 let screen = self.mouse_screen_pos;
+                if self.handle_pregame_click(screen) {
+                    return Ok(());
+                }
                 let mut hit_ui = false;
 
                 for i in 0..4 {
@@ -6506,9 +7072,19 @@ impl Plugin for Game {
                 if !hit_ui && self.selected_tower_entity.is_some() {
                     let lr = self.ui_td_selected_panel.path_left_rect;
                     let rr2 = self.ui_td_selected_panel.path_right_rect;
-                    log::info!("[arrow] scr=({:.0},{:.0}) L=[{:.0},{:.0} {}x{}] R=[{:.0},{:.0} {}x{}]",
-                        screen.x, screen.y, lr.x, lr.y, lr.w as u32, lr.h as u32,
-                        rr2.x, rr2.y, rr2.w as u32, rr2.h as u32);
+                    log::info!(
+                        "[arrow] scr=({:.0},{:.0}) L=[{:.0},{:.0} {}x{}] R=[{:.0},{:.0} {}x{}]",
+                        screen.x,
+                        screen.y,
+                        lr.x,
+                        lr.y,
+                        lr.w as u32,
+                        lr.h as u32,
+                        rr2.x,
+                        rr2.y,
+                        rr2.w as u32,
+                        rr2.h as u32
+                    );
                     if lr.w > 0.0 && lr.contains(screen) {
                         if self.ui_td_selected_panel.selected_path > 0 {
                             self.ui_td_selected_panel.selected_path -= 1;
@@ -6658,7 +7234,8 @@ impl Plugin for Game {
                                 );
                                 // 樂觀更新：立即更新本機快取讓 UI 即時反應，不用等 server snapshot
                                 if let Some(ent) = self.network_entities.get_mut(&tid) {
-                                    ent.upgrade_levels[path as usize] = ent.upgrade_levels[path as usize].saturating_add(1);
+                                    ent.upgrade_levels[path as usize] =
+                                        ent.upgrade_levels[path as usize].saturating_add(1);
                                 }
                             }
                             hit_ui = true;
@@ -6846,6 +7423,12 @@ impl Plugin for Game {
                             lockstep_client::InputOriginKind::OsEvent,
                             event_us,
                         );
+                        log::info!(
+                            "MoveTo lockstep input submitted target_raw=({}, {}) queued={}",
+                            target.x,
+                            target.y,
+                            queued
+                        );
                     }
                 }
             }
@@ -6882,6 +7465,14 @@ impl Plugin for Game {
                     _ => {}
                 }
                 if !pressed {
+                    return Ok(());
+                }
+                if self.pregame_runtime.is_pregame() {
+                    return Ok(());
+                }
+                if key == KeyCode::Escape && self.ctrl_held {
+                    log::info!("Ctrl+Escape exit-session action: returning to pregame menu");
+                    self.shutdown_game_session(true);
                     return Ok(());
                 }
 
@@ -7066,6 +7657,496 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    fn default_session_selection(&self) -> Option<pregame::SessionSelection> {
+        let map = self
+            .pregame_runtime
+            .catalog
+            .enabled_maps()
+            .into_iter()
+            .next()?
+            .clone();
+        let difficulty = self
+            .pregame_runtime
+            .catalog
+            .enabled_difficulties()
+            .into_iter()
+            .next()?
+            .clone();
+        Some(pregame::SessionSelection { map, difficulty })
+    }
+
+    fn start_game_session(&mut self, selection: pregame::SessionSelection) -> Result<(), String> {
+        if self.lockstep_handle.is_some()
+            || self.sim_runner_handle.is_some()
+            || self.backend_session.is_some()
+        {
+            return Err("game session is already active".to_string());
+        }
+
+        apply_frontend_runtime_env_from_config();
+        let server_addr = frontend_server_addr();
+        let session_id = format!(
+            "omfx-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0)
+        );
+        let story = selection.map.story_id().to_string();
+        let difficulty_config = selection.difficulty.config_value().to_string();
+        let launcher_enabled = backend_session::launcher_enabled_from_env();
+        let content_root = std::env::var("OMFX_CONTENT_ROOT")
+            .or_else(|_| std::env::var("OMB_CONTENT_ROOT"))
+            .or_else(|_| std::env::var("OMB_LUA_CONTENT_ROOT"))
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| frontend_config_path("content", "LUA_CONTENT_ROOT"))
+            .or_else(|| Some(PathBuf::from(DEFAULT_STORY_DATA_DIR)))
+            .map(absolute_existing_or_joined_path);
+        let backend_config = backend_session::BackendLaunchConfig {
+            session_id: session_id.clone(),
+            map_id: selection.map.id.clone(),
+            story: story.clone(),
+            difficulty_id: selection.difficulty.id.clone(),
+            difficulty_config: difficulty_config.clone(),
+            kcp_addr: server_addr.clone(),
+            content_root,
+            executable: backend_session::configured_backend_executable(),
+            launcher_enabled,
+        };
+
+        let backend = backend_session::BackendSession::start(backend_config)?;
+        self.backend_session = Some(backend);
+        std::env::set_var("OMB_SESSION_ID", &session_id);
+        std::env::set_var("OMB_MAP_ID", &selection.map.id);
+        std::env::set_var("OMB_STORY", &story);
+        std::env::set_var("OMB_DIFFICULTY_ID", &selection.difficulty.id);
+        std::env::set_var("OMB_DIFFICULTY", &difficulty_config);
+        std::env::set_var("OMB_KCP_ADDR", &server_addr);
+
+        let player_name =
+            frontend_config_env_or_section_value("OMB_PLAYER_NAME", "client", "PLAYER_NAME")
+                .unwrap_or_else(|| "omfx_player".to_string());
+        let lockstep_player_name = std::env::var("OMB_LOCKSTEP_PLAYER_NAME").unwrap_or_else(|_| {
+            let suffix = frontend_config_value("LOCKSTEP_PLAYER_SUFFIX")
+                .unwrap_or_else(|| "_lockstep".to_string());
+            format!("{}{}", player_name, suffix)
+        });
+        let local_player_id =
+            frontend_config_u32_or_default("OMB_PLAYER_ID", "client", "PLAYER_ID", 1);
+        self.local_player_id = local_player_id;
+        log::info!(
+            "frontend session start: session_id={} map_id={} story={} difficulty={} player_name='{}' lockstep_player_name='{}' player_id={}",
+            session_id,
+            selection.map.id,
+            story,
+            selection.difficulty.id,
+            player_name,
+            lockstep_player_name,
+            local_player_id
+        );
+        self.connection_status = ConnectionStatus::Connecting;
+        self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
+            server_addr,
+            lockstep_player_name,
+            local_player_id,
+        ));
+
+        let dll_path: PathBuf = std::env::var("OMB_DLL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                frontend_config_path("content", "DLL_PATH")
+                    .or_else(|| frontend_config_path("client", "DLL_PATH"))
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DLL_PATH))
+            });
+        let scene_path: PathBuf = std::env::var("OMB_SCENE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let data_root = std::env::var("OMB_STORY_DATA_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        frontend_config_path("content", "STORY_DATA_DIR")
+                            .or_else(|| frontend_config_path("client", "STORY_DATA_DIR"))
+                            .unwrap_or_else(|| PathBuf::from(DEFAULT_STORY_DATA_DIR))
+                    });
+                data_root.join(&story)
+            });
+        let extract_data_for_render_every_ticks = frontend_config_u32_or_default(
+            "OMFX_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS",
+            "client",
+            "EXTRACT_DATA_FOR_RENDER_EVERY_TICKS",
+            sim_runner::DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS,
+        );
+        log::info!(
+            "sim_runner spawn: session_id={} map_id={} story={} difficulty={} dll={:?} scene={:?} extract_data_for_render_every_ticks={}",
+            session_id,
+            selection.map.id,
+            story,
+            selection.difficulty.id,
+            dll_path,
+            scene_path,
+            extract_data_for_render_every_ticks
+        );
+        self.sim_runner_handle = Some(sim_runner::spawn_sim_runner_with_render_extract_rate(
+            dll_path,
+            scene_path,
+            extract_data_for_render_every_ticks,
+        ));
+        self.pregame_runtime.mark_in_game();
+        self.connection_status = ConnectionStatus::Connected;
+        Ok(())
+    }
+
+    fn shutdown_game_session(&mut self, return_to_menu: bool) {
+        self.lockstep_handle = None;
+        self.sim_runner_handle = None;
+        if let Some(mut backend) = self.backend_session.take() {
+            backend.shutdown();
+        }
+        self.connection_status = ConnectionStatus::Disconnected;
+        self.current_sim_tick = 0;
+        self.current_sim_tick_observed_at = None;
+        self.pending_inputs.clear();
+        self.pending_inputs_evict_at = None;
+        self.selected_tower_kind = None;
+        self.selected_tower_entity = None;
+        self.td_shop_scroll_dragging = false;
+        if return_to_menu {
+            self.pregame_runtime.return_to_menu();
+        }
+    }
+
+    fn update_pregame_ui(&mut self, ui: &mut UserInterface) {
+        self.hide_gameplay_ui_for_pregame(ui);
+
+        let screen_id = self.pregame_runtime.active_screen_id();
+        let title = self
+            .pregame_runtime
+            .catalog
+            .screen(screen_id)
+            .map(|screen| screen.title.clone())
+            .unwrap_or_else(|| "Open MOBA TD".to_string());
+        let subtitle = self
+            .pregame_runtime
+            .catalog
+            .screen(screen_id)
+            .map(|screen| screen.subtitle.clone())
+            .unwrap_or_default();
+        let full = UiRect {
+            x: 0.0,
+            y: 0.0,
+            w: self.window_size.x.max(1.0),
+            h: self.window_size.y.max(1.0),
+        };
+        ui.send(
+            self.ui_pregame.background,
+            WidgetMessage::DesiredPosition(full.pos()),
+        );
+        ui.send(self.ui_pregame.background, WidgetMessage::Width(full.w));
+        ui.send(self.ui_pregame.background, WidgetMessage::Height(full.h));
+
+        let panel_w = (self.window_size.x * 0.78).clamp(560.0, 980.0);
+        let panel_h = (self.window_size.y * 0.72).clamp(390.0, 720.0);
+        let panel = UiRect {
+            x: (self.window_size.x - panel_w) * 0.5,
+            y: (self.window_size.y - panel_h) * 0.46,
+            w: panel_w,
+            h: panel_h,
+        };
+        ui.send(
+            self.ui_pregame.panel,
+            WidgetMessage::DesiredPosition(panel.pos()),
+        );
+        ui.send(self.ui_pregame.panel, WidgetMessage::Width(panel.w));
+        ui.send(self.ui_pregame.panel, WidgetMessage::Height(panel.h));
+
+        let title_rect = UiRect {
+            x: panel.x + 36.0,
+            y: panel.y + 28.0,
+            w: panel.w - 72.0,
+            h: 58.0,
+        };
+        ui.send(
+            self.ui_pregame.title,
+            WidgetMessage::DesiredPosition(title_rect.pos()),
+        );
+        ui.send(self.ui_pregame.title, WidgetMessage::Width(title_rect.w));
+        ui.send(self.ui_pregame.title, TextMessage::Text(title));
+        let subtitle_rect = UiRect {
+            x: panel.x + 48.0,
+            y: panel.y + 88.0,
+            w: panel.w - 96.0,
+            h: 36.0,
+        };
+        ui.send(
+            self.ui_pregame.subtitle,
+            WidgetMessage::DesiredPosition(subtitle_rect.pos()),
+        );
+        ui.send(
+            self.ui_pregame.subtitle,
+            WidgetMessage::Width(subtitle_rect.w),
+        );
+        ui.send(self.ui_pregame.subtitle, TextMessage::Text(subtitle));
+
+        let status = self.pregame_runtime.last_error.clone().unwrap_or_default();
+        let status_rect = UiRect {
+            x: panel.x + 48.0,
+            y: panel.bottom() - 44.0,
+            w: panel.w - 96.0,
+            h: 28.0,
+        };
+        ui.send(
+            self.ui_pregame.status,
+            WidgetMessage::DesiredPosition(status_rect.pos()),
+        );
+        ui.send(self.ui_pregame.status, WidgetMessage::Width(status_rect.w));
+        ui.send(self.ui_pregame.status, TextMessage::Text(status));
+
+        let buttons = self.current_pregame_buttons();
+        self.pregame_button_rects.clear();
+        let cols = if buttons.len() > 3 && self.window_size.x >= 960.0 {
+            2
+        } else {
+            1
+        };
+        let button_w = if cols == 2 {
+            ((panel.w - 116.0) * 0.5).clamp(230.0, 390.0)
+        } else {
+            (panel.w - 120.0).clamp(260.0, 460.0)
+        };
+        let button_h = 68.0;
+        let gap_x = 24.0;
+        let gap_y = 18.0;
+        let start_y = panel.y + 148.0;
+        for (i, (label, description, active, action)) in buttons.iter().enumerate() {
+            if i >= self.ui_pregame.buttons.len() {
+                break;
+            }
+            let col = i % cols;
+            let row = i / cols;
+            let total_w = button_w * cols as f32 + gap_x * (cols.saturating_sub(1)) as f32;
+            let x = panel.x + (panel.w - total_w) * 0.5 + col as f32 * (button_w + gap_x);
+            let y = start_y + row as f32 * (button_h + gap_y);
+            let rect = UiRect {
+                x,
+                y,
+                w: button_w,
+                h: button_h,
+            };
+            let button = &self.ui_pregame.buttons[i];
+            ui.send(button.bg, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(button.bg, WidgetMessage::Width(rect.w));
+            ui.send(button.bg, WidgetMessage::Height(rect.h));
+            ui.send(button.text, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(button.text, WidgetMessage::Width(rect.w));
+            ui.send(button.text, WidgetMessage::Height(rect.h));
+            let mut text = if description.trim().is_empty() {
+                label.clone()
+            } else {
+                format!("{}\n{}", label, description)
+            };
+            if !active {
+                text.push_str("\nLocked");
+            }
+            ui.send(button.text, TextMessage::Text(text));
+            if *active {
+                self.pregame_button_rects.push((rect, action.clone()));
+            }
+        }
+        for i in buttons.len()..self.ui_pregame.buttons.len() {
+            let button = &self.ui_pregame.buttons[i];
+            ui.send(
+                button.bg,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+            ui.send(
+                button.text,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+    }
+
+    fn hide_gameplay_ui_for_pregame(&mut self, ui: &mut UserInterface) {
+        ui.send(self.ui_status_text, TextMessage::Text(String::new()));
+        ui.send(self.ui_hud_text, TextMessage::Text(String::new()));
+        ui.send(self.ui_shop_text, TextMessage::Text(String::new()));
+        ui.send(self.ui_end_text, TextMessage::Text(String::new()));
+        ui.send(self.ui_hero_stats_panel, TextMessage::Text(String::new()));
+        for handle in self.ui_ability_icons.iter().copied() {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        for handle in self.ui_ability_level_text.iter().copied() {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        for handle in self.ui_ability_key_text.iter().copied() {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        for handle in self.ui_ability_cd_text.iter().copied() {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        for handle in self.ui_ability_upgrade_buttons.iter().copied() {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        self.start_round_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.pause_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.td_tower_button_rects.clear();
+        self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.td_target_priority_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.td_upgrade_button_rects = [(UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0); 3];
+    }
+
+    fn hide_pregame_ui(&mut self, ui: &mut UserInterface) {
+        for handle in [self.ui_pregame.background, self.ui_pregame.panel] {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        for handle in [
+            self.ui_pregame.title,
+            self.ui_pregame.subtitle,
+            self.ui_pregame.status,
+        ] {
+            ui.send(
+                handle,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        for button in &self.ui_pregame.buttons {
+            ui.send(
+                button.bg,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+            ui.send(
+                button.text,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+        }
+        self.pregame_button_rects.clear();
+    }
+
+    fn current_pregame_buttons(&self) -> Vec<(String, String, bool, pregame::PregameAction)> {
+        match self.pregame_runtime.state {
+            pregame::PregameState::MainMenu => self
+                .pregame_runtime
+                .catalog
+                .screen("main_menu")
+                .map(|screen| {
+                    screen
+                        .widgets
+                        .iter()
+                        .map(|widget| {
+                            (
+                                widget.label.clone(),
+                                widget.description.clone(),
+                                widget.is_active(),
+                                widget.action.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            pregame::PregameState::MapSelect => {
+                let mut buttons = vec![(
+                    "Back".to_string(),
+                    String::new(),
+                    true,
+                    pregame::PregameAction::Back,
+                )];
+                buttons.extend(self.pregame_runtime.catalog.maps.iter().map(|map| {
+                    (
+                        map.label.clone(),
+                        if map.reward.trim().is_empty() {
+                            map.description.clone()
+                        } else {
+                            format!("{} | {}", map.description, map.reward)
+                        },
+                        map.is_playable(),
+                        pregame::PregameAction::SelectMap {
+                            map_id: map.id.clone(),
+                        },
+                    )
+                }));
+                buttons
+            }
+            pregame::PregameState::DifficultySelect => {
+                let mut buttons = vec![(
+                    "Back".to_string(),
+                    String::new(),
+                    true,
+                    pregame::PregameAction::Back,
+                )];
+                buttons.extend(self.pregame_runtime.catalog.difficulties.iter().map(
+                    |difficulty| {
+                        (
+                            difficulty.label.clone(),
+                            if difficulty.reward.trim().is_empty() {
+                                difficulty.description.clone()
+                            } else {
+                                format!("{} | {}", difficulty.description, difficulty.reward)
+                            },
+                            difficulty.enabled,
+                            pregame::PregameAction::SelectDifficulty {
+                                difficulty_id: difficulty.id.clone(),
+                            },
+                        )
+                    },
+                ));
+                buttons
+            }
+            pregame::PregameState::StartingSession => vec![(
+                "Starting...".to_string(),
+                "Please wait".to_string(),
+                false,
+                pregame::PregameAction::NoOp,
+            )],
+            pregame::PregameState::SessionEnded => vec![(
+                "Back to Menu".to_string(),
+                String::new(),
+                true,
+                pregame::PregameAction::Back,
+            )],
+            pregame::PregameState::InGame => Vec::new(),
+        }
+    }
+
+    fn handle_pregame_click(&mut self, screen: Vector2<f32>) -> bool {
+        if !self.pregame_runtime.is_pregame() {
+            return false;
+        }
+        let action = self
+            .pregame_button_rects
+            .iter()
+            .find_map(|(rect, action)| rect.contains(screen).then(|| action.clone()));
+        let Some(action) = action else {
+            return true;
+        };
+        if let Some(selection) = self.pregame_runtime.dispatch(&action) {
+            if let Err(err) = self.start_game_session(selection) {
+                log::error!("session start failed: {}", err);
+                self.shutdown_game_session(false);
+                self.pregame_runtime.recover_to_difficulty(err.clone());
+                self.connection_status = ConnectionStatus::Failed(err);
+            }
+        }
+        true
+    }
+
     fn server_timing(&self) -> LockstepTiming {
         LockstepTiming::new(if self.server_step_fps == 0 {
             LOCKSTEP_TPS
@@ -9152,7 +10233,7 @@ impl Game {
             .filter_map(|target| {
                 target
                     .target
-                    .map(|(x, y)| Vector2::new(x * WORLD_SCALE, y * WORLD_SCALE))
+                    .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
             })
             .collect();
         if points.is_empty() {
@@ -9160,7 +10241,7 @@ impl Game {
         }
 
         let line_color = Color::from_rgba(70, 240, 120, 180);
-        let hero_pos = Vector2::new(hero.pos_x * WORLD_SCALE, hero.pos_y * WORLD_SCALE);
+        let hero_pos = Vector2::new(-hero.pos_x * WORLD_SCALE, hero.pos_y * WORLD_SCALE);
         add_dashed_world_line(
             scene,
             hero_pos,
@@ -10086,6 +11167,19 @@ mod input_latency_tests {
         assert_eq!(pending.base_tick, 22);
         assert_eq!(pending.server_drain_tick, Some(24));
         assert_eq!(pending.server_queue_us, Some(16_000));
+    }
+
+    #[test]
+    fn pregame_default_state_does_not_own_gameplay_runtime() {
+        let game = Game::default();
+
+        assert!(matches!(
+            game.pregame_runtime.state,
+            pregame::PregameState::MainMenu
+        ));
+        assert!(game.lockstep_handle.is_none());
+        assert!(game.sim_runner_handle.is_none());
+        assert!(game.backend_session.is_none());
     }
 
     #[test]
