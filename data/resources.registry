@@ -1,7 +1,15 @@
 {
-    "dc5e7f3b-f348-4830-bca0-dad85df376d2": "data/scene.rgs",
     "11111111-1111-1111-1111-000000000001": "data/hero1_1.png",
     "11111111-1111-1111-1111-000000000002": "data/hero1_2.png",
     "11111111-1111-1111-1111-000000000003": "data/hero1_3.png",
     "11111111-1111-1111-1111-000000000004": "data/hero1_4.png",
+    "125e15fc-91ca-4f7f-8392-c9294ccaf38b": "data/ability_icons/ability_fire_dash.png",
+    "357e0102-d600-4cc5-87d8-f33b62459344": "data/hero_portraits/hero_date_masamune_portrait.png",
+    "5393045f-b7b6-4cbe-8ea5-90d73d3bd725": "data/hero_portraits/hero_default_portrait.png",
+    "68b7ec56-b1fa-4a68-b25a-32448f1a19a7": "data/ability_icons/ability_matchlock_gun.png",
+    "6d6e52a8-0d24-471d-af12-f2b2222357f7": "data/ability_icons/ability_flame_blade.png",
+    "9671b8c7-7a4f-4b35-81b0-ac1255c691cf": "data/ability_icons/ability_default_placeholder.png",
+    "9883b387-9f36-451b-8ef7-c9696ebf9888": "data/ability_icons/ability_flame_assault.png",
+    "ccbf407a-d497-4f86-86e5-935c369ee60b": "data/hero_portraits/hero_saika_magoichi_portrait.png",
+    "dc5e7f3b-f348-4830-bca0-dad85df376d2": "data/scene.rgs",
 }
