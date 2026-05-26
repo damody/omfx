@@ -684,6 +684,74 @@ impl UiRect {
     }
 }
 
+fn pregame_wrap_line(text: &str, max_chars: usize) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().count() > max_chars {
+            if !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() >= max_chars {
+                    lines.push(chunk);
+                    chunk = String::new();
+                }
+                chunk.push(ch);
+            }
+            if !chunk.is_empty() {
+                current = chunk;
+            }
+            continue;
+        }
+        let next_len =
+            current.chars().count() + if current.is_empty() { 0 } else { 1 } + word.chars().count();
+        if !current.is_empty() && next_len > max_chars {
+            lines.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(text.chars().take(max_chars).collect());
+    }
+    lines
+}
+
+fn pregame_button_text(label: &str, description: &str, active: bool, button_w: f32) -> String {
+    let max_chars = if button_w >= 420.0 {
+        42
+    } else if button_w >= 340.0 {
+        34
+    } else {
+        28
+    };
+    let mut lines = Vec::new();
+    lines.push(label.trim().to_string());
+    lines.extend(
+        pregame_wrap_line(description, max_chars)
+            .into_iter()
+            .take(2),
+    );
+    if !active {
+        lines.push("Locked".to_string());
+    }
+    lines.join("\n")
+}
+
 #[derive(Debug, Default)]
 struct PregameButtonUi {
     bg: Handle<UiNode>,
@@ -2633,7 +2701,7 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(55, 32, 12, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(26.0.into())
+            .with_font_size(22.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
@@ -7845,11 +7913,37 @@ impl Game {
         ui.send(self.ui_pregame.background, WidgetMessage::Width(full.w));
         ui.send(self.ui_pregame.background, WidgetMessage::Height(full.h));
 
-        let panel_w = (self.window_size.x * 0.78).clamp(560.0, 980.0);
-        let panel_h = (self.window_size.y * 0.72).clamp(390.0, 720.0);
+        let buttons = self.current_pregame_buttons();
+        let compact = self.window_size.y < 620.0;
+        let cols = if buttons.len() >= 3 && self.window_size.x >= 900.0 {
+            2
+        } else {
+            1
+        };
+        let rows = if buttons.is_empty() {
+            0
+        } else {
+            (buttons.len() + cols - 1) / cols
+        };
+        let button_h = if compact { 88.0 } else { 106.0 };
+        let gap_x = 24.0;
+        let gap_y = if compact { 12.0 } else { 18.0 };
+        let top_pad = if compact { 22.0 } else { 30.0 };
+        let title_h = if compact { 46.0 } else { 58.0 };
+        let subtitle_h = if compact { 30.0 } else { 38.0 };
+        let start_offset = top_pad + title_h + subtitle_h + if compact { 22.0 } else { 34.0 };
+        let buttons_h = rows as f32 * button_h + rows.saturating_sub(1) as f32 * gap_y;
+        let status_h = 30.0;
+        let bottom_pad = if compact { 22.0 } else { 34.0 };
+        let required_panel_h = start_offset + buttons_h + status_h + bottom_pad + 18.0;
+        let max_panel_h = (self.window_size.y - if compact { 24.0 } else { 48.0 }).max(360.0);
+        let panel_w = (self.window_size.x * 0.82).clamp(600.0, 1080.0);
+        let panel_h = (self.window_size.y * 0.76)
+            .max(required_panel_h)
+            .clamp(430.0, max_panel_h.min(780.0));
         let panel = UiRect {
             x: (self.window_size.x - panel_w) * 0.5,
-            y: (self.window_size.y - panel_h) * 0.46,
+            y: (self.window_size.y - panel_h) * 0.47,
             w: panel_w,
             h: panel_h,
         };
@@ -7862,9 +7956,9 @@ impl Game {
 
         let title_rect = UiRect {
             x: panel.x + 36.0,
-            y: panel.y + 28.0,
+            y: panel.y + top_pad,
             w: panel.w - 72.0,
-            h: 58.0,
+            h: title_h,
         };
         ui.send(
             self.ui_pregame.title,
@@ -7874,9 +7968,9 @@ impl Game {
         ui.send(self.ui_pregame.title, TextMessage::Text(title));
         let subtitle_rect = UiRect {
             x: panel.x + 48.0,
-            y: panel.y + 88.0,
+            y: title_rect.bottom() + 8.0,
             w: panel.w - 96.0,
-            h: 36.0,
+            h: subtitle_h,
         };
         ui.send(
             self.ui_pregame.subtitle,
@@ -7891,9 +7985,9 @@ impl Game {
         let status = self.pregame_runtime.last_error.clone().unwrap_or_default();
         let status_rect = UiRect {
             x: panel.x + 48.0,
-            y: panel.bottom() - 44.0,
+            y: panel.bottom() - status_h - 14.0,
             w: panel.w - 96.0,
-            h: 28.0,
+            h: status_h,
         };
         ui.send(
             self.ui_pregame.status,
@@ -7902,22 +7996,13 @@ impl Game {
         ui.send(self.ui_pregame.status, WidgetMessage::Width(status_rect.w));
         ui.send(self.ui_pregame.status, TextMessage::Text(status));
 
-        let buttons = self.current_pregame_buttons();
         self.pregame_button_rects.clear();
-        let cols = if buttons.len() > 3 && self.window_size.x >= 960.0 {
-            2
-        } else {
-            1
-        };
         let button_w = if cols == 2 {
-            ((panel.w - 116.0) * 0.5).clamp(230.0, 390.0)
+            ((panel.w - 128.0) * 0.5).clamp(280.0, 450.0)
         } else {
-            (panel.w - 120.0).clamp(260.0, 460.0)
+            (panel.w - 120.0).clamp(320.0, 560.0)
         };
-        let button_h = 68.0;
-        let gap_x = 24.0;
-        let gap_y = 18.0;
-        let start_y = panel.y + 148.0;
+        let start_y = panel.y + start_offset;
         for (i, (label, description, active, action)) in buttons.iter().enumerate() {
             if i >= self.ui_pregame.buttons.len() {
                 break;
@@ -7937,17 +8022,13 @@ impl Game {
             ui.send(button.bg, WidgetMessage::DesiredPosition(rect.pos()));
             ui.send(button.bg, WidgetMessage::Width(rect.w));
             ui.send(button.bg, WidgetMessage::Height(rect.h));
-            ui.send(button.text, WidgetMessage::DesiredPosition(rect.pos()));
-            ui.send(button.text, WidgetMessage::Width(rect.w));
-            ui.send(button.text, WidgetMessage::Height(rect.h));
-            let mut text = if description.trim().is_empty() {
-                label.clone()
-            } else {
-                format!("{}\n{}", label, description)
-            };
-            if !active {
-                text.push_str("\nLocked");
-            }
+            ui.send(
+                button.text,
+                WidgetMessage::DesiredPosition(Vector2::new(rect.x + 18.0, rect.y + 8.0)),
+            );
+            ui.send(button.text, WidgetMessage::Width(rect.w - 36.0));
+            ui.send(button.text, WidgetMessage::Height(rect.h - 16.0));
+            let text = pregame_button_text(label, description, *active, rect.w - 36.0);
             ui.send(button.text, TextMessage::Text(text));
             if *active {
                 self.pregame_button_rects.push((rect, action.clone()));
