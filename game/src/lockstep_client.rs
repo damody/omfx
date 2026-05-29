@@ -204,219 +204,279 @@ async fn run_client(
     input_rx: Receiver<LockstepInputMsg>,
     latest_tick: Arc<AtomicU32>,
 ) {
-    info!("lockstep-client connecting to {}", addr);
-
-    // 用新的 KcpClient，舊的 NetworkBridge 會有自己的。`connect`
-    // 會附帶送出 SubscribeRequest；階段 2 在行為上可接受，
-    // 伺服器可容忍，且 lockstep tag 仍走同一 socket。
-    let mut client = match KcpClient::connect(&addr, player_name.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("lockstep-client connect failed: {}", e);
-            let _ = events_tx.send(LockstepEvent::Disconnected {
-                reason: format!("connect: {}", e),
-            });
-            return;
-        }
-    };
-
-    // 送出 JoinRequest 0x13 並等待 GameStart 0x14，回傳
-    // `master_seed`。階段 2 固定以 Player 身分加入（observer = false）。
-    let master_seed = match client
-        .join_lockstep(player_name.clone(), player_id, false)
-        .await
-    {
-        Ok(seed) => seed,
-        Err(e) => {
-            error!("lockstep-client join_lockstep failed: {}", e);
-            let _ = events_tx.send(LockstepEvent::Disconnected {
-                reason: format!("join: {}", e),
-            });
-            return;
-        }
-    };
-    let player_id = client.lockstep_player_id().unwrap_or(0);
-    let step_fps = client.lockstep_step_fps().unwrap_or(LOCKSTEP_TPS);
-    info!(
-        "lockstep-client joined: master_seed=0x{:016x} player_id={} step_fps={}",
-        master_seed, player_id, step_fps
-    );
-    let _ = events_tx.send(LockstepEvent::Connected {
-        master_seed,
-        player_id,
-        step_fps,
-    });
-
-    // 接管 lockstep 入站串流。`join_lockstep` 已經耗掉第一筆
-    // `GameStart`，之後這個 rx 會回傳 `TickBatch` / `StateHash` /
-    // `SnapshotResp`，若又收到額外 `GameStart`（階段 2 不預期）也一併接收。
-    let mut rx = match client.subscribe_lockstep() {
-        Ok(r) => r,
-        Err(e) => {
-            error!("lockstep-client subscribe_lockstep failed: {}", e);
-            let _ = events_tx.send(LockstepEvent::Disconnected {
-                reason: format!("subscribe: {}", e),
-            });
-            return;
-        }
-    };
-
-    // 主迴圈：輪詢入站並頻繁清空待送輸入。
-    // 接收逾時若拉長，會累積到約一個 TickBatch 的輸入延遲，
-    // 會讓預期的 +3 tick 前瞻在 localhost 上變晚。
-    let mut last_hb_log = std::time::Instant::now();
-    let mut last_stall_log = std::time::Instant::now();
-    let mut tick_batches_since_log: u32 = 0;
-    let mut last_known_tick: u32 = 0;
-    // 每次迴圈的位元組增量，會在尾段輸出到 NetStats。
-    // 入站與出站同時計入，讓 HUD 顯示總 lockstep 流量。
-    let mut wire_delta: u64;
-    let mut logical_delta: u64;
+    let mut attempt = 0u32;
     loop {
-        wire_delta = 0;
-        logical_delta = 0;
-        let recv_result =
-            tokio::time::timeout(std::time::Duration::from_millis(2), rx.recv()).await;
-        match recv_result {
-            Err(_elapsed) => {
-                let now = std::time::Instant::now();
-                if now.duration_since(last_stall_log).as_secs() >= 2 {
-                    warn!(
-                        "[lockstep-client] no KCP frame in 2.0s (last_known_tick={}). \
-                         Upstream omb→KCP path is the suspect.",
-                        last_known_tick,
-                    );
-                    last_stall_log = now;
-                }
-            }
-            Ok(None) => {
-                warn!("lockstep-client stream closed");
-                let _ = events_tx.send(LockstepEvent::Disconnected {
-                    reason: "stream closed".into(),
-                });
-                break;
-            }
-            Ok(Some(LockstepInbound::TickBatch {
-                msg: b,
-                wire_bytes,
-                logical_bytes,
-            })) => {
-                let client_receive_us = wall_clock_us();
-                wire_delta += wire_bytes as u64;
-                logical_delta += logical_bytes as u64;
-                tick_batches_since_log += 1;
-                last_known_tick = b.tick;
-                latest_tick.store(b.tick, Ordering::Relaxed);
-                let now = std::time::Instant::now();
-                last_stall_log = now;
-                if now.duration_since(last_hb_log).as_secs() >= 5 {
-                    info!(
-                        "[lockstep-client] healthy: {} TickBatch frames in last 5s (latest tick={})",
-                        tick_batches_since_log, b.tick,
-                    );
-                    last_hb_log = now;
-                    tick_batches_since_log = 0;
-                }
-                // 階段 3.3：從 `InputForPlayer` 的各列抽出輸入與 edge metadata。
-                let inputs: Vec<LockstepTickInput> = b
-                    .inputs
-                    .into_iter()
-                    .filter_map(|ifp| {
-                        ifp.input.map(|inp| LockstepTickInput {
-                            player_id: ifp.player_id,
-                            input: inp,
-                            input_id: ifp.input_id,
-                            server_receive_tick: ifp.server_receive_tick,
-                            server_drain_tick: ifp.server_drain_tick,
-                            server_queue_us: ifp.server_queue_us,
-                            client_receive_us,
-                        })
-                    })
-                    .collect();
-                let server_events = b.server_events;
-                let _ = events_tx.send(LockstepEvent::TickBatch {
-                    tick: b.tick,
-                    inputs,
-                    server_events,
-                    lua_content_generation: b.lua_content_generation,
-                    lua_content_hash: b.lua_content_hash,
-                });
-            }
-            Ok(Some(LockstepInbound::StateHash {
-                msg: sh,
-                wire_bytes,
-                logical_bytes,
-            })) => {
-                wire_delta += wire_bytes as u64;
-                logical_delta += logical_bytes as u64;
-                let _ = events_tx.send(LockstepEvent::StateHash {
-                    tick: sh.tick,
-                    hash: sh.hash,
-                });
-            }
-            Ok(Some(LockstepInbound::GameStart {
-                wire_bytes,
-                logical_bytes,
-                ..
-            })) => {
-                wire_delta += wire_bytes as u64;
-                logical_delta += logical_bytes as u64;
-                warn!("lockstep-client got unexpected GameStart after join — ignoring");
-            }
-            Ok(Some(LockstepInbound::Pong {
-                rtt_us,
-                wire_bytes,
-                logical_bytes,
-            })) => {
-                wire_delta += wire_bytes as u64;
-                logical_delta += logical_bytes as u64;
-                let _ = events_tx.send(LockstepEvent::Latency { rtt_us });
-            }
-            Ok(Some(LockstepInbound::SnapshotResp {
-                msg: resp,
-                wire_bytes,
-                logical_bytes,
-            })) => {
-                wire_delta += wire_bytes as u64;
-                logical_delta += logical_bytes as u64;
-                let (bytes_len, schema) = match &resp.state {
-                    Some(s) => (s.world_bytes.len(), s.schema_version),
-                    None => (0, 0),
-                };
-                info!(
-                    "lockstep-client received SnapshotResp tick={} bytes={} schema={} (Phase 5.3 logs only; apply is Phase 5+)",
-                    resp.tick, bytes_len, schema
-                );
-            }
+        attempt += 1;
+        if attempt > 1 {
+            // 指數退避：1s, 2s, 4s, 8s 上限
+            let wait_secs = std::cmp::min(1u64 << (attempt - 2).min(3), 8);
+            info!(
+                "lockstep-client: reconnect attempt {} (waiting {}s)",
+                attempt, wait_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            // 清空上一個 session 殘留的輸入
+            while input_rx.try_recv().is_ok() {}
         }
 
-        // 非阻塞清空待送輸入。`InputSubmit` 的位元組也會納入同一個
-        // lockstep 流量總數。
-        while let Ok(msg) = input_rx.try_recv() {
-            let submit_start_us = wall_clock_us();
-            match client
-                .submit_input(msg.target_tick, msg.input, msg.input_id)
-                .await
-            {
-                Ok((logical, wire)) => {
-                    let submit_done_us = wall_clock_us();
-                    wire_delta += wire as u64;
-                    logical_delta += logical as u64;
-                    let _ = events_tx.send(LockstepEvent::InputSubmitted {
-                        input_id: msg.input_id,
-                        submit_start_us,
-                        submit_done_us,
+        // 若 events 接收端已關閉（LockstepClientHandle 被 drop），停止重試
+        macro_rules! send_or_return {
+            ($ev:expr) => {
+                if events_tx.send($ev).is_err() {
+                    return;
+                }
+            };
+        }
+
+        info!("lockstep-client: connecting to {} (attempt {})", addr, attempt);
+
+        // 用新的 KcpClient，舊的 NetworkBridge 會有自己的。`connect`
+        // 會附帶送出 SubscribeRequest；階段 2 在行為上可接受，
+        // 伺服器可容忍，且 lockstep tag 仍走同一 socket。
+        let mut client = match KcpClient::connect(&addr, player_name.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("lockstep-client connect failed: {}", e);
+                send_or_return!(LockstepEvent::Disconnected {
+                    reason: format!("connect: {}", e),
+                });
+                continue;
+            }
+        };
+
+        // 送出 JoinRequest 0x13 並等待 GameStart 0x14，回傳
+        // `master_seed`。階段 2 固定以 Player 身分加入（observer = false）。
+        // 10 秒 timeout：若伺服器拒絕 JoinRequest（不回 GameStart），
+        // 避免永遠卡住，讓外層重連邏輯可以繼續。
+        let join_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.join_lockstep(player_name.clone(), player_id, false),
+        )
+        .await;
+        let master_seed = match join_result {
+            Err(_timeout) => {
+                warn!("lockstep-client join_lockstep timed out after 10s (server may have rejected player_id={} as duplicate)", player_id);
+                send_or_return!(LockstepEvent::Disconnected {
+                    reason: "join timeout (server did not send GameStart within 10s)".into(),
+                });
+                continue;
+            }
+            Ok(Err(e)) => {
+                warn!("lockstep-client join_lockstep failed: {}", e);
+                send_or_return!(LockstepEvent::Disconnected {
+                    reason: format!("join: {}", e),
+                });
+                continue;
+            }
+            Ok(Ok(seed)) => seed,
+        };
+        let player_id = client.lockstep_player_id().unwrap_or(0);
+        let step_fps = client.lockstep_step_fps().unwrap_or(LOCKSTEP_TPS);
+        info!(
+            "lockstep-client joined: master_seed=0x{:016x} player_id={} step_fps={}",
+            master_seed, player_id, step_fps
+        );
+        send_or_return!(LockstepEvent::Connected {
+            master_seed,
+            player_id,
+            step_fps,
+        });
+
+        // 接管 lockstep 入站串流。`join_lockstep` 已經耗掉第一筆
+        // `GameStart`，之後這個 rx 會回傳 `TickBatch` / `StateHash` /
+        // `SnapshotResp`，若又收到額外 `GameStart`（階段 2 不預期）也一併接收。
+        let mut rx = match client.subscribe_lockstep() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("lockstep-client subscribe_lockstep failed: {}", e);
+                send_or_return!(LockstepEvent::Disconnected {
+                    reason: format!("subscribe: {}", e),
+                });
+                continue;
+            }
+        };
+
+        // 成功連線並加入，重設退避計數
+        attempt = 0;
+
+        // 主迴圈：輪詢入站並頻繁清空待送輸入。
+        // 接收逾時若拉長，會累積到約一個 TickBatch 的輸入延遲，
+        // 會讓預期的 +3 tick 前瞻在 localhost 上變晚。
+        let mut last_hb_log = std::time::Instant::now();
+        let mut last_stall_log = std::time::Instant::now();
+        let mut last_tickbatch_time = std::time::Instant::now();
+        let mut tick_batches_since_log: u32 = 0;
+        let mut last_known_tick: u32 = 0;
+        // 每次迴圈的位元組增量，會在尾段輸出到 NetStats。
+        // 入站與出站同時計入，讓 HUD 顯示總 lockstep 流量。
+        let mut wire_delta: u64;
+        let mut logical_delta: u64;
+        'inner: loop {
+            wire_delta = 0;
+            logical_delta = 0;
+            let recv_result =
+                tokio::time::timeout(std::time::Duration::from_millis(2), rx.recv()).await;
+            match recv_result {
+                Err(_elapsed) => {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_stall_log).as_secs() >= 2 {
+                        warn!(
+                            "[lockstep-client] no KCP frame in 2.0s (last_known_tick={}). \
+                             Upstream omb→KCP path is the suspect.",
+                            last_known_tick,
+                        );
+                        last_stall_log = now;
+                    }
+                    if now.duration_since(last_tickbatch_time).as_secs() >= 30 {
+                        warn!(
+                            "[lockstep-client] no TickBatch for 30s (last_known_tick={}) — forcing reconnect",
+                            last_known_tick,
+                        );
+                        send_or_return!(LockstepEvent::Disconnected {
+                            reason: format!(
+                                "stall timeout: no TickBatch for 30s (last_tick={})",
+                                last_known_tick
+                            ),
+                        });
+                        break 'inner;
+                    }
+                }
+                Ok(None) => {
+                    warn!("lockstep-client stream closed");
+                    send_or_return!(LockstepEvent::Disconnected {
+                        reason: "stream closed".into(),
+                    });
+                    break 'inner;
+                }
+                Ok(Some(LockstepInbound::TickBatch {
+                    msg: b,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
+                    let client_receive_us = wall_clock_us();
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    tick_batches_since_log += 1;
+                    last_known_tick = b.tick;
+                    latest_tick.store(b.tick, Ordering::Relaxed);
+                    let now = std::time::Instant::now();
+                    last_stall_log = now;
+                    last_tickbatch_time = now;
+                    if now.duration_since(last_hb_log).as_secs() >= 5 {
+                        info!(
+                            "[lockstep-client] healthy: {} TickBatch frames in last 5s (latest tick={})",
+                            tick_batches_since_log, b.tick,
+                        );
+                        last_hb_log = now;
+                        tick_batches_since_log = 0;
+                    }
+                    // 階段 3.3：從 `InputForPlayer` 的各列抽出輸入與 edge metadata。
+                    let inputs: Vec<LockstepTickInput> = b
+                        .inputs
+                        .into_iter()
+                        .filter_map(|ifp| {
+                            ifp.input.map(|inp| LockstepTickInput {
+                                player_id: ifp.player_id,
+                                input: inp,
+                                input_id: ifp.input_id,
+                                server_receive_tick: ifp.server_receive_tick,
+                                server_drain_tick: ifp.server_drain_tick,
+                                server_queue_us: ifp.server_queue_us,
+                                client_receive_us,
+                            })
+                        })
+                        .collect();
+                    let server_events = b.server_events;
+                    if events_tx
+                        .send(LockstepEvent::TickBatch {
+                            tick: b.tick,
+                            inputs,
+                            server_events,
+                            lua_content_generation: b.lua_content_generation,
+                            lua_content_hash: b.lua_content_hash,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Some(LockstepInbound::StateHash {
+                    msg: sh,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    let _ = events_tx.send(LockstepEvent::StateHash {
+                        tick: sh.tick,
+                        hash: sh.hash,
                     });
                 }
-                Err(e) => warn!("lockstep-client submit_input failed: {}", e),
+                Ok(Some(LockstepInbound::GameStart {
+                    wire_bytes,
+                    logical_bytes,
+                    ..
+                })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    warn!("lockstep-client got unexpected GameStart after join — ignoring");
+                }
+                Ok(Some(LockstepInbound::Pong {
+                    rtt_us,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    let _ = events_tx.send(LockstepEvent::Latency { rtt_us });
+                }
+                Ok(Some(LockstepInbound::SnapshotResp {
+                    msg: resp,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    let (bytes_len, schema) = match &resp.state {
+                        Some(s) => (s.world_bytes.len(), s.schema_version),
+                        None => (0, 0),
+                    };
+                    info!(
+                        "lockstep-client received SnapshotResp tick={} bytes={} schema={} (Phase 5.3 logs only; apply is Phase 5+)",
+                        resp.tick, bytes_len, schema
+                    );
+                }
+            }
+
+            // 非阻塞清空待送輸入。`InputSubmit` 的位元組也會納入同一個
+            // lockstep 流量總數。
+            while let Ok(msg) = input_rx.try_recv() {
+                let submit_start_us = wall_clock_us();
+                match client
+                    .submit_input(msg.target_tick, msg.input, msg.input_id)
+                    .await
+                {
+                    Ok((logical, wire)) => {
+                        let submit_done_us = wall_clock_us();
+                        wire_delta += wire as u64;
+                        logical_delta += logical as u64;
+                        let _ = events_tx.send(LockstepEvent::InputSubmitted {
+                            input_id: msg.input_id,
+                            submit_start_us,
+                            submit_done_us,
+                        });
+                    }
+                    Err(e) => warn!("lockstep-client submit_input failed: {}", e),
+                }
+            }
+
+            if wire_delta > 0 || logical_delta > 0 {
+                let _ = events_tx.send(LockstepEvent::NetStats {
+                    wire_delta,
+                    logical_delta,
+                });
             }
         }
-
-        if wire_delta > 0 || logical_delta > 0 {
-            let _ = events_tx.send(LockstepEvent::NetStats {
-                wire_delta,
-                logical_delta,
-            });
-        }
+        // inner loop ended → outer loop retries the connection
     }
 }
