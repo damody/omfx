@@ -53,7 +53,9 @@ impl BackendLaunchConfig {
                         | "OMB_STORY_DATA_DIR"
                         | "OMB_LUA_CONTENT_ROOT"
                 ) {
-                    absolute_path(PathBuf::from(value)).to_string_lossy().into_owned()
+                    absolute_path(PathBuf::from(value))
+                        .to_string_lossy()
+                        .into_owned()
                 } else {
                     value
                 };
@@ -268,6 +270,27 @@ mod tests {
     }
 
     #[test]
+    fn external_backend_shutdown_is_idempotent() {
+        let config = BackendLaunchConfig {
+            session_id: "session-shutdown".into(),
+            map_id: "map".into(),
+            story: "TD_1".into(),
+            difficulty_id: "easy".into(),
+            difficulty_config: "easy".into(),
+            kcp_addr: "127.0.0.1:50061".into(),
+            content_root: None,
+            executable: None,
+            launcher_enabled: false,
+        };
+        let mut session = BackendSession::start(config).expect("external session starts");
+
+        session.shutdown();
+        session.shutdown();
+
+        assert!(!session.owns_process());
+    }
+
+    #[test]
     fn launch_command_contains_session_metadata() {
         let config = BackendLaunchConfig {
             session_id: "session-2".into(),
@@ -318,8 +341,8 @@ mod tests {
         let envs = config.launch_env();
 
         assert!(envs.iter().any(|(key, _)| key == "OMB_CONTENT_ROOT"));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "OMB_LUA_CONTENT_ROOT" && value.ends_with("scripts/lua_data")));
+        assert!(envs.iter().any(
+            |(key, value)| key == "OMB_LUA_CONTENT_ROOT" && value.ends_with("scripts/lua_data")
+        ));
     }
 }

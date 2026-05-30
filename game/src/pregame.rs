@@ -817,6 +817,115 @@ mod tests {
     }
 
     #[test]
+    fn enabled_map_without_story_is_disabled() {
+        let json = r#"
+        {
+          "screens": [],
+          "maps": [
+            {
+              "id": "broken_map",
+              "label": "Broken",
+              "enabled": true,
+              "locked": false
+            }
+          ],
+          "difficulties": []
+        }
+        "#;
+
+        let catalog = PregameCatalog::from_json_str(json).expect("catalog parses");
+
+        let map = catalog.map("broken_map").expect("map exists");
+        assert!(!map.enabled);
+        assert!(!map.is_playable());
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("missing story/runtime id")));
+    }
+
+    #[test]
+    fn missing_difficulty_config_falls_back_to_id() {
+        let json = r#"
+        {
+          "screens": [],
+          "maps": [],
+          "difficulties": [
+            {
+              "id": "easy",
+              "label": "Easy",
+              "enabled": true
+            }
+          ]
+        }
+        "#;
+
+        let catalog = PregameCatalog::from_json_str(json).expect("catalog parses");
+
+        let difficulty = catalog.difficulty("easy").expect("difficulty exists");
+        assert!(difficulty.enabled);
+        assert_eq!(difficulty.config_value(), "easy");
+    }
+
+    #[test]
+    fn missing_optional_asset_path_is_diagnostic_only() {
+        let json = r#"
+        {
+          "screens": [
+            {
+              "id": "main_menu",
+              "title": "Main",
+              "background_image": "missing_background.png",
+              "widgets": [
+                {"id": "start", "label": "Start", "image": "missing_button.png", "action": {"kind": "NoOp"}}
+              ]
+            }
+          ],
+          "maps": [
+            {
+              "id": "td_1",
+              "label": "TD",
+              "story": "TD_1",
+              "image": "missing_map.png",
+              "enabled": true
+            }
+          ],
+          "difficulties": [
+            {
+              "id": "easy",
+              "label": "Easy",
+              "image": "missing_difficulty.png",
+              "enabled": true
+            }
+          ]
+        }
+        "#;
+        let mut catalog = PregameCatalog::from_json_str(json).expect("catalog parses");
+        catalog.source_path = Some(std::env::temp_dir().join("omfx_pregame_test/catalog.json"));
+
+        catalog.validate_asset_paths();
+
+        assert!(catalog.map("td_1").unwrap().is_playable());
+        assert!(catalog.difficulty("easy").unwrap().enabled);
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("missing_background.png")));
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("missing_button.png")));
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("missing_map.png")));
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("missing_difficulty.png")));
+    }
+
+    #[test]
     fn menu_only_runtime_state_has_no_gameplay_resources() {
         let runtime = PregameRuntime::new_for_menu(PregameCatalog::fallback());
 
