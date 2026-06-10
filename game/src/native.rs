@@ -325,6 +325,7 @@ pub enum InputActionKind {
     TowerUpgrade,
     ItemUse,
     StartRound,
+    TogglePause,
     MoveTo,
     AttackMove,
     AttackTarget,
@@ -343,6 +344,7 @@ impl InputActionKind {
             Some(Action::TowerUpgrade(_)) => Self::TowerUpgrade,
             Some(Action::ItemUse(_)) => Self::ItemUse,
             Some(Action::StartRound(_)) => Self::StartRound,
+            Some(Action::TogglePause(_)) => Self::TogglePause,
             Some(Action::MoveTo(_)) => Self::MoveTo,
             Some(Action::AttackMove(_)) => Self::AttackMove,
             Some(Action::AttackTarget(_)) => Self::AttackTarget,
@@ -784,6 +786,35 @@ fn td_ui_ref_rect(window_size: Vector2<f32>, x: f32, y: f32, w: f32, h: f32) -> 
     }
 }
 
+fn td_start_control_label(
+    is_paused: bool,
+    round_is_running: bool,
+    current_round: u32,
+    total_rounds: u32,
+) -> &'static str {
+    if is_paused {
+        "RESUME"
+    } else if total_rounds > 0 && current_round >= total_rounds {
+        "DONE"
+    } else if round_is_running {
+        "RUNNING"
+    } else {
+        "READY"
+    }
+}
+
+fn td_pause_control_label(is_paused: bool) -> &'static str {
+    if is_paused {
+        "PAUSED"
+    } else {
+        "PAUSE"
+    }
+}
+
+fn td_pause_control_opacity(is_paused: bool) -> Option<f32> {
+    Some(if is_paused { 0.35 } else { 1.0 })
+}
+
 fn td_upgrade_effect_text(description: &str) -> String {
     let text = description.trim();
     if text.is_empty() {
@@ -1083,6 +1114,7 @@ struct HeroModelRender {
     animations_by_source: HashMap<String, Handle<Animation>>,
     action_resources_requested: HashSet<String>,
     active_action: Option<String>,
+    active_animation_speed: f32,
     active_attack_seq: Option<u32>,
     last_attack_action: Option<String>,
     attack_repeat_ready: bool,
@@ -1463,6 +1495,14 @@ fn disable_other_animation_players(
         if player != active_player {
             disable_animation_player(scene, player);
         }
+    }
+}
+
+fn hero_animation_playback_speed(base_speed: f32, is_paused: bool) -> f32 {
+    if is_paused {
+        0.0
+    } else {
+        base_speed
     }
 }
 
@@ -2125,6 +2165,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     round_is_running: bool,
+    /// Lockstep-authoritative gameplay pause state.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    is_game_paused: bool,
     /// 是否為 TD 模式：由首次收到 hero.stats 有 lives>0 時設 true。
     /// 影響相機（固定不跟隨英雄）、zoom（拉遠讓整張路徑可見）。
     #[visit(skip)]
@@ -4317,6 +4361,7 @@ impl Plugin for Game {
                     self.current_round = snapshot.round;
                     self.total_rounds = snapshot.total_rounds;
                     self.round_is_running = snapshot.round_is_running;
+                    self.is_game_paused = snapshot.is_paused;
                     self.hero_state.lives = snapshot.lives;
 
                     // 階段 4.2：將模擬爆炸排入本地
@@ -5917,10 +5962,14 @@ impl Plugin for Game {
                     WidgetMessage::Height(pause_rect.h),
                 );
                 ui.send(
+                    self.ui_td_right_panel.pause_icon,
+                    WidgetMessage::Opacity(td_pause_control_opacity(self.is_game_paused)),
+                );
+                ui.send(
                     self.ui_td_right_panel.pause_text,
                     WidgetMessage::DesiredPosition(Vector2::new(
                         pause_rect.x,
-                        pause_rect.y + 78.0 * sy,
+                        pause_rect.y + pause_rect.h + 2.0 * sy,
                     )),
                 );
                 ui.send(
@@ -5929,7 +5978,11 @@ impl Plugin for Game {
                 );
                 ui.send(
                     self.ui_td_right_panel.pause_text,
-                    TextMessage::Text("PAUSE 待接".to_string()),
+                    WidgetMessage::Opacity(td_pause_control_opacity(self.is_game_paused)),
+                );
+                ui.send(
+                    self.ui_td_right_panel.pause_text,
+                    TextMessage::Text(td_pause_control_label(self.is_game_paused).to_string()),
                 );
                 let start_rect = td_ui_ref_rect(
                     self.window_size,
@@ -5953,15 +6006,27 @@ impl Plugin for Game {
                     WidgetMessage::Height(start_rect.h),
                 );
                 if self.ui_start_round_button != Handle::<Text>::NONE {
+                    let start_label = td_start_control_label(
+                        self.is_game_paused,
+                        self.round_is_running,
+                        self.current_round,
+                        self.total_rounds,
+                    );
                     ui.send(
                         self.ui_start_round_button,
-                        WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                        WidgetMessage::DesiredPosition(Vector2::new(
+                            start_rect.x,
+                            start_rect.y + start_rect.h + 2.0 * sy,
+                        )),
                     );
                     ui.send(
                         self.ui_start_round_button,
                         WidgetMessage::Width(start_rect.w),
                     );
-                    ui.send(self.ui_start_round_button, TextMessage::Text(String::new()));
+                    ui.send(
+                        self.ui_start_round_button,
+                        TextMessage::Text(start_label.to_string()),
+                    );
                 }
             }
 
@@ -7793,7 +7858,21 @@ impl Plugin for Game {
                         && screen.y >= by
                         && screen.y <= by + bh
                     {
-                        if !self.round_is_running
+                        if self.is_game_paused {
+                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                                action: Some(
+                                    omoba_core::kcp::game_proto::player_input::Action::TogglePause(
+                                        omoba_core::kcp::game_proto::TogglePause {},
+                                    ),
+                                ),
+                            };
+                            self.send_lockstep_input_from(
+                                input,
+                                lockstep_client::InputOriginKind::OsEvent,
+                                event_us,
+                            );
+                            log::info!("Start/Resume → lockstep PlayerInput::TogglePause sent");
+                        } else if !self.round_is_running
                             && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
                         {
                             let input = omoba_core::kcp::game_proto::PlayerInput {
@@ -7814,7 +7893,7 @@ impl Plugin for Game {
                     }
                 }
 
-                // Pause placeholder 目前沒有 gameplay action；點擊只攔截 UI，避免落到地圖。
+                // Pause button — authoritative lockstep toggle.
                 if !hit_ui {
                     let (bx, by, bw, bh) = self.pause_button_rect;
                     if bx > -9000.0
@@ -7823,6 +7902,21 @@ impl Plugin for Game {
                         && screen.y >= by
                         && screen.y <= by + bh
                     {
+                        if !self.is_game_paused {
+                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                                action: Some(
+                                    omoba_core::kcp::game_proto::player_input::Action::TogglePause(
+                                        omoba_core::kcp::game_proto::TogglePause {},
+                                    ),
+                                ),
+                            };
+                            self.send_lockstep_input_from(
+                                input,
+                                lockstep_client::InputOriginKind::OsEvent,
+                                event_us,
+                            );
+                            log::info!("Pause → lockstep PlayerInput::TogglePause sent");
+                        }
                         hit_ui = true;
                     }
                 }
@@ -9435,6 +9529,7 @@ impl Game {
         animation.set_speed(speed);
         animation.set_enabled(true);
         node.active_action = Some(action.to_string());
+        node.active_animation_speed = speed;
         node.one_shot_remaining = desired_duration_secs.unwrap_or(0.0);
         node.idle_cycle_remaining = if is_hero_idle_action(action) {
             source_duration / speed.max(0.001)
@@ -9725,6 +9820,7 @@ impl Game {
             }
         }
         node.active_action = None;
+        node.active_animation_speed = 1.0;
         node.active_attack_seq = None;
         node.last_attack_action = None;
         node.attack_repeat_ready = false;
@@ -9795,6 +9891,7 @@ impl Game {
                     animations_by_source: HashMap::new(),
                     action_resources_requested: HashSet::new(),
                     active_action: None,
+                    active_animation_speed: 1.0,
                     active_attack_seq: None,
                     last_attack_action: None,
                     attack_repeat_ready: false,
@@ -9813,6 +9910,7 @@ impl Game {
             );
         }
 
+        let model_dt = if self.is_game_paused { 0.0 } else { dt };
         if let Some(node) = self.hero_model_nodes.get_mut(&entity.entity_id) {
             if scene.graph.is_valid_handle(node.root_node) {
                 let dx = pos.x - node.last_pos.x;
@@ -9825,14 +9923,14 @@ impl Game {
                     .set_position(Vector3::new(pos.x, pos.y, Z_HERO + render.z_offset))
                     .set_rotation(rotation)
                     .set_scale(Vector3::new(render.scale, render.scale, render.scale));
-                node.one_shot_remaining = (node.one_shot_remaining - dt).max(0.0);
+                node.one_shot_remaining = (node.one_shot_remaining - model_dt).max(0.0);
                 if node
                     .active_action
                     .as_deref()
                     .map(is_hero_idle_action)
                     .unwrap_or(false)
                 {
-                    node.idle_cycle_remaining = (node.idle_cycle_remaining - dt).max(0.0);
+                    node.idle_cycle_remaining = (node.idle_cycle_remaining - model_dt).max(0.0);
                 } else {
                     node.idle_cycle_remaining = 0.0;
                 }
@@ -9840,7 +9938,7 @@ impl Game {
         }
 
         self.retarget_hero_action_sources(scene, resource_manager, entity.entity_id, render);
-        self.tick_hero_attack_action(scene, entity.entity_id, render, dt);
+        self.tick_hero_attack_action(scene, entity.entity_id, render, model_dt);
 
         if let Some(cue) = cancel_cue {
             self.cancel_hero_attack_action(scene, entity.entity_id, cue);
@@ -9910,8 +10008,25 @@ impl Game {
                 self.play_hero_action(scene, entity.entity_id, render, &action);
             }
         }
+        self.apply_hero_animation_pause_state(scene, entity.entity_id);
 
         true
+    }
+
+    fn apply_hero_animation_pause_state(&mut self, scene: &mut Scene, entity_id: u32) {
+        let Some(node) = self.hero_model_nodes.get(&entity_id) else {
+            return;
+        };
+        let speed = hero_animation_playback_speed(node.active_animation_speed, self.is_game_paused);
+        if let Some(player) = scene.graph[node.animation_player]
+            .cast_mut::<fyrox::scene::animation::AnimationPlayer>()
+        {
+            for animation in player.animations_mut().get_value_mut_silent().iter_mut() {
+                if animation.is_enabled() {
+                    animation.set_speed(speed);
+                }
+            }
+        }
     }
 
     fn start_tower_animation(
@@ -12143,5 +12258,25 @@ mod input_latency_tests {
 
         assert!(rotation_a.abs() < 1.0e-6);
         assert!(rotation_b.abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn hero_animation_playback_speed_freezes_only_while_paused() {
+        assert_eq!(hero_animation_playback_speed(1.25, true), 0.0);
+        assert_eq!(hero_animation_playback_speed(1.25, false), 1.25);
+    }
+
+    #[test]
+    fn td_control_labels_use_start_as_resume_when_paused() {
+        assert_eq!(td_start_control_label(true, false, 0, 3), "RESUME");
+        assert_eq!(td_start_control_label(false, false, 0, 3), "READY");
+        assert_eq!(td_start_control_label(false, true, 0, 3), "RUNNING");
+        assert_eq!(td_start_control_label(false, false, 3, 3), "DONE");
+    }
+
+    #[test]
+    fn td_pause_control_opacity_dims_when_paused() {
+        assert_eq!(td_pause_control_opacity(true), Some(0.35));
+        assert_eq!(td_pause_control_opacity(false), Some(1.0));
     }
 }

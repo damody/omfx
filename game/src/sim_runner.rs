@@ -461,11 +461,16 @@ fn run_sim_loop(
         world
             .write_resource::<omoba_core::comp::resources::Tick>()
             .0 = batch.tick as u64;
-        {
+        let is_paused = world
+            .read_resource::<omoba_core::comp::resources::GamePause>()
+            .is_paused;
+        if is_paused {
+            let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
+            dt.0 = omoba_sim::Fixed64::ZERO;
+        } else {
             let mut t = world.write_resource::<omoba_core::comp::resources::Time>();
             t.0 = timing.ticks_to_seconds_f64(batch.tick);
-        }
-        {
+            drop(t);
             let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
             dt.0 = omoba_sim::Fixed64::from_raw(timing.fixed_raw_for_tick(batch.tick as u64));
         }
