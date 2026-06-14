@@ -8999,6 +8999,18 @@ impl Game {
                         },
                     )
                 }));
+                buttons.extend(self.pregame_runtime.catalog.difficulties.iter().map(
+                    |difficulty| {
+                        (
+                            difficulty.label.clone(),
+                            difficulty.description.clone(),
+                            difficulty.enabled,
+                            pregame::PregameAction::SelectDifficulty {
+                                difficulty_id: difficulty.id.clone(),
+                            },
+                        )
+                    },
+                ));
                 buttons
             }
             pregame::PregameState::DifficultySelect => {
@@ -9353,8 +9365,14 @@ impl Game {
             );
         }
 
-        let tabs = ["新手", "中級", "高級", "專家"];
-        for (i, label) in tabs.iter().enumerate() {
+        let difficulties = self.pregame_runtime.catalog.difficulties.clone();
+        let selected_difficulty_id = self
+            .pregame_runtime
+            .selected_difficulty
+            .as_ref()
+            .map(|difficulty| difficulty.id.clone());
+        for (i, difficulty) in difficulties.iter().take(4).enumerate() {
+            let selected = selected_difficulty_id.as_deref() == Some(difficulty.id.as_str());
             self.place_pregame_node(
                 ui,
                 node_index,
@@ -9365,11 +9383,13 @@ impl Game {
                     170.0,
                     96.0,
                 ),
-                (*label).to_string(),
-                false,
-                pregame::PregameAction::NoOp,
+                difficulty.label.clone(),
+                difficulty.enabled,
+                pregame::PregameAction::SelectDifficulty {
+                    difficulty_id: difficulty.id.clone(),
+                },
                 PregameVisualRole::Button,
-                if i == 0 {
+                if selected {
                     Color::from_rgba(245, 195, 40, 255)
                 } else {
                     Color::from_rgba(35, 170, 205, 255)
@@ -12482,15 +12502,15 @@ mod input_latency_tests {
         assert!(matches!(difficulties[0].3, pregame::PregameAction::Back));
         assert_eq!(difficulties[0].0, "返回");
         assert!(difficulties.iter().any(|(label, _, active, action)| {
-            label == "簡單"
+            label == "新手"
                 && *active
-                && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "easy")
+                && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "novice")
         }));
 
         game.pregame_runtime.selected_difficulty = Some(
             game.pregame_runtime
                 .catalog
-                .difficulty("easy")
+                .difficulty("novice")
                 .unwrap()
                 .clone(),
         );
@@ -12502,6 +12522,11 @@ mod input_latency_tests {
             label == "綠野路口"
                 && *active
                 && matches!(action, pregame::PregameAction::SelectMap { map_id } if map_id == "td_1")
+        }));
+        assert!(maps.iter().any(|(label, _, active, action)| {
+            label == "高級"
+                && *active
+                && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "advanced")
         }));
     }
 
@@ -12517,8 +12542,8 @@ mod input_latency_tests {
 
         assert_eq!(selection.map.id, "td_1");
         assert_eq!(selection.map.story_id(), "TD_1");
-        assert_eq!(selection.difficulty.id, "easy");
-        assert_eq!(selection.difficulty.config_value(), "easy");
+        assert_eq!(selection.difficulty.id, "novice");
+        assert_eq!(selection.difficulty.config_value(), "novice");
     }
 
     #[test]
@@ -12533,8 +12558,8 @@ mod input_latency_tests {
         assert_eq!(config.session_id, "session-test");
         assert_eq!(config.map_id, "td_1");
         assert_eq!(config.story, "TD_1");
-        assert_eq!(config.difficulty_id, "easy");
-        assert_eq!(config.difficulty_config, "easy");
+        assert_eq!(config.difficulty_id, "novice");
+        assert_eq!(config.difficulty_config, "novice");
         assert!(!config.kcp_addr.trim().is_empty());
     }
 

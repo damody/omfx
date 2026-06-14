@@ -58,7 +58,7 @@ impl PregameRuntime {
         match action {
             PregameAction::Navigate { target } if target == "map_select" => {
                 self.selected_map = None;
-                self.selected_difficulty = None;
+                self.ensure_default_difficulty();
                 self.state = PregameState::MapSelect;
                 None
             }
@@ -130,6 +130,18 @@ impl PregameRuntime {
         }
         self.state = PregameState::StartingSession;
         Some(SessionSelection { map, difficulty })
+    }
+
+    fn ensure_default_difficulty(&mut self) {
+        if self.selected_difficulty.is_some() {
+            return;
+        }
+        self.selected_difficulty = self
+            .catalog
+            .enabled_difficulties()
+            .into_iter()
+            .next()
+            .cloned();
     }
 
     pub fn mark_in_game(&mut self) {
@@ -343,29 +355,38 @@ impl PregameCatalog {
             }],
             difficulties: vec![
                 DifficultyEntry {
-                    id: "easy".into(),
-                    label: "簡單".into(),
-                    description: "放鬆波次與寬裕經濟".into(),
-                    config: "easy".into(),
-                    reward: "1x 獎勵".into(),
+                    id: "novice".into(),
+                    label: "新手".into(),
+                    description: "塔價 70%，40 關".into(),
+                    config: "novice".into(),
+                    reward: String::new(),
                     image: None,
                     enabled: true,
                 },
                 DifficultyEntry {
-                    id: "medium".into(),
+                    id: "intermediate".into(),
                     label: "中級".into(),
-                    description: "標準平衡挑戰".into(),
-                    config: "medium".into(),
-                    reward: "1.25x 獎勵".into(),
+                    description: "塔價 80%，65 關".into(),
+                    config: "intermediate".into(),
+                    reward: String::new(),
                     image: None,
                     enabled: true,
                 },
                 DifficultyEntry {
-                    id: "hard".into(),
-                    label: "困難".into(),
-                    description: "經濟更緊，失誤空間更少".into(),
-                    config: "hard".into(),
-                    reward: "1.5x 獎勵".into(),
+                    id: "advanced".into(),
+                    label: "高級".into(),
+                    description: "塔價 90%，85 關".into(),
+                    config: "advanced".into(),
+                    reward: String::new(),
+                    image: None,
+                    enabled: true,
+                },
+                DifficultyEntry {
+                    id: "expert".into(),
+                    label: "專家".into(),
+                    description: "塔價 100%，100 關".into(),
+                    config: "expert".into(),
+                    reward: String::new(),
                     image: None,
                     enabled: true,
                 },
@@ -955,7 +976,7 @@ mod tests {
 
         assert_eq!(
             runtime.dispatch(&PregameAction::SelectDifficulty {
-                difficulty_id: "easy".to_string()
+                difficulty_id: "novice".to_string()
             }),
             None
         );
@@ -965,7 +986,7 @@ mod tests {
                 .selected_difficulty
                 .as_ref()
                 .map(|entry| entry.id.as_str()),
-            Some("easy")
+            Some("novice")
         );
 
         let selection = runtime
@@ -976,7 +997,25 @@ mod tests {
 
         assert!(matches!(runtime.state, PregameState::StartingSession));
         assert_eq!(selection.map.id, "td_1");
-        assert_eq!(selection.difficulty.id, "easy");
+        assert_eq!(selection.difficulty.id, "novice");
+    }
+
+    #[test]
+    fn map_select_defaults_to_first_enabled_difficulty() {
+        let mut runtime = PregameRuntime::new_for_menu(PregameCatalog::fallback());
+
+        runtime.dispatch(&PregameAction::Navigate {
+            target: "map_select".to_string(),
+        });
+
+        assert!(matches!(runtime.state, PregameState::MapSelect));
+        assert_eq!(
+            runtime
+                .selected_difficulty
+                .as_ref()
+                .map(|entry| entry.id.as_str()),
+            Some("novice")
+        );
     }
 
     #[test]
@@ -986,7 +1025,7 @@ mod tests {
             target: "difficulty_select".to_string(),
         });
         runtime.dispatch(&PregameAction::SelectDifficulty {
-            difficulty_id: "easy".to_string(),
+            difficulty_id: "novice".to_string(),
         });
         runtime.selected_map = Some(runtime.catalog.enabled_maps()[0].clone());
 
@@ -999,7 +1038,7 @@ mod tests {
                 .selected_difficulty
                 .as_ref()
                 .map(|entry| entry.id.as_str()),
-            Some("easy")
+            Some("novice")
         );
     }
 
@@ -1014,8 +1053,25 @@ mod tests {
             .widgets
             .iter()
             .any(|widget| widget.label == "開始"));
-        assert_eq!(catalog.difficulty("easy").unwrap().label, "簡單");
-        assert_eq!(catalog.difficulty("medium").unwrap().label, "中級");
-        assert_eq!(catalog.difficulty("hard").unwrap().label, "困難");
+        let difficulties: Vec<_> = catalog
+            .enabled_difficulties()
+            .into_iter()
+            .map(|difficulty| {
+                (
+                    difficulty.id.as_str(),
+                    difficulty.label.as_str(),
+                    difficulty.config_value(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            difficulties,
+            vec![
+                ("novice", "新手", "novice"),
+                ("intermediate", "中級", "intermediate"),
+                ("advanced", "高級", "advanced"),
+                ("expert", "專家", "expert"),
+            ]
+        );
     }
 }
