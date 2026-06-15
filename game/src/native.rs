@@ -753,10 +753,48 @@ fn pregame_button_text(label: &str, description: &str, active: bool, button_w: f
     lines.join("\n")
 }
 
+fn pregame_ref_rect(window_size: Vector2<f32>, x: f32, y: f32, w: f32, h: f32) -> UiRect {
+    let scale = (window_size.x / 2048.0)
+        .min(window_size.y / 1152.0)
+        .max(0.01);
+    let content_w = 2048.0 * scale;
+    let content_h = 1152.0 * scale;
+    UiRect {
+        x: (window_size.x - content_w) * 0.5 + x * scale,
+        y: (window_size.y - content_h) * 0.5 + y * scale,
+        w: w * scale,
+        h: h * scale,
+    }
+}
+
+fn pregame_button_label(label: &str, description: &str, active: bool) -> String {
+    let mut lines = vec![label.trim().to_string()];
+    if !description.trim().is_empty() {
+        lines.push(description.trim().to_string());
+    }
+    if !active {
+        lines.push("鎖定".to_string());
+    }
+    lines.join("\n")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PregameVisualRole {
+    Button,
+    Decoration,
+}
+
+impl Default for PregameVisualRole {
+    fn default() -> Self {
+        Self::Button
+    }
+}
+
 #[derive(Debug, Default)]
 struct PregameButtonUi {
     bg: Handle<UiNode>,
     text: Handle<Text>,
+    role: PregameVisualRole,
 }
 
 #[derive(Debug, Default)]
@@ -3921,7 +3959,7 @@ impl Plugin for Game {
         .with_horizontal_text_alignment(HorizontalAlignment::Center)
         .build(&mut ui.build_ctx());
         self.ui_pregame.buttons.clear();
-        for _ in 0..12 {
+        for _ in 0..32 {
             let bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -3945,7 +3983,11 @@ impl Plugin for Game {
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
-            self.ui_pregame.buttons.push(PregameButtonUi { bg, text });
+            self.ui_pregame.buttons.push(PregameButtonUi {
+                bg,
+                text,
+                role: PregameVisualRole::Button,
+            });
         }
 
         apply_frontend_runtime_env_from_config();
@@ -8944,7 +8986,7 @@ impl Game {
                 .unwrap_or_default(),
             pregame::PregameState::MapSelect => {
                 let mut buttons = vec![(
-                    "Back".to_string(),
+                    "返回".to_string(),
                     String::new(),
                     true,
                     pregame::PregameAction::Back,
@@ -8963,11 +9005,23 @@ impl Game {
                         },
                     )
                 }));
+                buttons.extend(self.pregame_runtime.catalog.difficulties.iter().map(
+                    |difficulty| {
+                        (
+                            difficulty.label.clone(),
+                            difficulty.description.clone(),
+                            difficulty.enabled,
+                            pregame::PregameAction::SelectDifficulty {
+                                difficulty_id: difficulty.id.clone(),
+                            },
+                        )
+                    },
+                ));
                 buttons
             }
             pregame::PregameState::DifficultySelect => {
                 let mut buttons = vec![(
-                    "Back".to_string(),
+                    "返回".to_string(),
                     String::new(),
                     true,
                     pregame::PregameAction::Back,
@@ -8991,13 +9045,13 @@ impl Game {
                 buttons
             }
             pregame::PregameState::StartingSession => vec![(
-                "Starting...".to_string(),
-                "Please wait".to_string(),
+                "啟動中...".to_string(),
+                "請稍候".to_string(),
                 false,
                 pregame::PregameAction::NoOp,
             )],
             pregame::PregameState::SessionEnded => vec![(
-                "Back to Menu".to_string(),
+                "返回選單".to_string(),
                 String::new(),
                 true,
                 pregame::PregameAction::Back,
@@ -9028,6 +9082,329 @@ impl Game {
         true
     }
 
+    fn place_pregame_node(
+        &mut self,
+        ui: &mut UserInterface,
+        index: &mut usize,
+        rect: UiRect,
+        text: String,
+        active: bool,
+        action: pregame::PregameAction,
+        role: PregameVisualRole,
+        bg_color: Color,
+        fg_color: Color,
+    ) {
+        if *index >= self.ui_pregame.buttons.len() {
+            return;
+        }
+        let node = &mut self.ui_pregame.buttons[*index];
+        node.role = role;
+        ui.send(node.bg, WidgetMessage::DesiredPosition(rect.pos()));
+        ui.send(node.bg, WidgetMessage::Width(rect.w));
+        ui.send(node.bg, WidgetMessage::Height(rect.h));
+        ui.send(
+            node.bg,
+            WidgetMessage::Background(Brush::Solid(bg_color).into()),
+        );
+        ui.send(
+            node.text,
+            WidgetMessage::DesiredPosition(Vector2::new(rect.x + 8.0, rect.y + 4.0)),
+        );
+        ui.send(node.text, WidgetMessage::Width((rect.w - 16.0).max(1.0)));
+        ui.send(node.text, WidgetMessage::Height((rect.h - 8.0).max(1.0)));
+        ui.send(
+            node.text,
+            WidgetMessage::Foreground(Brush::Solid(fg_color).into()),
+        );
+        ui.send(node.text, TextMessage::Text(text));
+        if active {
+            self.pregame_button_rects.push((rect, action));
+        }
+        *index += 1;
+    }
+
+    fn hide_unused_pregame_nodes(&mut self, ui: &mut UserInterface, used: usize) {
+        for button in self.ui_pregame.buttons.iter_mut().skip(used) {
+            button.role = PregameVisualRole::Button;
+            ui.send(
+                button.bg,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+            ui.send(
+                button.text,
+                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+            );
+            ui.send(button.text, TextMessage::Text(String::new()));
+        }
+    }
+
+    fn layout_pregame_home(&mut self, ui: &mut UserInterface, node_index: &mut usize) {
+        let deco = [
+            (
+                pregame_ref_rect(self.window_size, 250.0, 245.0, 190.0, 170.0),
+                "",
+                Color::from_rgba(190, 100, 25, 255),
+            ),
+            (
+                pregame_ref_rect(self.window_size, 1510.0, 260.0, 190.0, 170.0),
+                "",
+                Color::from_rgba(205, 120, 30, 255),
+            ),
+            (
+                pregame_ref_rect(self.window_size, 920.0, 365.0, 210.0, 210.0),
+                "神像",
+                Color::from_rgba(210, 200, 172, 255),
+            ),
+            (
+                pregame_ref_rect(self.window_size, 160.0, 650.0, 260.0, 80.0),
+                "",
+                Color::from_rgba(80, 190, 80, 255),
+            ),
+            (
+                pregame_ref_rect(self.window_size, 1470.0, 650.0, 260.0, 80.0),
+                "",
+                Color::from_rgba(80, 190, 80, 255),
+            ),
+        ];
+        for (rect, text, color) in deco {
+            self.place_pregame_node(
+                ui,
+                node_index,
+                rect,
+                text.to_string(),
+                false,
+                pregame::PregameAction::NoOp,
+                PregameVisualRole::Decoration,
+                color,
+                Color::from_rgba(82, 65, 48, 255),
+            );
+        }
+
+        let utility = [
+            ("設定", 28.0, 185.0, Color::from_rgba(35, 195, 235, 255)),
+            ("任務", 28.0, 325.0, Color::from_rgba(245, 190, 30, 255)),
+            ("商店", 28.0, 465.0, Color::from_rgba(230, 75, 48, 255)),
+        ];
+        for (label, x, y, color) in utility {
+            self.place_pregame_node(
+                ui,
+                node_index,
+                pregame_ref_rect(self.window_size, x, y, 96.0, 96.0),
+                label.to_string(),
+                false,
+                pregame::PregameAction::NoOp,
+                PregameVisualRole::Button,
+                color,
+                Color::from_rgba(255, 255, 255, 255),
+            );
+        }
+
+        let widgets = self
+            .pregame_runtime
+            .catalog
+            .screen("main_menu")
+            .map(|screen| screen.widgets.clone())
+            .unwrap_or_default();
+        let start = widgets.iter().find(|widget| widget.id == "start");
+        let side_widgets: Vec<_> = widgets
+            .iter()
+            .filter(|widget| widget.id != "start")
+            .take(2)
+            .collect();
+        let nav = [
+            (
+                side_widgets
+                    .get(0)
+                    .map(|widget| widget.label.as_str())
+                    .unwrap_or("英雄"),
+                pregame_ref_rect(self.window_size, 470.0, 930.0, 210.0, 132.0),
+                side_widgets
+                    .get(0)
+                    .map(|widget| widget.action.clone())
+                    .unwrap_or(pregame::PregameAction::NoOp),
+                side_widgets
+                    .get(0)
+                    .map(|widget| widget.is_active())
+                    .unwrap_or(false),
+                Color::from_rgba(238, 145, 38, 255),
+            ),
+            (
+                start.map(|widget| widget.label.as_str()).unwrap_or("開始"),
+                pregame_ref_rect(self.window_size, 900.0, 866.0, 248.0, 190.0),
+                start.map(|widget| widget.action.clone()).unwrap_or(
+                    pregame::PregameAction::Navigate {
+                        target: "difficulty_select".to_string(),
+                    },
+                ),
+                start.map(|widget| widget.is_active()).unwrap_or(true),
+                Color::from_rgba(50, 225, 35, 255),
+            ),
+            (
+                side_widgets
+                    .get(1)
+                    .map(|widget| widget.label.as_str())
+                    .unwrap_or("知識"),
+                pregame_ref_rect(self.window_size, 1368.0, 930.0, 210.0, 132.0),
+                side_widgets
+                    .get(1)
+                    .map(|widget| widget.action.clone())
+                    .unwrap_or(pregame::PregameAction::NoOp),
+                side_widgets
+                    .get(1)
+                    .map(|widget| widget.is_active())
+                    .unwrap_or(false),
+                Color::from_rgba(250, 185, 30, 255),
+            ),
+        ];
+        for (label, rect, action, active, color) in nav {
+            self.place_pregame_node(
+                ui,
+                node_index,
+                rect,
+                label.to_string(),
+                active,
+                action,
+                PregameVisualRole::Button,
+                color,
+                Color::from_rgba(255, 255, 255, 255),
+            );
+        }
+    }
+
+    fn layout_pregame_difficulty(&mut self, ui: &mut UserInterface, node_index: &mut usize) {
+        self.place_pregame_node(
+            ui,
+            node_index,
+            pregame_ref_rect(self.window_size, 36.0, 28.0, 96.0, 96.0),
+            "←\n返回".to_string(),
+            true,
+            pregame::PregameAction::Back,
+            PregameVisualRole::Button,
+            Color::from_rgba(35, 195, 235, 255),
+            Color::from_rgba(255, 255, 255, 255),
+        );
+
+        let rects = [
+            (560.0, 430.0, 280.0, 190.0),
+            (884.0, 390.0, 280.0, 190.0),
+            (1208.0, 430.0, 280.0, 190.0),
+        ];
+        let difficulties = self.pregame_runtime.catalog.difficulties.clone();
+        for (difficulty, (x, y, w, h)) in difficulties.iter().zip(rects) {
+            let reward = if difficulty.reward.trim().is_empty() {
+                String::new()
+            } else {
+                format!("獎勵：{}", difficulty.reward)
+            };
+            self.place_pregame_node(
+                ui,
+                node_index,
+                pregame_ref_rect(self.window_size, x, y, w, h),
+                pregame_button_label(&difficulty.label, &reward, difficulty.enabled),
+                difficulty.enabled,
+                pregame::PregameAction::SelectDifficulty {
+                    difficulty_id: difficulty.id.clone(),
+                },
+                PregameVisualRole::Button,
+                Color::from_rgba(195, 150, 80, 255),
+                Color::from_rgba(255, 255, 255, 255),
+            );
+        }
+
+        self.place_pregame_node(
+            ui,
+            node_index,
+            pregame_ref_rect(self.window_size, 42.0, 965.0, 160.0, 120.0),
+            "更換英雄".to_string(),
+            false,
+            pregame::PregameAction::NoOp,
+            PregameVisualRole::Button,
+            Color::from_rgba(245, 145, 35, 255),
+            Color::from_rgba(255, 255, 255, 255),
+        );
+    }
+
+    fn layout_pregame_maps(&mut self, ui: &mut UserInterface, node_index: &mut usize) {
+        self.place_pregame_node(
+            ui,
+            node_index,
+            pregame_ref_rect(self.window_size, 36.0, 28.0, 96.0, 96.0),
+            "←\n返回".to_string(),
+            true,
+            pregame::PregameAction::Back,
+            PregameVisualRole::Button,
+            Color::from_rgba(35, 195, 235, 255),
+            Color::from_rgba(255, 255, 255, 255),
+        );
+
+        let rects = [
+            (370.0, 135.0, 380.0, 170.0),
+            (834.0, 135.0, 380.0, 170.0),
+            (1298.0, 135.0, 380.0, 170.0),
+            (370.0, 470.0, 380.0, 170.0),
+            (834.0, 470.0, 380.0, 170.0),
+            (1298.0, 470.0, 380.0, 170.0),
+        ];
+        let maps = self.pregame_runtime.catalog.maps.clone();
+        for (map, (x, y, w, h)) in maps.iter().take(6).zip(rects) {
+            let description = if map.reward.trim().is_empty() {
+                map.description.clone()
+            } else {
+                format!("{}\n{}", map.description, map.reward)
+            };
+            self.place_pregame_node(
+                ui,
+                node_index,
+                pregame_ref_rect(self.window_size, x, y, w, h),
+                pregame_button_label(&map.label, &description, map.is_playable()),
+                map.is_playable(),
+                pregame::PregameAction::SelectMap {
+                    map_id: map.id.clone(),
+                },
+                PregameVisualRole::Button,
+                if map.is_playable() {
+                    Color::from_rgba(194, 154, 93, 255)
+                } else {
+                    Color::from_rgba(125, 105, 82, 230)
+                },
+                Color::from_rgba(255, 255, 255, 255),
+            );
+        }
+
+        let difficulties = self.pregame_runtime.catalog.difficulties.clone();
+        let selected_difficulty_id = self
+            .pregame_runtime
+            .selected_difficulty
+            .as_ref()
+            .map(|difficulty| difficulty.id.clone());
+        for (i, difficulty) in difficulties.iter().take(4).enumerate() {
+            let selected = selected_difficulty_id.as_deref() == Some(difficulty.id.as_str());
+            self.place_pregame_node(
+                ui,
+                node_index,
+                pregame_ref_rect(
+                    self.window_size,
+                    540.0 + i as f32 * 260.0,
+                    970.0,
+                    170.0,
+                    96.0,
+                ),
+                difficulty.label.clone(),
+                difficulty.enabled,
+                pregame::PregameAction::SelectDifficulty {
+                    difficulty_id: difficulty.id.clone(),
+                },
+                PregameVisualRole::Button,
+                if selected {
+                    Color::from_rgba(245, 195, 40, 255)
+                } else {
+                    Color::from_rgba(35, 170, 205, 255)
+                },
+                Color::from_rgba(255, 255, 255, 255),
+            );
+        }
+    }
+
     fn update_pregame_ui(&mut self, ui: &mut UserInterface) {
         self.hide_gameplay_ui_for_pregame(ui);
 
@@ -9037,7 +9414,7 @@ impl Game {
             .catalog
             .screen(screen_id)
             .map(|screen| screen.title.clone())
-            .unwrap_or_else(|| "Open MOBA TD".to_string());
+            .unwrap_or_else(|| "Omoba 塔防".to_string());
         let subtitle = self
             .pregame_runtime
             .catalog
@@ -9056,40 +9433,25 @@ impl Game {
         );
         ui.send(self.ui_pregame.background, WidgetMessage::Width(full.w));
         ui.send(self.ui_pregame.background, WidgetMessage::Height(full.h));
+        ui.send(
+            self.ui_pregame.background,
+            WidgetMessage::Background(
+                Brush::Solid(match self.pregame_runtime.state {
+                    pregame::PregameState::MainMenu => Color::from_rgba(112, 211, 154, 255),
+                    _ => Color::from_rgba(12, 91, 92, 238),
+                })
+                .into(),
+            ),
+        );
 
-        let buttons = self.current_pregame_buttons();
-        let compact = self.window_size.y < 620.0;
-        let cols = if buttons.len() >= 3 && self.window_size.x >= 900.0 {
-            2
-        } else {
-            1
-        };
-        let rows = if buttons.is_empty() {
-            0
-        } else {
-            (buttons.len() + cols - 1) / cols
-        };
-        let button_h = if compact { 88.0 } else { 106.0 };
-        let gap_x = 24.0;
-        let gap_y = if compact { 12.0 } else { 18.0 };
-        let top_pad = if compact { 22.0 } else { 30.0 };
-        let title_h = if compact { 46.0 } else { 58.0 };
-        let subtitle_h = if compact { 30.0 } else { 38.0 };
-        let start_offset = top_pad + title_h + subtitle_h + if compact { 22.0 } else { 34.0 };
-        let buttons_h = rows as f32 * button_h + rows.saturating_sub(1) as f32 * gap_y;
-        let status_h = 30.0;
-        let bottom_pad = if compact { 22.0 } else { 34.0 };
-        let required_panel_h = start_offset + buttons_h + status_h + bottom_pad + 18.0;
-        let max_panel_h = (self.window_size.y - if compact { 24.0 } else { 48.0 }).max(360.0);
-        let panel_w = (self.window_size.x * 0.82).clamp(600.0, 1080.0);
-        let panel_h = (self.window_size.y * 0.76)
-            .max(required_panel_h)
-            .clamp(430.0, max_panel_h.min(780.0));
-        let panel = UiRect {
-            x: (self.window_size.x - panel_w) * 0.5,
-            y: (self.window_size.y - panel_h) * 0.47,
-            w: panel_w,
-            h: panel_h,
+        let panel = match self.pregame_runtime.state {
+            pregame::PregameState::MainMenu => full,
+            _ => UiRect {
+                x: full.w * 0.08,
+                y: full.h * 0.08,
+                w: full.w * 0.84,
+                h: full.h * 0.84,
+            },
         };
         ui.send(
             self.ui_pregame.panel,
@@ -9097,12 +9459,22 @@ impl Game {
         );
         ui.send(self.ui_pregame.panel, WidgetMessage::Width(panel.w));
         ui.send(self.ui_pregame.panel, WidgetMessage::Height(panel.h));
+        ui.send(
+            self.ui_pregame.panel,
+            WidgetMessage::Background(
+                Brush::Solid(match self.pregame_runtime.state {
+                    pregame::PregameState::MainMenu => Color::from_rgba(125, 221, 116, 0),
+                    _ => Color::from_rgba(0, 38, 42, 96),
+                })
+                .into(),
+            ),
+        );
 
         let title_rect = UiRect {
-            x: panel.x + 36.0,
-            y: panel.y + top_pad,
-            w: panel.w - 72.0,
-            h: title_h,
+            x: full.x + full.w * 0.18,
+            y: full.y + full.h * 0.04,
+            w: full.w * 0.64,
+            h: 64.0,
         };
         ui.send(
             self.ui_pregame.title,
@@ -9111,10 +9483,10 @@ impl Game {
         ui.send(self.ui_pregame.title, WidgetMessage::Width(title_rect.w));
         ui.send(self.ui_pregame.title, TextMessage::Text(title));
         let subtitle_rect = UiRect {
-            x: panel.x + 48.0,
-            y: title_rect.bottom() + 8.0,
-            w: panel.w - 96.0,
-            h: subtitle_h,
+            x: full.x + full.w * 0.22,
+            y: title_rect.bottom() + 2.0,
+            w: full.w * 0.56,
+            h: 36.0,
         };
         ui.send(
             self.ui_pregame.subtitle,
@@ -9128,10 +9500,10 @@ impl Game {
 
         let status = self.pregame_runtime.last_error.clone().unwrap_or_default();
         let status_rect = UiRect {
-            x: panel.x + 48.0,
-            y: panel.bottom() - status_h - 14.0,
-            w: panel.w - 96.0,
-            h: status_h,
+            x: full.x + full.w * 0.18,
+            y: full.bottom() - 42.0,
+            w: full.w * 0.64,
+            h: 30.0,
         };
         ui.send(
             self.ui_pregame.status,
@@ -9141,54 +9513,35 @@ impl Game {
         ui.send(self.ui_pregame.status, TextMessage::Text(status));
 
         self.pregame_button_rects.clear();
-        let button_w = if cols == 2 {
-            ((panel.w - 128.0) * 0.5).clamp(280.0, 450.0)
-        } else {
-            (panel.w - 120.0).clamp(320.0, 560.0)
-        };
-        let start_y = panel.y + start_offset;
-        for (i, (label, description, active, action)) in buttons.iter().enumerate() {
-            if i >= self.ui_pregame.buttons.len() {
-                break;
+        let mut node_index = 0;
+        match self.pregame_runtime.state {
+            pregame::PregameState::MainMenu => {
+                self.layout_pregame_home(ui, &mut node_index);
             }
-            let col = i % cols;
-            let row = i / cols;
-            let total_w = button_w * cols as f32 + gap_x * (cols.saturating_sub(1)) as f32;
-            let x = panel.x + (panel.w - total_w) * 0.5 + col as f32 * (button_w + gap_x);
-            let y = start_y + row as f32 * (button_h + gap_y);
-            let rect = UiRect {
-                x,
-                y,
-                w: button_w,
-                h: button_h,
-            };
-            let button = &self.ui_pregame.buttons[i];
-            ui.send(button.bg, WidgetMessage::DesiredPosition(rect.pos()));
-            ui.send(button.bg, WidgetMessage::Width(rect.w));
-            ui.send(button.bg, WidgetMessage::Height(rect.h));
-            ui.send(
-                button.text,
-                WidgetMessage::DesiredPosition(Vector2::new(rect.x + 18.0, rect.y + 8.0)),
-            );
-            ui.send(button.text, WidgetMessage::Width(rect.w - 36.0));
-            ui.send(button.text, WidgetMessage::Height(rect.h - 16.0));
-            let text = pregame_button_text(label, description, *active, rect.w - 36.0);
-            ui.send(button.text, TextMessage::Text(text));
-            if *active {
-                self.pregame_button_rects.push((rect, action.clone()));
+            pregame::PregameState::DifficultySelect => {
+                self.layout_pregame_difficulty(ui, &mut node_index);
             }
+            pregame::PregameState::MapSelect => {
+                self.layout_pregame_maps(ui, &mut node_index);
+            }
+            pregame::PregameState::StartingSession | pregame::PregameState::SessionEnded => {
+                for (label, description, active, action) in self.current_pregame_buttons() {
+                    self.place_pregame_node(
+                        ui,
+                        &mut node_index,
+                        pregame_ref_rect(self.window_size, 744.0, 520.0, 560.0, 120.0),
+                        pregame_button_label(&label, &description, active),
+                        active,
+                        action,
+                        PregameVisualRole::Button,
+                        Color::from_rgba(245, 178, 54, 255),
+                        Color::from_rgba(255, 255, 255, 255),
+                    );
+                }
+            }
+            pregame::PregameState::InGame => {}
         }
-        for i in buttons.len()..self.ui_pregame.buttons.len() {
-            let button = &self.ui_pregame.buttons[i];
-            ui.send(
-                button.bg,
-                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
-            );
-            ui.send(
-                button.text,
-                WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
-            );
-        }
+        self.hide_unused_pregame_nodes(ui, node_index);
     }
 
     fn hide_gameplay_ui_for_pregame(&mut self, ui: &mut UserInterface) {
@@ -12145,27 +12498,41 @@ mod input_latency_tests {
 
         let main = game.current_pregame_buttons();
         assert!(main.iter().any(|(label, _, active, action)| {
-            label == "Start"
+            label == "開始"
                 && *active
-                && matches!(action, pregame::PregameAction::Navigate { target } if target == "map_select")
-        }));
-
-        game.pregame_runtime.state = pregame::PregameState::MapSelect;
-        let maps = game.current_pregame_buttons();
-        assert!(matches!(maps[0].3, pregame::PregameAction::Back));
-        assert!(maps.iter().any(|(label, _, active, action)| {
-            label == "Green Crossing"
-                && *active
-                && matches!(action, pregame::PregameAction::SelectMap { map_id } if map_id == "td_1")
+                && matches!(action, pregame::PregameAction::Navigate { target } if target == "difficulty_select")
         }));
 
         game.pregame_runtime.state = pregame::PregameState::DifficultySelect;
         let difficulties = game.current_pregame_buttons();
         assert!(matches!(difficulties[0].3, pregame::PregameAction::Back));
+        assert_eq!(difficulties[0].0, "返回");
         assert!(difficulties.iter().any(|(label, _, active, action)| {
-            label == "Easy"
+            label == "新手"
                 && *active
-                && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "easy")
+                && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "novice")
+        }));
+
+        game.pregame_runtime.selected_difficulty = Some(
+            game.pregame_runtime
+                .catalog
+                .difficulty("novice")
+                .unwrap()
+                .clone(),
+        );
+        game.pregame_runtime.state = pregame::PregameState::MapSelect;
+        let maps = game.current_pregame_buttons();
+        assert!(matches!(maps[0].3, pregame::PregameAction::Back));
+        assert_eq!(maps[0].0, "返回");
+        assert!(maps.iter().any(|(label, _, active, action)| {
+            label == "綠野路口"
+                && *active
+                && matches!(action, pregame::PregameAction::SelectMap { map_id } if map_id == "td_1")
+        }));
+        assert!(maps.iter().any(|(label, _, active, action)| {
+            label == "高級"
+                && *active
+                && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "advanced")
         }));
     }
 
@@ -12181,8 +12548,8 @@ mod input_latency_tests {
 
         assert_eq!(selection.map.id, "td_1");
         assert_eq!(selection.map.story_id(), "TD_1");
-        assert_eq!(selection.difficulty.id, "easy");
-        assert_eq!(selection.difficulty.config_value(), "easy");
+        assert_eq!(selection.difficulty.id, "novice");
+        assert_eq!(selection.difficulty.config_value(), "novice");
     }
 
     #[test]
@@ -12197,8 +12564,8 @@ mod input_latency_tests {
         assert_eq!(config.session_id, "session-test");
         assert_eq!(config.map_id, "td_1");
         assert_eq!(config.story, "TD_1");
-        assert_eq!(config.difficulty_id, "easy");
-        assert_eq!(config.difficulty_config, "easy");
+        assert_eq!(config.difficulty_id, "novice");
+        assert_eq!(config.difficulty_config, "novice");
         assert!(!config.kcp_addr.trim().is_empty());
     }
 
@@ -12215,14 +12582,14 @@ mod input_latency_tests {
                 h: 50.0,
             },
             pregame::PregameAction::Navigate {
-                target: "map_select".to_string(),
+                target: "difficulty_select".to_string(),
             },
         ));
 
         assert!(game.handle_pregame_click(Vector2::new(40.0, 40.0)));
         assert!(matches!(
             game.pregame_runtime.state,
-            pregame::PregameState::MapSelect
+            pregame::PregameState::DifficultySelect
         ));
         assert!(game.lockstep_handle.is_none());
         assert!(game.sim_runner_handle.is_none());
