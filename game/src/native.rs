@@ -1544,6 +1544,14 @@ fn hero_animation_playback_speed(base_speed: f32, is_paused: bool) -> f32 {
     }
 }
 
+fn tower_animation_dt(dt: f32, is_paused: bool) -> f32 {
+    if is_paused {
+        0.0
+    } else {
+        dt.max(0.0)
+    }
+}
+
 fn select_retargeted_animation_by_duration(
     scene: &Scene,
     player: Handle<Node>,
@@ -10420,6 +10428,7 @@ impl Game {
         attack_cue: Option<&sim_runner::AttackPhaseFx>,
         fire_cue: Option<&sim_runner::TowerFireFx>,
     ) {
+        let animation_dt = tower_animation_dt(dt, self.is_game_paused);
         let upgrade_levels = entity.upgrade_levels.unwrap_or([0; 3]);
         let selected_variant = self.selected_barrel_variant(tpl, upgrade_levels);
         let is_animated_area = tpl.render_mode == "animated_area";
@@ -10637,7 +10646,7 @@ impl Game {
                             comp.barrel_material_key = Some(key);
                         }
                     }
-                    anim.elapsed += dt.max(0.0);
+                    anim.elapsed += animation_dt;
                     if anim.fire_once && anim.elapsed >= total_duration {
                         if animation_meta.loop_animation && active_frames.len() > 1 {
                             *anim = TowerAnimationState {
@@ -10676,7 +10685,7 @@ impl Game {
                     let dir = tower_render_dir_from_world_rad(recoil.dir_rad);
                     recoil_offset = -dir * (tpl.recoil.distance * WORLD_SCALE * amount);
                 }
-                recoil.elapsed += dt.max(0.0);
+                recoil.elapsed += animation_dt;
                 if recoil.elapsed >= total {
                     comp.recoil = None;
                 }
@@ -12631,6 +12640,12 @@ mod input_latency_tests {
     fn hero_animation_playback_speed_freezes_only_while_paused() {
         assert_eq!(hero_animation_playback_speed(1.25, true), 0.0);
         assert_eq!(hero_animation_playback_speed(1.25, false), 1.25);
+    }
+
+    #[test]
+    fn tower_animation_dt_freezes_only_while_paused() {
+        assert_eq!(tower_animation_dt(0.25, true), 0.0);
+        assert_eq!(tower_animation_dt(0.25, false), 0.25);
     }
 
     #[test]
