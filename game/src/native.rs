@@ -5678,9 +5678,15 @@ impl Plugin for Game {
                     self.ui_td_right_panel.title_text,
                     WidgetMessage::Width(title.w),
                 );
+                let shop_title = self
+                    .selected_tower_kind
+                    .as_ref()
+                    .and_then(|k| self.td_templates.get(k))
+                    .map(|tpl| tpl.label.clone())
+                    .unwrap_or_else(|| "塔商店".to_string());
                 ui.send(
                     self.ui_td_right_panel.title_text,
-                    TextMessage::Text("塔商店".to_string()),
+                    TextMessage::Text(shop_title),
                 );
 
                 let shop_viewport_y_ref = 170.0f32;
@@ -6134,8 +6140,8 @@ impl Plugin for Game {
                     let selected_x = self
                         .selected_tower_screen_x()
                         .unwrap_or(self.window_size.x * 0.5);
-                    let anchor_x_ref: f32 = 24.0;
                     let ws = self.window_size;
+                    let anchor_x_ref: f32 = if selected_x < ws.x * 0.5 { 1170.0 } else { 24.0 };
                     let rr = |dx: f32, dy: f32, w: f32, h: f32| -> UiRect {
                         td_ui_ref_rect(ws, anchor_x_ref + dx, 45.0 + dy, w, h)
                     };
