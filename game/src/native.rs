@@ -2304,6 +2304,12 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     tower_composites: HashMap<u32, TowerCompositeRender>,
+    /// 每 render frame 累積的塔台動畫 dt（在 sim tick guard 之外累積，
+    /// tick 變化時一次性取用，確保動畫以正確速度播放而非 ~50% 速度）。
+    /// f32 默認為 0.0，不需要額外初始化。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_anim_dt_acc: f32,
     /// 已處理過的 render-only tower fire cue keys。sim snapshot 會短暫保留 FX，
     /// 所以必須以 cue identity 去重，不能只看 snapshot tick。
     #[visit(skip)]
@@ -4996,6 +5002,8 @@ impl Plugin for Game {
         // 早期的 4.2 render_bridge — 每個實體曾經是單獨的場景
         // 節點 = 單獨的繪製呼叫（1000 個實體→ 3000+ 繪製）。現在的
         // 整個實體集經歷 2-3 個批次網格 = 總共 2-3 個繪製。
+        // 每 render frame 累積動畫時間，確保 sim tick guard 不會讓動畫只跑 ~50% 速度。
+        self.tower_anim_dt_acc += tower_animation_dt(context.dt, self.is_game_paused);
         self.update_sim_batches(scene, &context.resource_manager, context.dt);
 
         // Batched mesh flush：interp loop 寫進各 batch 的 cpu_mirror，這裡一次性
@@ -10594,32 +10602,8 @@ impl Game {
                 comp.last_aim_direction
             };
 
-            if comp.animation.is_none() && animation_meta.loop_animation && active_frames.len() > 1
-            {
-                comp.animation = Some(TowerAnimationState {
-                    frames: active_frames.clone(),
-                    elapsed: 0.0,
-                    fps: animation_meta.fps.max(1.0),
-                    fire_once: false,
-                    active: false,
-                    last_frame_index: usize::MAX,
-                });
-            }
-            if comp
-                .animation
-                .as_ref()
-                .map(|a| !a.active && a.frames != active_frames && animation_meta.loop_animation)
-                .unwrap_or(false)
-            {
-                comp.animation = Some(TowerAnimationState {
-                    frames: active_frames.clone(),
-                    elapsed: 0.0,
-                    fps: animation_meta.fps.max(1.0),
-                    fire_once: false,
-                    active: false,
-                    last_frame_index: usize::MAX,
-                });
-            }
+            // 待機循環動畫已停用：砲管只在攻擊 cue 到達時才播放，
+            // 範圍內無敵人時砲管保持靜止。
 
             if let Some(anim) = comp.animation.as_mut() {
                 if !anim.frames.is_empty() {
@@ -10648,23 +10632,23 @@ impl Game {
                         if is_animated_area {
                             comp.base_material_key = key.clone();
                             comp.body_material_key = Some(key);
-                        } else {
-                            comp.barrel_material_key = Some(key);
                         }
+                        // 注意：barrel_material_key 不在這裡更新——
+                        // 它追蹤靜態砲管/variant 圖片鍵，用於偵測 variant 切換，
+                        // 若被動畫幀鍵覆蓋，下一 tick 的 variant 檢查會誤判變動，
+                        // 並重置 animation = None，中斷動畫。
                     }
                     anim.elapsed += animation_dt;
                     if anim.fire_once && anim.elapsed >= total_duration {
-                        if animation_meta.loop_animation && active_frames.len() > 1 {
-                            *anim = TowerAnimationState {
-                                frames: active_frames.clone(),
-                                elapsed: 0.0,
-                                fps: animation_meta.fps.max(1.0),
-                                fire_once: false,
-                                active: false,
-                                last_frame_index: usize::MAX,
-                            };
-                        } else {
-                            comp.animation = None;
+                        comp.animation = None;
+                        // fire_once 播完後把砲管材質還原到靜止幀（barrel_image）。
+                        if !is_animated_area {
+                            let barrel_node = comp.barrel_node.unwrap_or(comp.base_node);
+                            post_material_updates.push((
+                                barrel_node,
+                                barrel_key.clone(),
+                                Color::from_rgba(35, 35, 35, 255),
+                            ));
                         }
                     }
                 }
@@ -10772,6 +10756,9 @@ impl Game {
             return;
         }
         self.sim_batches_last_snapshot_tick = Some(snapshot.tick);
+        // 取走自上次 tick 以來累積的動畫 dt（替換舊的 render frame dt，
+        // 使動畫以正確的 wall clock 速度播放）。
+        let sim_tick_anim_dt = std::mem::take(&mut self.tower_anim_dt_acc);
 
         self.sim_seen_attack_phase_fx
             .retain(|key| snapshot.tick.saturating_sub(key.2) <= RENDER_FX_SEEN_RETENTION_TICKS);
@@ -10830,7 +10817,7 @@ impl Game {
                     e,
                     tpl,
                     pos,
-                    dt,
+                    sim_tick_anim_dt,
                     attack_cues.get(&e.entity_id).copied(),
                     fire_cues.get(&e.entity_id).copied(),
                 );
