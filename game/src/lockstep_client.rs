@@ -228,7 +228,10 @@ async fn run_client(
             };
         }
 
-        info!("lockstep-client: connecting to {} (attempt {})", addr, attempt);
+        info!(
+            "lockstep-client: connecting to {} (attempt {})",
+            addr, attempt
+        );
 
         // 用新的 KcpClient，舊的 NetworkBridge 會有自己的。`connect`
         // 會附帶送出 SubscribeRequest；階段 2 在行為上可接受，

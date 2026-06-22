@@ -357,7 +357,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "novice".into(),
                     label: "新手".into(),
-                    description: "適合初次熟悉路線的地圖".into(),
+                    description: "200 HP，40 關，塔與升級價格 0.7 倍".into(),
                     config: "novice".into(),
                     reward: String::new(),
                     image: None,
@@ -366,7 +366,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "intermediate".into(),
                     label: "中級".into(),
-                    description: "路線與節奏更有挑戰的地圖".into(),
+                    description: "150 HP，65 關，塔與升級價格 0.8 倍".into(),
                     config: "intermediate".into(),
                     reward: String::new(),
                     image: None,
@@ -375,7 +375,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "advanced".into(),
                     label: "高級".into(),
-                    description: "複雜路線與更高壓力的地圖".into(),
+                    description: "125 HP，85 關，塔與升級價格 0.9 倍".into(),
                     config: "advanced".into(),
                     reward: String::new(),
                     image: None,
@@ -384,7 +384,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "expert".into(),
                     label: "專家".into(),
-                    description: "最高難度地圖分類".into(),
+                    description: "100 HP，100 關，塔與升級價格 1 倍".into(),
                     config: "expert".into(),
                     reward: String::new(),
                     image: None,

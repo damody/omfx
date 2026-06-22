@@ -468,11 +468,18 @@ fn run_sim_loop(
             let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
             dt.0 = omoba_sim::Fixed64::ZERO;
         } else {
+            let speed = world
+                .read_resource::<omoba_core::comp::resources::GameSpeed>()
+                .multiplier();
             let mut t = world.write_resource::<omoba_core::comp::resources::Time>();
-            t.0 = timing.ticks_to_seconds_f64(batch.tick);
+            t.0 += timing.dt_f64() * f64::from(speed);
             drop(t);
             let mut dt = world.write_resource::<omoba_core::comp::resources::DeltaTime>();
-            dt.0 = omoba_sim::Fixed64::from_raw(timing.fixed_raw_for_tick(batch.tick as u64));
+            dt.0 = omoba_sim::Fixed64::from_raw(
+                timing
+                    .fixed_raw_for_tick(batch.tick as u64)
+                    .saturating_mul(i64::from(speed)),
+            );
         }
         drop(input_apply_span);
 
