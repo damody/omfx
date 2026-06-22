@@ -326,6 +326,7 @@ pub enum InputActionKind {
     ItemUse,
     StartRound,
     TogglePause,
+    ToggleGameSpeed,
     MoveTo,
     AttackMove,
     AttackTarget,
@@ -345,6 +346,7 @@ impl InputActionKind {
             Some(Action::ItemUse(_)) => Self::ItemUse,
             Some(Action::StartRound(_)) => Self::StartRound,
             Some(Action::TogglePause(_)) => Self::TogglePause,
+            Some(Action::ToggleGameSpeed(_)) => Self::ToggleGameSpeed,
             Some(Action::MoveTo(_)) => Self::MoveTo,
             Some(Action::AttackMove(_)) => Self::AttackMove,
             Some(Action::AttackTarget(_)) => Self::AttackTarget,
@@ -829,15 +831,34 @@ fn td_start_control_label(
     round_is_running: bool,
     current_round: u32,
     total_rounds: u32,
+    game_speed_multiplier: u32,
 ) -> &'static str {
     if is_paused {
         "RESUME"
     } else if total_rounds > 0 && current_round >= total_rounds {
         "DONE"
+    } else if round_is_running && game_speed_multiplier >= 2 {
+        "2X"
     } else if round_is_running {
-        "RUNNING"
+        "1X"
     } else {
         "READY"
+    }
+}
+
+fn td_start_control_color(
+    is_paused: bool,
+    round_is_running: bool,
+    game_speed_multiplier: u32,
+) -> Color {
+    if is_paused {
+        Color::from_rgba(45, 100, 145, 255)
+    } else if round_is_running && game_speed_multiplier >= 2 {
+        Color::from_rgba(205, 90, 20, 255)
+    } else if round_is_running {
+        Color::from_rgba(35, 120, 55, 255)
+    } else {
+        Color::from_rgba(0, 80, 0, 255)
     }
 }
 
@@ -851,6 +872,29 @@ fn td_pause_control_label(is_paused: bool) -> &'static str {
 
 fn td_pause_control_opacity(is_paused: bool) -> Option<f32> {
     Some(if is_paused { 0.35 } else { 1.0 })
+}
+
+fn td_auto_start_checkbox_label(enabled: bool) -> String {
+    if enabled {
+        "[x] Auto".to_string()
+    } else {
+        "[ ] Auto".to_string()
+    }
+}
+
+fn td_should_auto_start_round(
+    auto_start_enabled: bool,
+    auto_start_sent_for_idle_round: bool,
+    is_paused: bool,
+    round_is_running: bool,
+    current_round: u32,
+    total_rounds: u32,
+) -> bool {
+    auto_start_enabled
+        && !auto_start_sent_for_idle_round
+        && !is_paused
+        && !round_is_running
+        && !(total_rounds > 0 && current_round >= total_rounds)
 }
 
 fn td_upgrade_effect_text(description: &str) -> String {
@@ -2190,10 +2234,18 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ui_start_round_button: Handle<Text>,
+    /// Auto-start checkbox text above the Start button.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_auto_start_checkbox_text: Handle<Text>,
     /// Start Round 按鈕 hit-test rect（每 frame 依 window_size 更新）。
     #[visit(skip)]
     #[reflect(hidden)]
     start_round_button_rect: (f32, f32, f32, f32),
+    /// Auto-start checkbox hit-test rect.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    auto_start_checkbox_rect: (f32, f32, f32, f32),
     /// Pause placeholder hit-test rect；目前只攔截點擊，不送 gameplay input。
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2215,6 +2267,18 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     is_game_paused: bool,
+    /// Lockstep-authoritative gameplay speed multiplier.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    game_speed_multiplier: u32,
+    /// Local UI preference: automatically start the next TD wave when idle.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_auto_start_enabled: bool,
+    /// Debounce auto-start so one idle wave receives one StartRound input.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    td_auto_start_sent_for_idle_round: bool,
     /// 是否為 TD 模式：由首次收到 hero.stats 有 lives>0 時設 true。
     /// 影響相機（固定不跟隨英雄）、zoom（拉遠讓整張路徑可見）。
     #[visit(skip)]
@@ -3864,7 +3928,18 @@ impl Plugin for Game {
             .with_text("▶ Start Round 1".to_string())
             .with_font_size(30.0.into())
             .build(&mut ui.build_ctx());
+            self.ui_td_auto_start_checkbox_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(-9999.0, -9999.0))
+                    .with_width(142.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(245, 245, 245, 220)).into()),
+            )
+            .with_text(td_auto_start_checkbox_label(false))
+            .with_font_size(24.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .build(&mut ui.build_ctx());
             self.start_round_button_rect = (-9999.0, -9999.0, 240.0, 48.0);
+            self.auto_start_checkbox_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
             self.pause_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         }
 
@@ -4412,6 +4487,33 @@ impl Plugin for Game {
                     self.total_rounds = snapshot.total_rounds;
                     self.round_is_running = snapshot.round_is_running;
                     self.is_game_paused = snapshot.is_paused;
+                    self.game_speed_multiplier = snapshot.game_speed_multiplier;
+                    if self.round_is_running {
+                        self.td_auto_start_sent_for_idle_round = false;
+                    }
+                    if td_should_auto_start_round(
+                        self.td_auto_start_enabled,
+                        self.td_auto_start_sent_for_idle_round,
+                        self.is_game_paused,
+                        self.round_is_running,
+                        self.current_round,
+                        self.total_rounds,
+                    ) {
+                        let input = omoba_core::kcp::game_proto::PlayerInput {
+                            action: Some(
+                                omoba_core::kcp::game_proto::player_input::Action::StartRound(
+                                    omoba_core::kcp::game_proto::StartRound {},
+                                ),
+                            ),
+                        };
+                        self.send_lockstep_input_from(
+                            input,
+                            lockstep_client::InputOriginKind::Auto,
+                            wall_clock_us(),
+                        );
+                        self.td_auto_start_sent_for_idle_round = true;
+                        log::info!("Auto Start Round → lockstep PlayerInput::StartRound sent");
+                    }
                     self.hero_state.lives = snapshot.lives;
 
                     // 階段 4.2：將模擬爆炸排入本地
@@ -6049,6 +6151,26 @@ impl Plugin for Game {
                 );
                 self.ui_td_right_panel.start_rect = start_rect;
                 self.start_round_button_rect = start_rect.tuple();
+                let auto_rect = td_ui_ref_rect(
+                    self.window_size,
+                    right_panel_x_ref + 190.0,
+                    900.0,
+                    142.0,
+                    32.0,
+                );
+                self.auto_start_checkbox_rect = auto_rect.tuple();
+                ui.send(
+                    self.ui_td_auto_start_checkbox_text,
+                    WidgetMessage::DesiredPosition(auto_rect.pos()),
+                );
+                ui.send(
+                    self.ui_td_auto_start_checkbox_text,
+                    WidgetMessage::Width(auto_rect.w),
+                );
+                ui.send(
+                    self.ui_td_auto_start_checkbox_text,
+                    TextMessage::Text(td_auto_start_checkbox_label(self.td_auto_start_enabled)),
+                );
                 ui.send(
                     self.ui_td_right_panel.start_icon,
                     WidgetMessage::DesiredPosition(start_rect.pos()),
@@ -6067,6 +6189,7 @@ impl Plugin for Game {
                         self.round_is_running,
                         self.current_round,
                         self.total_rounds,
+                        self.game_speed_multiplier,
                     );
                     ui.send(
                         self.ui_start_round_button,
@@ -6078,6 +6201,17 @@ impl Plugin for Game {
                     ui.send(
                         self.ui_start_round_button,
                         WidgetMessage::Width(start_rect.w),
+                    );
+                    ui.send(
+                        self.ui_start_round_button,
+                        WidgetMessage::Foreground(
+                            Brush::Solid(td_start_control_color(
+                                self.is_game_paused,
+                                self.round_is_running,
+                                self.game_speed_multiplier,
+                            ))
+                            .into(),
+                        ),
                     );
                     ui.send(
                         self.ui_start_round_button,
@@ -6141,7 +6275,11 @@ impl Plugin for Game {
                         .selected_tower_screen_x()
                         .unwrap_or(self.window_size.x * 0.5);
                     let ws = self.window_size;
-                    let anchor_x_ref: f32 = if selected_x < ws.x * 0.5 { 1170.0 } else { 24.0 };
+                    let anchor_x_ref: f32 = if selected_x < ws.x * 0.5 {
+                        1170.0
+                    } else {
+                        24.0
+                    };
                     let rr = |dx: f32, dy: f32, w: f32, h: f32| -> UiRect {
                         td_ui_ref_rect(ws, anchor_x_ref + dx, 45.0 + dy, w, h)
                     };
@@ -7905,7 +8043,30 @@ impl Plugin for Game {
                     }
                 }
 
-                // 1. Start Round 按鈕 — Phase 5.x lockstep send
+                // Auto-start checkbox above Start.
+                if !hit_ui {
+                    let (bx, by, bw, bh) = self.auto_start_checkbox_rect;
+                    if bx > -9000.0
+                        && screen.x >= bx
+                        && screen.x <= bx + bw
+                        && screen.y >= by
+                        && screen.y <= by + bh
+                    {
+                        self.td_auto_start_enabled = !self.td_auto_start_enabled;
+                        self.td_auto_start_sent_for_idle_round = false;
+                        log::info!(
+                            "TD auto-start {}",
+                            if self.td_auto_start_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        );
+                        hit_ui = true;
+                    }
+                }
+
+                // 1. Start Round / speed toggle button — Phase 5.x lockstep send
                 if !hit_ui {
                     let (bx, by, bw, bh) = self.start_round_button_rect;
                     if bx > -9000.0
@@ -7928,6 +8089,22 @@ impl Plugin for Game {
                                 event_us,
                             );
                             log::info!("Start/Resume → lockstep PlayerInput::TogglePause sent");
+                        } else if self.round_is_running {
+                            let input = omoba_core::kcp::game_proto::PlayerInput {
+                                action: Some(
+                                    omoba_core::kcp::game_proto::player_input::Action::ToggleGameSpeed(
+                                        omoba_core::kcp::game_proto::ToggleGameSpeed {},
+                                    ),
+                                ),
+                            };
+                            self.send_lockstep_input_from(
+                                input,
+                                lockstep_client::InputOriginKind::OsEvent,
+                                event_us,
+                            );
+                            log::info!(
+                                "Start Speed Toggle → lockstep PlayerInput::ToggleGameSpeed sent"
+                            );
                         } else if !self.round_is_running
                             && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
                         {
@@ -7943,6 +8120,7 @@ impl Plugin for Game {
                                 lockstep_client::InputOriginKind::OsEvent,
                                 event_us,
                             );
+                            self.td_auto_start_sent_for_idle_round = true;
                             log::info!("Start Round → lockstep PlayerInput::StartRound sent");
                         }
                         hit_ui = true;
@@ -9558,6 +9736,10 @@ impl Game {
         ui.send(self.ui_shop_text, TextMessage::Text(String::new()));
         ui.send(self.ui_end_text, TextMessage::Text(String::new()));
         ui.send(self.ui_hero_stats_panel, TextMessage::Text(String::new()));
+        ui.send(
+            self.ui_td_auto_start_checkbox_text,
+            WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+        );
         for handle in self.ui_ability_icons.iter().copied() {
             ui.send(
                 handle,
@@ -9589,6 +9771,7 @@ impl Game {
             );
         }
         self.start_round_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.auto_start_checkbox_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.pause_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.td_tower_button_rects.clear();
         self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
@@ -12656,10 +12839,23 @@ mod input_latency_tests {
 
     #[test]
     fn td_control_labels_use_start_as_resume_when_paused() {
-        assert_eq!(td_start_control_label(true, false, 0, 3), "RESUME");
-        assert_eq!(td_start_control_label(false, false, 0, 3), "READY");
-        assert_eq!(td_start_control_label(false, true, 0, 3), "RUNNING");
-        assert_eq!(td_start_control_label(false, false, 3, 3), "DONE");
+        assert_eq!(td_start_control_label(true, false, 0, 3, 1), "RESUME");
+        assert_eq!(td_start_control_label(false, false, 0, 3, 1), "READY");
+        assert_eq!(td_start_control_label(false, true, 0, 3, 1), "1X");
+        assert_eq!(td_start_control_label(false, true, 0, 3, 2), "2X");
+        assert_eq!(td_start_control_label(false, false, 3, 3, 2), "DONE");
+    }
+
+    #[test]
+    fn td_auto_start_round_only_when_idle_and_armed() {
+        assert!(td_should_auto_start_round(true, false, false, false, 1, 3));
+        assert!(!td_should_auto_start_round(
+            false, false, false, false, 1, 3
+        ));
+        assert!(!td_should_auto_start_round(true, true, false, false, 1, 3));
+        assert!(!td_should_auto_start_round(true, false, true, false, 1, 3));
+        assert!(!td_should_auto_start_round(true, false, false, true, 1, 3));
+        assert!(!td_should_auto_start_round(true, false, false, false, 3, 3));
     }
 
     #[test]
