@@ -295,13 +295,13 @@ impl PregameCatalog {
                 ScreenEntry {
                     id: "main_menu".into(),
                     title: "Omoba 塔防".into(),
-                    subtitle: "選擇難度與地圖，準備守住路線".into(),
+                    subtitle: "選擇地圖難度與地圖，準備守住路線".into(),
                     background_image: None,
                     widgets: vec![
                         WidgetEntry {
                             id: "start".into(),
                             label: "開始".into(),
-                            description: "選擇難度".into(),
+                            description: "選擇地圖難度".into(),
                             image: None,
                             enabled: true,
                             locked: false,
@@ -337,8 +337,8 @@ impl PregameCatalog {
                 },
                 ScreenEntry {
                     id: "difficulty_select".into(),
-                    title: "選擇難度".into(),
-                    subtitle: "先選難度，再挑戰地圖".into(),
+                    title: "選擇地圖難度".into(),
+                    subtitle: "先選地圖難度，再挑戰地圖".into(),
                     background_image: None,
                     widgets: vec![WidgetEntry {
                         id: "back".into(),
@@ -366,7 +366,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "novice".into(),
                     label: "新手".into(),
-                    description: "塔價 70%，40 關".into(),
+                    description: "200 HP，40 關，塔與升級價格 0.7 倍".into(),
                     config: "novice".into(),
                     reward: String::new(),
                     image: None,
@@ -375,7 +375,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "intermediate".into(),
                     label: "中級".into(),
-                    description: "塔價 80%，65 關".into(),
+                    description: "150 HP，65 關，塔與升級價格 0.8 倍".into(),
                     config: "intermediate".into(),
                     reward: String::new(),
                     image: None,
@@ -384,7 +384,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "advanced".into(),
                     label: "高級".into(),
-                    description: "塔價 90%，85 關".into(),
+                    description: "125 HP，85 關，塔與升級價格 0.9 倍".into(),
                     config: "advanced".into(),
                     reward: String::new(),
                     image: None,
@@ -393,7 +393,7 @@ impl PregameCatalog {
                 DifficultyEntry {
                     id: "expert".into(),
                     label: "專家".into(),
-                    description: "塔價 100%，100 關".into(),
+                    description: "100 HP，100 關，塔與升級價格 1 倍".into(),
                     config: "expert".into(),
                     reward: String::new(),
                     image: None,
@@ -1056,6 +1056,10 @@ mod tests {
         let catalog = PregameCatalog::fallback();
 
         assert_eq!(catalog.screen("main_menu").unwrap().title, "Omoba 塔防");
+        assert_eq!(
+            catalog.screen("difficulty_select").unwrap().title,
+            "選擇地圖難度"
+        );
         assert!(catalog
             .screen("main_menu")
             .unwrap()
