@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PregameState {
     MainMenu,
+    Settings,
     MapSelect,
     DifficultySelect,
     StartingSession,
@@ -42,6 +43,7 @@ impl PregameRuntime {
     pub fn active_screen_id(&self) -> &'static str {
         match self.state {
             PregameState::MainMenu => "main_menu",
+            PregameState::Settings => "settings",
             PregameState::MapSelect => "map_select",
             PregameState::DifficultySelect => "difficulty_select",
             PregameState::StartingSession => "starting_session",
@@ -74,8 +76,15 @@ impl PregameRuntime {
                 self.state = PregameState::MainMenu;
                 None
             }
+            PregameAction::Navigate { target } if target == "settings" => {
+                self.state = PregameState::Settings;
+                None
+            }
             PregameAction::Back => {
                 match self.state {
+                    PregameState::Settings => {
+                        self.state = PregameState::MainMenu;
+                    }
                     PregameState::MapSelect => {
                         self.selected_map = None;
                         self.state = PregameState::DifficultySelect;

@@ -807,6 +807,49 @@ struct PregameUi {
     buttons: Vec<PregameButtonUi>,
 }
 
+#[derive(Debug, Default)]
+struct SettingsSlider {
+    track: Handle<UiNode>,
+    fill: Handle<UiNode>,
+    thumb: Handle<UiNode>,
+    icon: Handle<UiNode>,
+    label: Handle<Text>,
+    pct_text: Handle<Text>,
+    track_rect: UiRect,
+}
+
+#[derive(Debug, Default)]
+struct SettingsPlaceholderBtn {
+    bg: Handle<UiNode>,
+    label: Handle<Text>,
+    sublabel: Handle<Text>,
+}
+
+#[derive(Debug, Default)]
+struct SettingsPanel {
+    bg: Handle<UiNode>,
+    title_bg: Handle<UiNode>,
+    title_text: Handle<Text>,
+    back_btn: Handle<UiNode>,
+    back_btn_text: Handle<Text>,
+    back_btn_rect: UiRect,
+    resolution_badge_bg: Handle<UiNode>,
+    resolution_badge_label: Handle<Text>,
+    resolution_badge_value: Handle<Text>,
+    left_panel_bg: Handle<UiNode>,
+    left_panel_jukebox_bg: Handle<UiNode>,
+    left_panel_jukebox_inner: Handle<UiNode>,
+    left_panel_btn_bg: Handle<UiNode>,
+    left_panel_btn_text: Handle<Text>,
+    left_panel_toggle_bg: Handle<UiNode>,
+    left_panel_enable_label: Handle<Text>,
+    slider_panel_bg: Handle<UiNode>,
+    sfx: SettingsSlider,
+    music: SettingsSlider,
+    speed: SettingsSlider,
+    placeholder_btns: Vec<SettingsPlaceholderBtn>,
+}
+
 fn td_ui_ref_scale(window_size: Vector2<f32>) -> (f32, f32) {
     (
         (window_size.x.max(1.0) / TD_UI_REF_W).max(0.01),
@@ -863,9 +906,8 @@ fn td_upgrade_effect_text(description: &str) -> String {
         .replace(", ", "\n")
         .replace(',', "\n")
         .replace('、', "\n");
-    // 各行之間插入空行增加行距（Fyrox Text widget 無原生行距設定）
     let lines = td_wrap_ui_text(&text, 20, 3);
-    lines.lines().collect::<Vec<_>>().join("\n\n")
+    lines.lines().collect::<Vec<_>>().join("\n")
 }
 
 fn td_upgrade_title_text(name: &str) -> String {
@@ -2007,6 +2049,27 @@ pub struct Game {
     ui_pregame: PregameUi,
     #[visit(skip)]
     #[reflect(hidden)]
+    ui_settings: SettingsPanel,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_sfx_volume: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_music_volume: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_dragging_sfx: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_dragging_music: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_dragging_speed: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_speed_value: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
     pregame_button_rects: Vec<(UiRect, pregame::PregameAction)>,
     #[visit(skip)]
     #[reflect(hidden)]
@@ -2878,6 +2941,7 @@ impl Plugin for Game {
             )
             .with_text("".to_string())
             .with_font_size(36.0.into())
+            .with_wrap(WrapMode::Letter)
             .with_shadow(true)
             .with_shadow_brush(Brush::Solid(Color::from_rgba(0, 0, 0, 220)))
             .with_shadow_dilation(2.0)
@@ -3186,6 +3250,7 @@ impl Plugin for Game {
                     .with_font_size(26.0.into())
                     .with_horizontal_text_alignment(HorizontalAlignment::Center)
                     .with_vertical_text_alignment(VerticalAlignment::Center)
+                    .with_wrap(WrapMode::Letter)
                     .with_shadow(true)
                     .with_shadow_brush(Brush::Solid(Color::from_rgba(0, 0, 0, 200)))
                     .with_shadow_dilation(2.0)
@@ -3732,6 +3797,7 @@ impl Plugin for Game {
                 )
                 .with_text(String::new())
                 .with_font_size(36.0.into())
+                .with_wrap(WrapMode::Letter)
                 .with_shadow(true)
                 .with_shadow_brush(Brush::Solid(Color::from_rgba(0, 0, 0, 220)))
                 .with_shadow_dilation(2.0)
@@ -3988,6 +4054,262 @@ impl Plugin for Game {
                 text,
                 role: PregameVisualRole::Button,
             });
+        }
+
+        // 設定面板初始化
+        self.settings_sfx_volume = 1.0;
+        self.settings_music_volume = 0.0;
+        self.settings_speed_value = 1.0;
+        self.ui_settings.bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(22, 42, 30, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.title_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(110, 72, 30, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(8.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.title_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(220, 220, 220, 255)).into()),
+        )
+        .with_text(String::new()).with_font_size(28.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .with_vertical_text_alignment(VerticalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        self.ui_settings.back_btn = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(65, 158, 218, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(12.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.back_btn_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(240, 248, 242, 255)).into()),
+        )
+        .with_text(String::new()).with_font_size(22.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .with_vertical_text_alignment(VerticalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        // Resolution badge (top-right)
+        self.ui_settings.resolution_badge_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(50, 42, 28, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(6.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.resolution_badge_label = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(200, 185, 155, 255)).into()),
+        )
+        .with_text(String::new()).with_font_size(14.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        self.ui_settings.resolution_badge_value = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(240, 230, 200, 255)).into()),
+        )
+        .with_text(String::new()).with_font_size(16.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        // Left decorative panel
+        self.ui_settings.left_panel_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(28, 34, 48, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(12.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        // Jukebox illustration area (top half of left panel)
+        self.ui_settings.left_panel_jukebox_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(20, 26, 40, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(10.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        // Inner decorative block (simulate jukebox body)
+        self.ui_settings.left_panel_jukebox_inner = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(55, 105, 165, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(2.0).into())
+        .with_corner_radius(8.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.left_panel_btn_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(60, 130, 200, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(6.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.left_panel_btn_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+        )
+        .with_text(String::new()).with_font_size(18.0.into())
+        .with_horizontal_text_alignment(HorizontalAlignment::Center)
+        .with_vertical_text_alignment(VerticalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        self.ui_settings.left_panel_toggle_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(60, 180, 80, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(6.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        self.ui_settings.left_panel_enable_label = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(180, 185, 195, 255)).into()),
+        )
+        .with_text(String::new()).with_font_size(16.0.into())
+        .with_vertical_text_alignment(VerticalAlignment::Center)
+        .build(&mut ui.build_ctx());
+        // Right slider panel background
+        self.ui_settings.slider_panel_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(1.0).with_height(1.0)
+                .with_background(Brush::Solid(Color::from_rgba(58, 46, 28, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(0.0).into())
+        .with_corner_radius(10.0_f32.into())
+        .build(&mut ui.build_ctx()).transmute();
+        // Helper: build one slider set (icon_rgba, fill_rgba, thumb_rgba)
+        let mut make_slider = |ui: &mut UserInterface,
+                               icon_c: (u8,u8,u8,u8),
+                               fill_c: (u8,u8,u8,u8),
+                               thumb_c: (u8,u8,u8,u8)| -> SettingsSlider {
+            let icon = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_background(Brush::Solid(Color::from_rgba(icon_c.0, icon_c.1, icon_c.2, icon_c.3)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(999.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            let track = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_background(Brush::Solid(Color::from_rgba(42, 32, 18, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(999.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            let fill = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_background(Brush::Solid(Color::from_rgba(fill_c.0, fill_c.1, fill_c.2, fill_c.3)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(999.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            let thumb = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_background(Brush::Solid(Color::from_rgba(thumb_c.0, thumb_c.1, thumb_c.2, thumb_c.3)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(999.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            let label = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(220, 215, 200, 255)).into()),
+            )
+            .with_text(String::new()).with_font_size(18.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Left)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            let pct_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(220, 215, 200, 255)).into()),
+            )
+            .with_text(String::new()).with_font_size(18.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Left)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            SettingsSlider { track, fill, thumb, icon, label, pct_text, track_rect: UiRect::default() }
+        };
+        // 音樂：深藍 icon + 藍色 fill；音效：灰藍 icon + 藍色 fill；速度：棕黃 icon + 綠色 fill
+        self.ui_settings.music = make_slider(ui, (55, 115, 185, 255), (70, 150, 220, 200), (85, 175, 240, 255));
+        self.ui_settings.sfx   = make_slider(ui, (55, 115, 185, 255), (70, 150, 220, 200), (85, 175, 240, 255));
+        self.ui_settings.speed = make_slider(ui, (120, 90, 40, 255),  (80, 190, 70, 200),  (85, 175, 240, 255));
+        // Placeholder buttons (6) — rounded square icon area + sublabel below
+        for _ in 0..6 {
+            let bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_background(Brush::Solid(Color::from_rgba(55, 130, 210, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(14.0_f32.into())
+            .build(&mut ui.build_ctx()).transmute();
+            let label = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new()).with_font_size(20.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            let sublabel = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(1.0).with_height(1.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(220, 225, 230, 255)).into()),
+            )
+            .with_text(String::new()).with_font_size(16.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Top)
+            .build(&mut ui.build_ctx());
+            self.ui_settings.placeholder_btns.push(SettingsPlaceholderBtn { bg, label, sublabel });
         }
 
         apply_frontend_runtime_env_from_config();
@@ -6241,10 +6563,15 @@ impl Plugin for Game {
                         self.ui_td_selected_panel.info_btn_text,
                         WidgetMessage::Height(info_btn_rect.h),
                     );
-                    // info 側面板（面板右側，對齊黃色卡片 y，與 upgrade tooltip 相同 x 邏輯）
+                    // info 側面板（面板右側或左側，依 panel_rect 動態計算）
                     let sx = self.window_size.x / TD_UI_REF_W;
                     let sy = self.window_size.y / TD_UI_REF_H;
-                    let panel_right = 404.0 * sx + 8.0;
+                    let pr = self.ui_td_selected_panel.panel_rect;
+                    let panel_right = if pr.x > self.window_size.x * 0.5 {
+                        pr.x - 244.0 * sx - 8.0
+                    } else {
+                        pr.right() + 8.0
+                    };
                     if self.ui_td_selected_panel.show_info {
                         // 對齊黃色卡片頂部 (ref y = 45+78 = 123)
                         let card_top = (45.0 + 78.0) * sy;
@@ -6383,10 +6710,7 @@ impl Plugin for Game {
                                     self.ui_td_selected_panel.info_row_titles[i],
                                     TextMessage::Text(title),
                                 );
-                                let desc_y = ty + 30.0 * sy;
-                                let mut lines = desc.splitn(2, '\n');
-                                let line1 = lines.next().unwrap_or("").to_string();
-                                let line2 = lines.next().unwrap_or("").to_string();
+                                let desc_y = ty + 48.0 * sy;
                                 ui.send(
                                     self.ui_td_selected_panel.info_row_descs[i],
                                     WidgetMessage::DesiredPosition(Vector2::new(
@@ -6400,23 +6724,15 @@ impl Plugin for Game {
                                 );
                                 ui.send(
                                     self.ui_td_selected_panel.info_row_descs[i],
-                                    TextMessage::Text(line1),
-                                );
-                                let desc2_y = desc_y + 20.0 * sy;
-                                ui.send(
-                                    self.ui_td_selected_panel.info_row_descs2[i],
-                                    WidgetMessage::DesiredPosition(Vector2::new(
-                                        panel_right + pad,
-                                        desc2_y,
-                                    )),
+                                    TextMessage::Text(desc),
                                 );
                                 ui.send(
                                     self.ui_td_selected_panel.info_row_descs2[i],
-                                    WidgetMessage::Width(box_w - pad * 2.0),
+                                    WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)),
                                 );
                                 ui.send(
                                     self.ui_td_selected_panel.info_row_descs2[i],
-                                    TextMessage::Text(line2),
+                                    TextMessage::Text(String::new()),
                                 );
                             }
                         }
@@ -6903,14 +7219,8 @@ impl Plugin for Game {
                                         self.ui_upgrade_tooltip_title,
                                         TextMessage::Text(title),
                                     );
-                                    let mut lines = desc.splitn(2, '\n');
-                                    let line1 = lines.next().unwrap_or("").to_string();
-                                    let line2 = lines.next().unwrap_or("").to_string();
-                                    ui.send(self.ui_upgrade_tooltip_desc, TextMessage::Text(line1));
-                                    ui.send(
-                                        self.ui_upgrade_tooltip_desc2,
-                                        TextMessage::Text(line2),
-                                    );
+                                    ui.send(self.ui_upgrade_tooltip_desc, TextMessage::Text(desc));
+                                    ui.send(self.ui_upgrade_tooltip_desc2, TextMessage::Text(String::new()));
                                 }
                                 None => {
                                     ui.send(
@@ -6962,7 +7272,12 @@ impl Plugin for Game {
                             // 跟左邊棕色區塊一樣大：參考 244×160
                             let box_w = 244.0 * sx;
                             let box_h = 160.0 * sy;
-                            let panel_right = (404.0 * sx) + 8.0;
+                            let pr = self.ui_td_selected_panel.panel_rect;
+                            let panel_right = if pr.x > self.window_size.x * 0.5 {
+                                pr.x - box_w - 8.0
+                            } else {
+                                pr.right() + 8.0
+                            };
                             // 對齊各列的 row_y（305, 497, 689 在參考空間，加上 panel 頂部 45）
                             let row_ref_y = 305.0 + hover_idx as f32 * 192.0;
                             let ty = (45.0 + row_ref_y + 15.0) * sy;
@@ -6985,8 +7300,8 @@ impl Plugin for Game {
                                 self.ui_upgrade_tooltip_title,
                                 WidgetMessage::Width(box_w - pad * 2.0),
                             );
-                            // 說明第一行
-                            let desc_y = ty + 30.0 * sy;
+                            // 說明文字（全部放進單一 widget，行距自然一致）
+                            let desc_y = ty + 48.0 * sy;
                             ui.send(
                                 self.ui_upgrade_tooltip_desc,
                                 WidgetMessage::DesiredPosition(Vector2::new(
@@ -6998,17 +7313,9 @@ impl Plugin for Game {
                                 self.ui_upgrade_tooltip_desc,
                                 WidgetMessage::Width(box_w - pad * 2.0),
                             );
-                            // 說明第二行（間距 34px，可微調）
                             ui.send(
                                 self.ui_upgrade_tooltip_desc2,
-                                WidgetMessage::DesiredPosition(Vector2::new(
-                                    panel_right + pad,
-                                    desc_y + 20.0 * sy,
-                                )),
-                            );
-                            ui.send(
-                                self.ui_upgrade_tooltip_desc2,
-                                WidgetMessage::Width(box_w - pad * 2.0),
+                                WidgetMessage::DesiredPosition(Vector2::new(-9999.0, -9999.0)),
                             );
                         }
                     }
@@ -7794,6 +8101,21 @@ impl Plugin for Game {
                         self.td_shop_scroll_dragging = false;
                     }
                 }
+                if self.settings_dragging_sfx {
+                    let track = self.ui_settings.sfx.track_rect;
+                    let pct = ((cursor.x - track.x) / track.w.max(1.0)).clamp(0.0, 1.0);
+                    self.settings_sfx_volume = pct;
+                }
+                if self.settings_dragging_music {
+                    let track = self.ui_settings.music.track_rect;
+                    let pct = ((cursor.x - track.x) / track.w.max(1.0)).clamp(0.0, 1.0);
+                    self.settings_music_volume = pct;
+                }
+                if self.settings_dragging_speed {
+                    let track = self.ui_settings.speed.track_rect;
+                    let pct = ((cursor.x - track.x) / track.w.max(1.0)).clamp(0.0, 1.0);
+                    self.settings_speed_value = pct;
+                }
             }
             Event::WindowEvent {
                 event: WindowEvent::MouseWheel { delta, .. },
@@ -7823,6 +8145,9 @@ impl Plugin for Game {
                 ..
             } => {
                 self.td_shop_scroll_dragging = false;
+                self.settings_dragging_sfx = false;
+                self.settings_dragging_music = false;
+                self.settings_dragging_speed = false;
             }
             Event::WindowEvent {
                 event:
@@ -7835,6 +8160,30 @@ impl Plugin for Game {
             } => {
                 // 左鍵 UI：技能升級三角按鈕優先，避免命中後落到地圖/TD 點擊邏輯。
                 let screen = self.mouse_screen_pos;
+                // 設定面板滑桿優先處理（在 pregame 按鈕前攔截）
+                if self.pregame_runtime.state == pregame::PregameState::Settings {
+                    let sfx_track = self.ui_settings.sfx.track_rect;
+                    let music_track = self.ui_settings.music.track_rect;
+                    let speed_track = self.ui_settings.speed.track_rect;
+                    if sfx_track.contains(screen) {
+                        let pct = ((screen.x - sfx_track.x) / sfx_track.w.max(1.0)).clamp(0.0, 1.0);
+                        self.settings_sfx_volume = pct;
+                        self.settings_dragging_sfx = true;
+                        return Ok(());
+                    }
+                    if music_track.contains(screen) {
+                        let pct = ((screen.x - music_track.x) / music_track.w.max(1.0)).clamp(0.0, 1.0);
+                        self.settings_music_volume = pct;
+                        self.settings_dragging_music = true;
+                        return Ok(());
+                    }
+                    if speed_track.contains(screen) {
+                        let pct = ((screen.x - speed_track.x) / speed_track.w.max(1.0)).clamp(0.0, 1.0);
+                        self.settings_speed_value = pct;
+                        self.settings_dragging_speed = true;
+                        return Ok(());
+                    }
+                }
                 if self.handle_pregame_click(screen) {
                     return Ok(());
                 }
@@ -9057,6 +9406,7 @@ impl Game {
                 pregame::PregameAction::Back,
             )],
             pregame::PregameState::InGame => Vec::new(),
+            pregame::PregameState::Settings => Vec::new(),
         }
     }
 
@@ -9408,6 +9758,14 @@ impl Game {
     fn update_pregame_ui(&mut self, ui: &mut UserInterface) {
         self.hide_gameplay_ui_for_pregame(ui);
 
+        let is_settings = self.pregame_runtime.state == pregame::PregameState::Settings;
+        if is_settings {
+            self.hide_pregame_ui(ui);
+            self.update_settings_panel(ui);
+            return;
+        }
+        self.hide_settings_elements(ui);
+
         let screen_id = self.pregame_runtime.active_screen_id();
         let title = self
             .pregame_runtime
@@ -9540,8 +9898,268 @@ impl Game {
                 }
             }
             pregame::PregameState::InGame => {}
+            pregame::PregameState::Settings => {}
         }
         self.hide_unused_pregame_nodes(ui, node_index);
+    }
+
+    fn hide_settings_elements(&mut self, ui: &mut UserInterface) {
+        let h = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        for handle in [
+            self.ui_settings.bg,
+            self.ui_settings.title_bg,
+            self.ui_settings.resolution_badge_bg,
+            self.ui_settings.left_panel_bg,
+            self.ui_settings.left_panel_jukebox_bg,
+            self.ui_settings.left_panel_jukebox_inner,
+            self.ui_settings.left_panel_btn_bg,
+            self.ui_settings.left_panel_toggle_bg,
+            self.ui_settings.slider_panel_bg,
+            self.ui_settings.back_btn,
+            self.ui_settings.sfx.track,
+            self.ui_settings.sfx.fill,
+            self.ui_settings.sfx.thumb,
+            self.ui_settings.sfx.icon,
+            self.ui_settings.music.track,
+            self.ui_settings.music.fill,
+            self.ui_settings.music.thumb,
+            self.ui_settings.music.icon,
+            self.ui_settings.speed.track,
+            self.ui_settings.speed.fill,
+            self.ui_settings.speed.thumb,
+            self.ui_settings.speed.icon,
+        ] {
+            ui.send(handle, WidgetMessage::DesiredPosition(h));
+        }
+        for handle in [
+            self.ui_settings.title_text,
+            self.ui_settings.back_btn_text,
+            self.ui_settings.resolution_badge_label,
+            self.ui_settings.resolution_badge_value,
+            self.ui_settings.left_panel_btn_text,
+            self.ui_settings.left_panel_enable_label,
+            self.ui_settings.sfx.label,
+            self.ui_settings.sfx.pct_text,
+            self.ui_settings.music.label,
+            self.ui_settings.music.pct_text,
+            self.ui_settings.speed.label,
+            self.ui_settings.speed.pct_text,
+        ] {
+            ui.send(handle, WidgetMessage::DesiredPosition(h));
+        }
+        for btn in &self.ui_settings.placeholder_btns {
+            ui.send(btn.bg, WidgetMessage::DesiredPosition(h));
+            ui.send(btn.label, WidgetMessage::DesiredPosition(h));
+            ui.send(btn.sublabel, WidgetMessage::DesiredPosition(h));
+        }
+    }
+
+    fn update_settings_panel(&mut self, ui: &mut UserInterface) {
+        let ws = self.window_size;
+        let full = UiRect { x: 0.0, y: 0.0, w: ws.x.max(1.0), h: ws.y.max(1.0) };
+
+        // ── 全螢幕暗底 ──────────────────────────────────────────────
+        ui.send(self.ui_settings.bg, WidgetMessage::DesiredPosition(full.pos()));
+        ui.send(self.ui_settings.bg, WidgetMessage::Width(full.w));
+        ui.send(self.ui_settings.bg, WidgetMessage::Height(full.h));
+
+        // ── 頂部欄 ──────────────────────────────────────────────────
+        let title_h = full.h * 0.075;
+        let bar_y   = full.h * 0.025;
+
+        // 返回按鈕（左）
+        let back = UiRect { x: full.w * 0.04, y: bar_y, w: title_h * 2.2, h: title_h };
+        ui.send(self.ui_settings.back_btn, WidgetMessage::DesiredPosition(back.pos()));
+        ui.send(self.ui_settings.back_btn, WidgetMessage::Width(back.w));
+        ui.send(self.ui_settings.back_btn, WidgetMessage::Height(back.h));
+        ui.send(self.ui_settings.back_btn_text, WidgetMessage::DesiredPosition(back.pos()));
+        ui.send(self.ui_settings.back_btn_text, WidgetMessage::Width(back.w));
+        ui.send(self.ui_settings.back_btn_text, WidgetMessage::Height(back.h));
+        ui.send(self.ui_settings.back_btn_text, TextMessage::Text("< 返回".to_string()));
+        self.ui_settings.back_btn_rect = back;
+
+        // 標題列（中，寬一點貼近 BTD6）
+        let title_bar = UiRect { x: full.w * 0.22, y: bar_y, w: full.w * 0.56, h: title_h };
+        ui.send(self.ui_settings.title_bg, WidgetMessage::DesiredPosition(title_bar.pos()));
+        ui.send(self.ui_settings.title_bg, WidgetMessage::Width(title_bar.w));
+        ui.send(self.ui_settings.title_bg, WidgetMessage::Height(title_bar.h));
+        ui.send(self.ui_settings.title_text, WidgetMessage::DesiredPosition(title_bar.pos()));
+        ui.send(self.ui_settings.title_text, WidgetMessage::Width(title_bar.w));
+        ui.send(self.ui_settings.title_text, WidgetMessage::Height(title_bar.h));
+        ui.send(self.ui_settings.title_text, TextMessage::Text("設定".to_string()));
+
+        // 解析度 badge（右）
+        let badge_w = full.w * 0.14;
+        let badge = UiRect { x: full.w * 0.96 - badge_w, y: bar_y, w: badge_w, h: title_h };
+        ui.send(self.ui_settings.resolution_badge_bg, WidgetMessage::DesiredPosition(badge.pos()));
+        ui.send(self.ui_settings.resolution_badge_bg, WidgetMessage::Width(badge.w));
+        ui.send(self.ui_settings.resolution_badge_bg, WidgetMessage::Height(badge.h));
+        let badge_label = UiRect { x: badge.x, y: badge.y + badge.h * 0.10, w: badge.w, h: title_h * 0.38 };
+        ui.send(self.ui_settings.resolution_badge_label, WidgetMessage::DesiredPosition(badge_label.pos()));
+        ui.send(self.ui_settings.resolution_badge_label, WidgetMessage::Width(badge_label.w));
+        ui.send(self.ui_settings.resolution_badge_label, WidgetMessage::Height(badge_label.h));
+        ui.send(self.ui_settings.resolution_badge_label, TextMessage::Text("螢幕尺寸".to_string()));
+        let badge_val = UiRect { x: badge.x, y: badge.y + title_h * 0.48, w: badge.w, h: title_h * 0.52 };
+        ui.send(self.ui_settings.resolution_badge_value, WidgetMessage::DesiredPosition(badge_val.pos()));
+        ui.send(self.ui_settings.resolution_badge_value, WidgetMessage::Width(badge_val.w));
+        ui.send(self.ui_settings.resolution_badge_value, WidgetMessage::Height(badge_val.h));
+        ui.send(self.ui_settings.resolution_badge_value, TextMessage::Text(
+            format!("{} x {}", ws.x as u32, ws.y as u32),
+        ));
+
+        // ── 主內容區（兩欄，佔螢幕高度 62%，不 clamp）────────────────
+        let content_y  = title_bar.bottom() + full.h * 0.015;
+        let content_h  = full.h * 0.62;
+        let slider_h   = content_h / 4.2;
+        let row_gap    = (content_h - slider_h * 3.0) / 4.0;
+
+        // 左欄裝飾面板
+        let left_w  = full.w * 0.22;
+        let left    = UiRect { x: full.w * 0.04, y: content_y, w: left_w, h: content_h };
+        ui.send(self.ui_settings.left_panel_bg, WidgetMessage::DesiredPosition(left.pos()));
+        ui.send(self.ui_settings.left_panel_bg, WidgetMessage::Width(left.w));
+        ui.send(self.ui_settings.left_panel_bg, WidgetMessage::Height(left.h));
+
+        // Jukebox 插圖區（上半部 50%）
+        let juke_pad = left_w * 0.06;
+        let juke = UiRect { x: left.x + juke_pad, y: left.y + juke_pad, w: left.w - juke_pad * 2.0, h: left.h * 0.48 };
+        ui.send(self.ui_settings.left_panel_jukebox_bg, WidgetMessage::DesiredPosition(juke.pos()));
+        ui.send(self.ui_settings.left_panel_jukebox_bg, WidgetMessage::Width(juke.w));
+        ui.send(self.ui_settings.left_panel_jukebox_bg, WidgetMessage::Height(juke.h));
+        // 內部裝飾塊（模擬老虎機機身）
+        let inner_pad = juke.w * 0.12;
+        let inner = UiRect { x: juke.x + inner_pad, y: juke.y + juke.h * 0.18, w: juke.w - inner_pad * 2.0, h: juke.h * 0.55 };
+        ui.send(self.ui_settings.left_panel_jukebox_inner, WidgetMessage::DesiredPosition(inner.pos()));
+        ui.send(self.ui_settings.left_panel_jukebox_inner, WidgetMessage::Width(inner.w));
+        ui.send(self.ui_settings.left_panel_jukebox_inner, WidgetMessage::Height(inner.h));
+
+        let lpad  = left_w * 0.10;
+        let btn_h = left_w * 0.28;
+        let lbtn  = UiRect { x: left.x + lpad, y: left.y + left.h * 0.60, w: left.w - lpad * 2.0, h: btn_h };
+        ui.send(self.ui_settings.left_panel_btn_bg, WidgetMessage::DesiredPosition(lbtn.pos()));
+        ui.send(self.ui_settings.left_panel_btn_bg, WidgetMessage::Width(lbtn.w));
+        ui.send(self.ui_settings.left_panel_btn_bg, WidgetMessage::Height(lbtn.h));
+        ui.send(self.ui_settings.left_panel_btn_text, WidgetMessage::DesiredPosition(lbtn.pos()));
+        ui.send(self.ui_settings.left_panel_btn_text, WidgetMessage::Width(lbtn.w));
+        ui.send(self.ui_settings.left_panel_btn_text, WidgetMessage::Height(lbtn.h));
+        ui.send(self.ui_settings.left_panel_btn_text, TextMessage::Text("自動唱機".to_string()));
+
+        let tog_w = left_w * 0.24;
+        let tog_h = tog_w * 0.5;
+        let tog   = UiRect { x: left.x + left.w - lpad - tog_w, y: left.y + left.h * 0.80, w: tog_w, h: tog_h };
+        ui.send(self.ui_settings.left_panel_toggle_bg, WidgetMessage::DesiredPosition(tog.pos()));
+        ui.send(self.ui_settings.left_panel_toggle_bg, WidgetMessage::Width(tog.w));
+        ui.send(self.ui_settings.left_panel_toggle_bg, WidgetMessage::Height(tog.h));
+
+        let en_label = UiRect { x: left.x + lpad, y: tog.y, w: tog.x - left.x - lpad * 1.5, h: tog_h };
+        ui.send(self.ui_settings.left_panel_enable_label, WidgetMessage::DesiredPosition(en_label.pos()));
+        ui.send(self.ui_settings.left_panel_enable_label, WidgetMessage::Width(en_label.w));
+        ui.send(self.ui_settings.left_panel_enable_label, WidgetMessage::Height(en_label.h));
+        ui.send(self.ui_settings.left_panel_enable_label, TextMessage::Text("啟用".to_string()));
+
+        // 右欄滑桿面板（延伸至 96% 螢幕寬度）
+        let right_x = left.right() + full.w * 0.015;
+        let right_w = full.w * 0.955 - right_x;
+        let right   = UiRect { x: right_x, y: content_y, w: right_w, h: content_h };
+        ui.send(self.ui_settings.slider_panel_bg, WidgetMessage::DesiredPosition(right.pos()));
+        ui.send(self.ui_settings.slider_panel_bg, WidgetMessage::Width(right.w));
+        ui.send(self.ui_settings.slider_panel_bg, WidgetMessage::Height(right.h));
+
+        let icon_r  = full.h * 0.024;    // 固定比例，不受 slider_h 影響（1440p ≈ 35px）
+        let rpad    = right_w * 0.03;
+        let icon_cx = right.x + rpad + icon_r;
+        let pct_w   = (right_w * 0.07).max(55.0);
+        let lbl_w   = full.h * 0.058;
+        let track_x = icon_cx + icon_r + rpad * 0.4 + lbl_w + rpad * 0.3;
+        // 在 track 右端留 icon_r 空間（thumb 半徑），避免 100% 時 thumb 蓋住 pct_text
+        let track_w = right.right() - rpad - pct_w - track_x - icon_r - rpad * 0.3;
+
+        let layout_slider = |ui: &mut UserInterface,
+                             slider: &mut SettingsSlider,
+                             row: usize,
+                             volume: f32,
+                             pct: &str,
+                             label_text: &str| {
+            let cy = right.y + row_gap + row as f32 * (slider_h + row_gap) + slider_h * 0.5;
+            // Icon circle
+            let icon_x = icon_cx - icon_r;
+            let icon_y = cy - icon_r;
+            ui.send(slider.icon, WidgetMessage::DesiredPosition(Vector2::new(icon_x, icon_y)));
+            ui.send(slider.icon, WidgetMessage::Width(icon_r * 2.0));
+            ui.send(slider.icon, WidgetMessage::Height(icon_r * 2.0));
+            // Label text（圖示右側，軌道左側）
+            let lbl_rect = UiRect { x: icon_cx + icon_r + rpad * 0.4, y: cy - slider_h * 0.5, w: lbl_w, h: slider_h };
+            ui.send(slider.label, WidgetMessage::DesiredPosition(lbl_rect.pos()));
+            ui.send(slider.label, WidgetMessage::Width(lbl_rect.w));
+            ui.send(slider.label, WidgetMessage::Height(lbl_rect.h));
+            ui.send(slider.label, TextMessage::Text(label_text.to_string()));
+            // Track
+            let track_h = slider_h * 0.28;
+            let track = UiRect { x: track_x, y: cy - track_h * 0.5, w: track_w, h: track_h };
+            slider.track_rect = UiRect { x: track_x, y: cy - slider_h * 0.5, w: track_w, h: slider_h };
+            ui.send(slider.track, WidgetMessage::DesiredPosition(track.pos()));
+            ui.send(slider.track, WidgetMessage::Width(track.w));
+            ui.send(slider.track, WidgetMessage::Height(track.h));
+            // Fill
+            let fill_w = (track.w * volume).max(0.0);
+            ui.send(slider.fill, WidgetMessage::DesiredPosition(track.pos()));
+            ui.send(slider.fill, WidgetMessage::Width(fill_w.max(1.0)));
+            ui.send(slider.fill, WidgetMessage::Height(track.h));
+            // Thumb（與 icon 同尺寸，center clamp 在 track 範圍內）
+            let thumb_r = icon_r;
+            let thumb_cx = (track.x + fill_w).clamp(track.x, track.right());
+            let thumb_x = thumb_cx - thumb_r;
+            let thumb_y = cy - thumb_r;
+            ui.send(slider.thumb, WidgetMessage::DesiredPosition(Vector2::new(thumb_x, thumb_y)));
+            ui.send(slider.thumb, WidgetMessage::Width(thumb_r * 2.0));
+            ui.send(slider.thumb, WidgetMessage::Height(thumb_r * 2.0));
+            // Percentage text（起點在 thumb 右側，避免 100% 時被蓋住）
+            let pct_rect = UiRect { x: track.right() + icon_r + rpad * 0.3, y: cy - slider_h * 0.5, w: pct_w, h: slider_h };
+            ui.send(slider.pct_text, WidgetMessage::DesiredPosition(pct_rect.pos()));
+            ui.send(slider.pct_text, WidgetMessage::Width(pct_rect.w));
+            ui.send(slider.pct_text, WidgetMessage::Height(pct_rect.h));
+            ui.send(slider.pct_text, TextMessage::Text(pct.to_string()));
+        };
+
+        let sfx_v   = self.settings_sfx_volume;
+        let music_v = self.settings_music_volume;
+        let speed_v = self.settings_speed_value;
+        let sfx_pct   = format!("{}%", (sfx_v   * 100.0) as u32);
+        let music_pct = format!("{}%", (music_v  * 100.0) as u32);
+        let speed_pct = format!("{}%", (speed_v  * 100.0) as u32);
+        layout_slider(ui, &mut self.ui_settings.music, 0, music_v, &music_pct, "音樂");
+        layout_slider(ui, &mut self.ui_settings.sfx,   1, sfx_v,   &sfx_pct,   "音效");
+        layout_slider(ui, &mut self.ui_settings.speed,  2, speed_v,  &speed_pct,  "速度");
+
+        // ── 底部 6 個圖示按鈕（不 clamp，跟螢幕等比）────────────────
+        let btn_size   = full.h * 0.09;
+        let sub_h      = full.h * 0.035;
+        let btn_gap    = full.w * 0.025;
+        let btn_names  = ["備份", "賬戶", "登出", "語言", "熱鍵", "輔助"];
+        let btn_icons  = ["雲", "人", "出", "文", "鍵", "助"];
+        let total_btn_w = btn_size * btn_names.len() as f32 + btn_gap * (btn_names.len() - 1) as f32;
+        let btn_start_x = (full.w - total_btn_w) * 0.5;
+        let btn_row_y  = content_y + content_h + full.h * 0.03;
+        for (i, btn) in self.ui_settings.placeholder_btns.iter().enumerate() {
+            if i >= btn_names.len() { break; }
+            let bx = btn_start_x + i as f32 * (btn_size + btn_gap);
+            let br = UiRect { x: bx, y: btn_row_y, w: btn_size, h: btn_size };
+            ui.send(btn.bg, WidgetMessage::DesiredPosition(br.pos()));
+            ui.send(btn.bg, WidgetMessage::Width(br.w));
+            ui.send(btn.bg, WidgetMessage::Height(br.h));
+            ui.send(btn.label, WidgetMessage::DesiredPosition(br.pos()));
+            ui.send(btn.label, WidgetMessage::Width(br.w));
+            ui.send(btn.label, WidgetMessage::Height(br.h));
+            ui.send(btn.label, TextMessage::Text(btn_icons[i].to_string()));
+            let sub = UiRect { x: bx, y: br.bottom() + 4.0, w: btn_size, h: sub_h };
+            ui.send(btn.sublabel, WidgetMessage::DesiredPosition(sub.pos()));
+            ui.send(btn.sublabel, WidgetMessage::Width(sub.w));
+            ui.send(btn.sublabel, WidgetMessage::Height(sub.h));
+            ui.send(btn.sublabel, TextMessage::Text(btn_names[i].to_string()));
+        }
+
+        // Register back button
+        self.pregame_button_rects.push((back, pregame::PregameAction::Back));
     }
 
     fn hide_gameplay_ui_for_pregame(&mut self, ui: &mut UserInterface) {
