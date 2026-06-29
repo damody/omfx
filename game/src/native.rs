@@ -639,6 +639,22 @@ const TD_UI_MAX_UPGRADE_LEVEL: u8 = 4;
 const TD_SHOP_LAYOUT_DEBUG_MIN_CARDS: usize = 20;
 const TD_UI_REF_W: f32 = 1920.0;
 const TD_UI_REF_H: f32 = 1080.0;
+const TD_CAMERA_VERTICAL_SIZE: f32 = 16.5;
+const TD_CAMERA_WORLD_CENTER_X: f32 = 0.75;
+const TD_CAMERA_WORLD_CENTER_Y: f32 = 0.0;
+
+#[derive(Clone, Copy, Debug)]
+struct TdCameraViewConfig {
+    vertical_size: f32,
+    scene_position: Vector2<f32>,
+}
+
+fn td_camera_view_config() -> TdCameraViewConfig {
+    TdCameraViewConfig {
+        vertical_size: TD_CAMERA_VERTICAL_SIZE,
+        scene_position: Vector2::new(TD_CAMERA_WORLD_CENTER_X, TD_CAMERA_WORLD_CENTER_Y),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct UiRect {
@@ -903,6 +919,25 @@ fn td_start_control_color(
     } else {
         Color::from_rgba(0, 80, 0, 255)
     }
+}
+
+fn td_round_status_label(_round_is_running: bool, current_round: u32, total_rounds: u32) -> String {
+    if total_rounds == 0 {
+        return String::new();
+    }
+    if current_round >= total_rounds {
+        return format!("完成 {} / {} 波", total_rounds, total_rounds);
+    }
+    let display_round = current_round.saturating_add(1);
+    format!(
+        "第 {} / {} 波",
+        display_round.min(total_rounds),
+        total_rounds
+    )
+}
+
+fn td_mode_from_snapshot(lives: i32, total_rounds: u32) -> bool {
+    lives > 0 || total_rounds > 0
 }
 
 fn td_pause_control_label(is_paused: bool) -> &'static str {
@@ -2556,6 +2591,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ui_td_top_hud_texts: [Handle<Text>; 3],
+    /// TD 上方目前波數文字。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_td_wave_text: Handle<Text>,
     /// 左下角英雄屬性面板（多行：name/title/Lv/XP/SP/三圍/HP/Gold + 4 技能等級）
     #[visit(skip)]
     #[reflect(hidden)]
@@ -3087,6 +3126,15 @@ impl Plugin for Game {
             .with_font_size(34.0.into())
             .build(&mut ui.build_ctx());
         }
+        self.ui_td_wave_text = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(260.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(0, 0, 0, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(34.0.into())
+        .build(&mut ui.build_ctx());
 
         // 左下角英雄屬性面板（多行）；實際位置由 update() 依 window_size 重定位
         self.ui_hero_stats_panel = TextBuilder::new(
@@ -4843,6 +4891,9 @@ impl Plugin for Game {
                         log::info!("Auto Start Round → lockstep PlayerInput::StartRound sent");
                     }
                     self.hero_state.lives = snapshot.lives;
+                    if td_mode_from_snapshot(snapshot.lives, snapshot.total_rounds) {
+                        self.is_td_mode = true;
+                    }
 
                     // 階段 4.2：將模擬爆炸排入本地
                     // `active_explosions` 環形緩衝區。按刻度進行重複資料刪除
@@ -5664,24 +5715,34 @@ impl Plugin for Game {
         let t_cam = std::time::Instant::now();
         let camera_span = tracing::trace_span!("omfx::frame::camera", perfetto = true).entered();
         if self.is_td_mode {
+            let td_camera = td_camera_view_config();
+            // 固定 TD 視角每幀套用一次，讓 hot reload / 同一局調整相機時立即生效。
+            if let Some(cam) = scene.graph[self.camera].cast_mut::<fyrox::scene::camera::Camera>() {
+                cam.set_projection(Projection::Orthographic(OrthographicProjection {
+                    z_near: 0.1,
+                    z_far: 1000.0,
+                    vertical_size: td_camera.vertical_size,
+                }));
+            }
+            // 相機在 z=-100 處看著 +Z（預設）。scene X 往右移會讓畫面內容往左，
+            // 替右側常駐商店留出空間；camera_world_pos 仍依投影慣例反推。
+            scene.graph[self.camera]
+                .local_transform_mut()
+                .set_position(Vector3::new(
+                    td_camera.scene_position.x,
+                    td_camera.scene_position.y,
+                    -100.0,
+                ));
+            self.camera_world_pos =
+                Vector2::new(-td_camera.scene_position.x, td_camera.scene_position.y);
             if !self.td_camera_configured {
-                // 一次性：放大視角、鎖定在原點
-                if let Some(cam) =
-                    scene.graph[self.camera].cast_mut::<fyrox::scene::camera::Camera>()
-                {
-                    cam.set_projection(Projection::Orthographic(OrthographicProjection {
-                        z_near: 0.1,
-                        z_far: 1000.0,
-                        vertical_size: 14.0, // 28 render 高 = 2800 backend，可裝下 ±1200 Y
-                    }));
-                }
-                // 相機在 z=-100 處看著 +Z（預設）——在重新居中時保留它。
-                scene.graph[self.camera]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(0.0, 0.0, -100.0));
-                self.camera_world_pos = Vector2::new(0.0, 0.0);
                 self.td_camera_configured = true;
-                log::info!("🎥 TD 相機已鎖定：center=(0,0), vertical_size=14");
+                log::info!(
+                    "🎥 TD 相機已鎖定：scene_pos=({:.1},{:.1}), vertical_size={:.1}",
+                    td_camera.scene_position.x,
+                    td_camera.scene_position.y,
+                    td_camera.vertical_size
+                );
 
                 // 階段 5.1：刪除了向舊版 NetworkBridge 的視窗推送。
                 // 無論如何，鎖步狀態都會向所有客戶端完整廣播
@@ -7947,6 +8008,20 @@ impl Plugin for Game {
                     );
                     ui.send(self.ui_td_top_hud_texts[i], TextMessage::Text(text.clone()));
                 }
+                let wave_rect = td_ui_ref_rect(self.window_size, 1250.0, 48.0, 260.0, 46.0);
+                ui.send(
+                    self.ui_td_wave_text,
+                    WidgetMessage::DesiredPosition(wave_rect.pos()),
+                );
+                ui.send(self.ui_td_wave_text, WidgetMessage::Width(wave_rect.w));
+                ui.send(
+                    self.ui_td_wave_text,
+                    TextMessage::Text(td_round_status_label(
+                        self.round_is_running,
+                        self.current_round,
+                        self.total_rounds,
+                    )),
+                );
             } else {
                 for i in 0..3 {
                     ui.send(
@@ -7958,6 +8033,10 @@ impl Plugin for Game {
                         WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
                     );
                 }
+                ui.send(
+                    self.ui_td_wave_text,
+                    WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                );
             }
 
             // 左下角英雄屬性面板：每 tick 重組文字並依 window_size 重定位
@@ -13449,6 +13528,31 @@ mod input_latency_tests {
         assert_eq!(td_start_control_label(false, true, 0, 3, 1), "1X");
         assert_eq!(td_start_control_label(false, true, 0, 3, 2), "2X");
         assert_eq!(td_start_control_label(false, false, 3, 3, 2), "DONE");
+    }
+
+    #[test]
+    fn td_round_status_label_shows_current_wave_being_fought() {
+        assert_eq!(td_round_status_label(false, 0, 3), "第 1 / 3 波");
+        assert_eq!(td_round_status_label(true, 0, 3), "第 1 / 3 波");
+        assert_eq!(td_round_status_label(false, 1, 3), "第 2 / 3 波");
+        assert_eq!(td_round_status_label(true, 1, 3), "第 2 / 3 波");
+        assert_eq!(td_round_status_label(false, 3, 3), "完成 3 / 3 波");
+        assert_eq!(td_round_status_label(false, 0, 0), String::new());
+    }
+
+    #[test]
+    fn td_camera_view_zooms_out_enough_for_right_panel() {
+        let config = td_camera_view_config();
+
+        assert!((16.0..=17.0).contains(&config.vertical_size));
+        assert!((0.5..=1.0).contains(&config.scene_position.x));
+    }
+
+    #[test]
+    fn td_mode_is_detected_from_lockstep_snapshot_resources() {
+        assert!(td_mode_from_snapshot(200, 40));
+        assert!(td_mode_from_snapshot(0, 40));
+        assert!(!td_mode_from_snapshot(0, 0));
     }
 
     #[test]
