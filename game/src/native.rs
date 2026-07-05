@@ -43,6 +43,7 @@ use fyrox::{
         light::{point::PointLightBuilder, BaseLightBuilder},
         mesh::Mesh,
         node::Node,
+        sound::{DataSource, SoundBuilder, Status},
         transform::TransformBuilder,
         EnvironmentLightingSource, Scene,
     },
@@ -54,12 +55,17 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fyrox_sound::buffer::SoundBufferResourceExtension;
+
 use omoba_core::lockstep_timing::{LockstepTiming, LOCKSTEP_ONE_SECOND_TICKS_U32, LOCKSTEP_TPS};
 
 pub use fyrox;
 
 #[path = "backend_session.rs"]
 pub(crate) mod backend_session;
+
+#[path = "hotkeys.rs"]
+pub(crate) mod hotkeys;
 #[path = "lockstep_client.rs"]
 pub(crate) mod lockstep_client;
 #[path = "pregame.rs"]
@@ -333,6 +339,7 @@ pub enum InputActionKind {
     SetTowerTargetPriority,
     CastAbility,
     UpgradeAbility,
+    DebugSpawnCreep,
     NoOp,
 }
 
@@ -353,6 +360,7 @@ impl InputActionKind {
             Some(Action::SetTowerTargetPriority(_)) => Self::SetTowerTargetPriority,
             Some(Action::CastAbility(_)) => Self::CastAbility,
             Some(Action::UpgradeAbility(_)) => Self::UpgradeAbility,
+            Some(Action::DebugSpawnCreep(_)) => Self::DebugSpawnCreep,
             Some(Action::NoOp(_)) | None => Self::NoOp,
         }
     }
@@ -619,6 +627,62 @@ fn ability_key_index(key: fyrox::keyboard::KeyCode) -> Option<u32> {
         KeyCode::KeyT => Some(3),
         _ => None,
     }
+}
+
+/// 解析度切換請求（設定頁下拉選單 → update() 套用）。
+#[derive(Clone, Copy, Debug)]
+enum DisplayModeRequest {
+    Fullscreen,
+    Windowed(u32, u32),
+}
+
+/// 設定頁「螢幕尺寸」下拉選單的 UI 節點與 hit-test 矩形。
+#[derive(Default, Debug)]
+struct ResolutionDropdownUi {
+    built: bool,
+    visible_applied: bool,
+    bg: Handle<UiNode>,
+    /// 每列：(列背景, 文字)
+    rows: Vec<(Handle<UiNode>, Handle<Text>)>,
+    row_rects: Vec<UiRect>,
+    ok_bg: Handle<UiNode>,
+    ok_text: Handle<Text>,
+    ok_rect: UiRect,
+}
+
+/// 下拉選單的解析度選項（None = Fullscreen，放最下面）。
+const RESOLUTION_OPTIONS: [Option<(u32, u32)>; 6] = [
+    Some((1280, 720)),
+    Some((1366, 768)),
+    Some((1600, 900)),
+    Some((1920, 1080)),
+    Some((2560, 1440)),
+    None,
+];
+
+/// 熱鍵設定面板（F1 開關）的 UI 節點與 hit-test 矩形。
+#[derive(Default, Debug)]
+struct HotkeyPanelUi {
+    built: bool,
+    /// 目前面板是否處於顯示位置（避免每 frame 重送隱藏訊息）。
+    visible_applied: bool,
+    backdrop: Handle<UiNode>,
+    bg: Handle<UiNode>,
+    header_banner: Handle<UiNode>,
+    title: Handle<Text>,
+    reset_bg: Handle<UiNode>,
+    reset_text: Handle<Text>,
+    reset_rect: UiRect,
+    close_bg: Handle<UiNode>,
+    close_text: Handle<Text>,
+    close_rect: UiRect,
+    cat_titles: Vec<Handle<Text>>,
+    /// 每列：(列卡片背景, 動作 label, 按鍵按鈕背景, 按鍵文字)
+    rows: Vec<(Handle<UiNode>, Handle<Text>, Handle<UiNode>, Handle<Text>)>,
+    /// 每列按鍵按鈕的 hit-test 矩形（與 rows 對齊）。
+    row_rects: Vec<UiRect>,
+    /// 每列對應的 action id（與 rows 對齊）。
+    row_ids: Vec<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1483,39 @@ fn load_texture_from_rel_path(rel_path: &str) -> Option<TextureResource> {
     load_texture_from_candidate_paths(candidate_paths)
 }
 
+fn load_sound_from_path(rel_path: &str) -> Option<fyrox::scene::sound::SoundBufferResource> {
+    // CWD when run via run.bat is omoba/omoba/ (project root).
+    // Sound assets live in omfx/game/data/ relative to that root.
+    let mut candidate_paths: Vec<String> = vec![
+        rel_path.to_string(),                       // CWD == game/ (dev server mode)
+        format!("omfx/game/{}", rel_path),          // CWD == omoba/omoba/ (run.bat)
+        format!("game/{}", rel_path),               // CWD == omfx/
+        format!("omfx/{}", rel_path),               // legacy omfx/data/ layout
+        format!("../{}", rel_path),                 // CWD == omfx/executor/
+        format!("../../game/{}", rel_path),         // CWD == omfx/target/debug/
+    ];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidate_paths.push(exe_dir.join(rel_path).to_string_lossy().into_owned());
+            // exe in target/debug/ → go up to omfx/ then into game/
+            if let Some(omfx_dir) = exe_dir.parent().and_then(|p| p.parent()) {
+                candidate_paths.push(omfx_dir.join("game").join(rel_path).to_string_lossy().into_owned());
+            }
+        }
+    }
+    for path in &candidate_paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            let data_source = DataSource::from_memory(bytes);
+            if let Ok(buf) = fyrox::scene::sound::SoundBufferResource::new_generic(data_source) {
+                log::info!("Sound loaded from: {}", path);
+                return Some(buf);
+            }
+        }
+    }
+    log::warn!("Sound not found ({}), tried: {:?}", rel_path, candidate_paths);
+    None
+}
+
 fn load_td_ui_texture(asset_name: &str) -> Option<TextureResource> {
     let script_rel = format!("scripts/base_content/assets/td_ui/{}", asset_name);
     let frontend_rel = format!("data/td_ui/{}", asset_name);
@@ -2120,6 +2217,13 @@ fn frame_time_summary(samples: &[f64]) -> (f64, f64, f64, f64) {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SfxKind {
+    ButtonClick,
+    TowerPlace,
+    CookieCrunch,
+}
+
 #[derive(Default, Visit, Reflect, Debug)]
 #[reflect(non_cloneable)]
 pub struct Game {
@@ -2143,6 +2247,65 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     settings_music_volume: f32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    bgm_handle: Handle<Node>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sfx_button_click: Option<fyrox::scene::sound::SoundBufferResource>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sfx_tower_place: Option<fyrox::scene::sound::SoundBufferResource>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sfx_cookie_crunch: Option<fyrox::scene::sound::SoundBufferResource>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sfx_one_shots: Vec<Handle<Node>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sfx_pending: Vec<SfxKind>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    entity_kind_cache: std::collections::HashMap<u32, sim_runner::EntityKind>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hotkeys: hotkeys::HotkeyConfig,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hotkey_panel_visible: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hotkey_rebinding: Option<String>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    hotkey_panel_ui: HotkeyPanelUi,
+    /// 設定頁「熱鍵」按鈕的 hit-test 矩形（非設定頁時為 default=不可命中）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_hotkey_btn_rect: UiRect,
+    /// 設定頁「螢幕尺寸」badge 的 hit-test 矩形（點擊開關下拉選單）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    settings_resolution_rect: UiRect,
+    /// 待套用的顯示模式（下一 frame 在 graphics context 可用時套用）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    pending_display_mode: Option<DisplayModeRequest>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    resolution_dropdown_open: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    resolution_dropdown_ui: ResolutionDropdownUi,
+    /// 目前是否為全螢幕（套用時更新，用於下拉選單高亮）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    display_fullscreen: bool,
+    /// 進入全螢幕前的視窗尺寸（Esc 退出全螢幕時還原用；(0,0)=未記錄）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    last_windowed_size: (u32, u32),
     #[visit(skip)]
     #[reflect(hidden)]
     settings_dragging_sfx: bool,
@@ -4195,7 +4358,7 @@ impl Plugin for Game {
 
         // 設定面板初始化
         self.settings_sfx_volume = 1.0;
-        self.settings_music_volume = 0.0;
+        self.settings_music_volume = 1.0;
         self.settings_speed_value = 1.0;
         self.ui_settings.bg = BorderBuilder::new(
             WidgetBuilder::new()
@@ -4466,6 +4629,28 @@ impl Plugin for Game {
         // client_projectiles 狀態不再初始化－消費者消失了。
         // （現場聲明仍需在同一階段 5.1 剪輯中刪除。）
 
+        // 背景音樂
+        if let Some(buffer) = load_sound_from_path("data/music/bgm.ogg") {
+            let scene = &mut context.scenes[self.scene];
+            let bgm_node = SoundBuilder::new(BaseBuilder::new())
+                .with_buffer(Some(buffer))
+                .with_looping(true)
+                .with_status(Status::Playing)
+                .with_gain(self.settings_music_volume)
+                .build_node();
+            self.bgm_handle = scene.graph.add_node(bgm_node);
+            log::info!("BGM node added, handle valid: {}", !self.bgm_handle.is_none());
+        }
+
+        // 音效
+        self.sfx_button_click  = load_sound_from_path("data/sfx/button_click.wav");
+        self.sfx_tower_place   = load_sound_from_path("data/sfx/tower_place.wav");
+        self.sfx_cookie_crunch = load_sound_from_path("data/sfx/cookie_crunch.wav");
+
+        self.hotkeys = hotkeys::HotkeyConfig::load();
+        self.hotkey_panel_visible = false;
+        self.hotkey_rebinding = None;
+
         Ok(())
     }
 
@@ -4490,6 +4675,49 @@ impl Plugin for Game {
         // 每 frame 清掉 drawing_context 的 line buffer，避免累積到無限大導致 FPS 為 0。
         // 後續 phase（爆炸 / 路徑 debug 等）會 push 新的 line 進來。
         scene.drawing_context.clear_lines();
+
+        // 每 frame 同步 BGM 音量（透過 primary audio bus）
+        scene.graph.sound_context.state().bus_graph_mut().primary_bus_mut().set_gain(self.settings_music_volume * 2.0);
+
+        // 播放待定音效（由 on_os_event 觸發）
+        let pending_sfx: Vec<SfxKind> = std::mem::take(&mut self.sfx_pending);
+        for kind in pending_sfx {
+            self.play_sfx(scene, kind);
+        }
+        // 每 60 幀清理一次已停止的一次性音效節點
+        if self.current_sim_tick % 60 == 0 {
+            self.cleanup_sfx_one_shots(scene);
+        }
+
+        // 套用設定頁請求的顯示模式切換（必須在 pregame 早退之前，
+        // 因為設定頁本身就在 pregame 模式）
+        if self.pending_display_mode.is_some() {
+            if let fyrox::engine::GraphicsContext::Initialized(ref gc) = context.graphics_context {
+                if let Some(mode) = self.pending_display_mode.take() {
+                    match mode {
+                        DisplayModeRequest::Fullscreen => {
+                            // 記住目前視窗尺寸，Esc 退出全螢幕時還原
+                            self.last_windowed_size =
+                                (self.window_size.x as u32, self.window_size.y as u32);
+                            gc.window.set_fullscreen(Some(
+                                fyrox::window::Fullscreen::Borderless(None),
+                            ));
+                            self.display_fullscreen = true;
+                            log::info!("顯示模式已套用: Fullscreen");
+                        }
+                        DisplayModeRequest::Windowed(w, h) => {
+                            gc.window.set_fullscreen(None);
+                            let _ = gc
+                                .window
+                                .request_inner_size(fyrox::dpi::PhysicalSize::new(w, h));
+                            self.display_fullscreen = false;
+                            log::info!("顯示模式已套用: {}x{}", w, h);
+                        }
+                    }
+                }
+            }
+        }
+
         if self.pregame_runtime.is_pregame() {
             let ui = context.user_interfaces.first_mut();
             self.update_pregame_ui(ui);
@@ -8165,6 +8393,9 @@ impl Plugin for Game {
             };
             ui.send(self.ui_shop_text, TextMessage::Text(shop));
 
+            // 熱鍵設定面板（F1 開關）
+            self.update_hotkey_panel(ui);
+
             let end_str = if self.game_ended {
                 "VICTORY!".to_string()
             } else {
@@ -8418,9 +8649,11 @@ impl Plugin for Game {
                     }
                 }
                 if self.handle_pregame_click(screen) {
+                    self.sfx_pending.push(SfxKind::ButtonClick);
                     return Ok(());
                 }
                 let mut hit_ui = false;
+                let mut play_button_sfx = false;
 
                 for i in 0..4 {
                     let (bx, by, bw, bh) = self.ability_upgrade_button_rects[i];
@@ -8436,6 +8669,7 @@ impl Plugin for Game {
                             event_us,
                         );
                         hit_ui = true;
+                        play_button_sfx = true;
                         break;
                     }
                 }
@@ -8456,6 +8690,7 @@ impl Plugin for Game {
                                 event_us,
                             );
                             hit_ui = true;
+                            play_button_sfx = true;
                             break;
                         }
                     }
@@ -8499,7 +8734,15 @@ impl Plugin for Game {
                             }
                         );
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
+                }
+
+                // 熱鍵設定面板：modal 點擊攔截（開啟時吃掉所有點擊）
+                if !hit_ui && self.hotkey_panel_visible {
+                    self.handle_hotkey_panel_click(screen);
+                    hit_ui = true;
+                    play_button_sfx = true;
                 }
 
                 // 1. Start Round / speed toggle button — Phase 5.x lockstep send
@@ -8511,55 +8754,9 @@ impl Plugin for Game {
                         && screen.y >= by
                         && screen.y <= by + bh
                     {
-                        if self.is_game_paused {
-                            let input = omoba_core::kcp::game_proto::PlayerInput {
-                                action: Some(
-                                    omoba_core::kcp::game_proto::player_input::Action::TogglePause(
-                                        omoba_core::kcp::game_proto::TogglePause {},
-                                    ),
-                                ),
-                            };
-                            self.send_lockstep_input_from(
-                                input,
-                                lockstep_client::InputOriginKind::OsEvent,
-                                event_us,
-                            );
-                            log::info!("Start/Resume → lockstep PlayerInput::TogglePause sent");
-                        } else if self.round_is_running {
-                            let input = omoba_core::kcp::game_proto::PlayerInput {
-                                action: Some(
-                                    omoba_core::kcp::game_proto::player_input::Action::ToggleGameSpeed(
-                                        omoba_core::kcp::game_proto::ToggleGameSpeed {},
-                                    ),
-                                ),
-                            };
-                            self.send_lockstep_input_from(
-                                input,
-                                lockstep_client::InputOriginKind::OsEvent,
-                                event_us,
-                            );
-                            log::info!(
-                                "Start Speed Toggle → lockstep PlayerInput::ToggleGameSpeed sent"
-                            );
-                        } else if !self.round_is_running
-                            && !(self.total_rounds > 0 && self.current_round >= self.total_rounds)
-                        {
-                            let input = omoba_core::kcp::game_proto::PlayerInput {
-                                action: Some(
-                                    omoba_core::kcp::game_proto::player_input::Action::StartRound(
-                                        omoba_core::kcp::game_proto::StartRound {},
-                                    ),
-                                ),
-                            };
-                            self.send_lockstep_input_from(
-                                input,
-                                lockstep_client::InputOriginKind::OsEvent,
-                                event_us,
-                            );
-                            self.td_auto_start_sent_for_idle_round = true;
-                            log::info!("Start Round → lockstep PlayerInput::StartRound sent");
-                        }
+                        self.trigger_start_round_button(event_us);
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8588,6 +8785,7 @@ impl Plugin for Game {
                             log::info!("Pause → lockstep PlayerInput::TogglePause sent");
                         }
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8616,6 +8814,7 @@ impl Plugin for Game {
                         self.ui_td_selected_panel.selected_path = 0;
                         log::info!("選中塔: {}", uid);
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8626,6 +8825,7 @@ impl Plugin for Game {
                         self.selected_tower_entity = None;
                         self.ui_td_selected_panel.selected_path = 0;
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8635,6 +8835,7 @@ impl Plugin for Game {
                     if ir.w > 0.0 && ir.contains(screen) {
                         self.ui_td_selected_panel.show_info = !self.ui_td_selected_panel.show_info;
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8660,11 +8861,13 @@ impl Plugin for Game {
                             self.ui_td_selected_panel.selected_path -= 1;
                         }
                         hit_ui = true;
+                        play_button_sfx = true;
                     } else if rr2.w > 0.0 && rr2.contains(screen) {
                         if self.ui_td_selected_panel.selected_path < 2 {
                             self.ui_td_selected_panel.selected_path += 1;
                         }
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8677,8 +8880,9 @@ impl Plugin for Game {
                         && screen.y >= by
                         && screen.y <= by + bh
                     {
-                        self.cycle_selected_tower_priority(event_us);
+                        self.cycle_selected_tower_priority(false, event_us);
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8689,50 +8893,11 @@ impl Plugin for Game {
                         && screen.y >= by
                         && screen.y <= by + bh
                     {
-                        if let Some(tid) = self.selected_tower_entity {
-                            let owned_by_local = tower_owned_by_local(
-                                self.network_entities
-                                    .get(&tid)
-                                    .and_then(|ent| ent.owner_player_id),
-                                self.local_player_id,
-                            );
-                            if !owned_by_local {
-                                log::warn!(
-                                    "Tower sell skipped locally: eid={} owner={:?} local_player_id={}",
-                                    tid,
-                                    self.network_entities
-                                        .get(&tid)
-                                        .and_then(|ent| ent.owner_player_id),
-                                    self.local_player_id
-                                );
-                            } else {
-                                // 階段 2.2：TowerSell 鎖步輸入。 tid 是
-                                // 塔實體 id（規範 `Entity::id()` u32）；
-                                // omb 的排水處理程序解析實體，驗證
-                                // 玩家陣營，退款85%基礎+75%升級，
-                                // 並刪除實體（快照差異清理
-                                // 使成為）。 selected_tower_entity 已清除
-                                // 無條件地因為該實體正在消失。
-                                let input = omoba_core::kcp::game_proto::PlayerInput {
-                                action: Some(
-                                    omoba_core::kcp::game_proto::player_input::Action::TowerSell(
-                                        omoba_core::kcp::game_proto::TowerSell {
-                                            tower_entity_id: tid,
-                                        },
-                                    ),
-                                ),
-                            };
-                                self.send_lockstep_input_from(
-                                    input,
-                                    lockstep_client::InputOriginKind::OsEvent,
-                                    event_us,
-                                );
-                                log::info!("Tower sell lockstep input submitted: eid={}", tid);
-                                self.selected_tower_entity = None;
-                                self.ui_td_selected_panel.selected_path = 0;
-                            }
-                        }
+                        // 階段 2.2：TowerSell 鎖步輸入（邏輯在
+                        // send_tower_sell_for_selected，與 Backspace 熱鍵共用）。
+                        self.send_tower_sell_for_selected(event_us);
                         hit_ui = true;
+                        play_button_sfx = true;
                     }
                 }
 
@@ -8746,67 +8911,10 @@ impl Plugin for Game {
                             && screen.y >= by
                             && screen.y < by + bh
                         {
-                            if let Some(tid) = self.selected_tower_entity {
-                                let owned_by_local = tower_owned_by_local(
-                                    self.network_entities
-                                        .get(&tid)
-                                        .and_then(|ent| ent.owner_player_id),
-                                    self.local_player_id,
-                                );
-                                if !owned_by_local {
-                                    log::warn!(
-                                        "Tower upgrade skipped locally: eid={} owner={:?} local_player_id={}",
-                                        tid,
-                                        self.network_entities
-                                            .get(&tid)
-                                            .and_then(|ent| ent.owner_player_id),
-                                        self.local_player_id
-                                    );
-                                    hit_ui = true;
-                                    break;
-                                }
-                                // 階段 2.3：TowerUpgrade 鎖步輸入。 tid 是
-                                // 塔實體 ID； `路徑`是0/1/2； `等級`
-                                // 是升級後的等級（current_level + 1）
-                                // 來自快取的
-                                // `network_entities[tid].upgrade_levels` 表示
-                                // 銷售/升級面板已在上面顯示。
-                                // omb 的排水處理程序將「level」視為提示
-                                // 並重新計算實際目標
-                                // 實體自己的`upgrade_levels[path] + 1`，
-                                // 所以這裡的過時快照仍然會產生
-                                // 正確升級。
-                                let current_level = self
-                                    .network_entities
-                                    .get(&tid)
-                                    .map(|e| e.upgrade_levels[path as usize])
-                                    .unwrap_or(0);
-                                let target_level = current_level + 1;
-                                let input = omoba_core::kcp::game_proto::PlayerInput {
-                                    action: Some(
-                                        omoba_core::kcp::game_proto::player_input::Action::TowerUpgrade(
-                                            omoba_core::kcp::game_proto::TowerUpgradeInput {
-                                                tower_entity_id: tid,
-                                                path: path as u32,
-                                                level: target_level as u32,
-                                            },
-                                        ),
-                                    ),
-                                };
-                                self.send_lockstep_input_from(
-                                    input,
-                                    lockstep_client::InputOriginKind::OsEvent,
-                                    event_us,
-                                );
-                                log::info!(
-                                    "Tower upgrade lockstep input submitted: eid={} path={} level={}",
-                                    tid, path, target_level
-                                );
-                                // 樂觀更新：立即更新本機快取讓 UI 即時反應，不用等 server snapshot
-                                if let Some(ent) = self.network_entities.get_mut(&tid) {
-                                    ent.upgrade_levels[path as usize] =
-                                        ent.upgrade_levels[path as usize].saturating_add(1);
-                                }
+                            // 階段 2.3：TowerUpgrade 鎖步輸入（邏輯在
+                            // send_tower_upgrade_for_selected，與 , . / 熱鍵共用）。
+                            if self.send_tower_upgrade_for_selected(path, event_us) {
+                                play_button_sfx = true;
                             }
                             hit_ui = true;
                             break;
@@ -8861,6 +8969,7 @@ impl Plugin for Game {
                                         "Tower place lockstep input submitted: kind='{}' kind_id={} pos=({}, {})",
                                         kind, tid.0, pos.x, pos.y
                                     );
+                                    self.sfx_pending.push(SfxKind::TowerPlace);
                                     if !self.ctrl_held {
                                         self.selected_tower_kind = None;
                                     }
@@ -8937,6 +9046,10 @@ impl Plugin for Game {
                             self.ui_td_selected_panel.selected_path = 0;
                         }
                     }
+                }
+
+                if play_button_sfx {
+                    self.sfx_pending.push(SfxKind::ButtonClick);
                 }
             }
             // Right click：TD 模式優先用來取消選塔；若無任何選取才送 HeroMove
@@ -9031,6 +9144,51 @@ impl Plugin for Game {
                 if !pressed {
                     return Ok(());
                 }
+                // F1：開關熱鍵設定面板（pregame 設定頁與遊戲中皆可用）
+                if key == KeyCode::F1 {
+                    self.hotkey_panel_visible = !self.hotkey_panel_visible;
+                    self.hotkey_rebinding = None;
+                    return Ok(());
+                }
+                // 熱鍵設定面板開啟時攔截所有按鍵（重綁模式下下一鍵成為新綁定）
+                // 必須在 pregame guard 之前，設定頁開面板時才能重綁
+                if self.hotkey_panel_visible {
+                    if let Some(rebind_id) = self.hotkey_rebinding.take() {
+                        if key == KeyCode::Escape {
+                            // Escape 取消重綁
+                        } else if hotkeys::is_bindable_key(key) {
+                            self.hotkeys.rebind(&rebind_id, key, self.ctrl_held);
+                            self.hotkeys.save();
+                            log::info!(
+                                "熱鍵重綁: {} → {}",
+                                rebind_id,
+                                self.hotkeys.binding_display(&rebind_id)
+                            );
+                        } else {
+                            // 不可綁定的鍵（F 鍵等）：維持等待狀態
+                            self.hotkey_rebinding = Some(rebind_id);
+                        }
+                    } else if key == KeyCode::Escape {
+                        self.hotkey_panel_visible = false;
+                    }
+                    return Ok(());
+                }
+
+                // Esc 退出全螢幕（pregame 選單中；遊戲中的 Esc 保留原本取消功能）
+                if key == KeyCode::Escape
+                    && !self.ctrl_held
+                    && self.display_fullscreen
+                    && self.pregame_runtime.is_pregame()
+                {
+                    let (w, h) = if self.last_windowed_size.0 > 0 {
+                        self.last_windowed_size
+                    } else {
+                        (1920, 1080)
+                    };
+                    self.pending_display_mode = Some(DisplayModeRequest::Windowed(w, h));
+                    log::info!("Esc → 退出全螢幕，還原 {}x{}", w, h);
+                    return Ok(());
+                }
                 if self.pregame_runtime.is_pregame() {
                     return Ok(());
                 }
@@ -9051,7 +9209,8 @@ impl Plugin for Game {
                 // 按 W/E/R/T → lockstep PlayerInput::CastAbility (ability_index
                 // 0/1/2/3)。滑鼠 world pos 會成為 optional `target_pos`。
                 // Modifier 按住的情境（Shift = 升級，不是施法）會排除。
-                if !self.shift_held {
+                // TD 模式下 W/E/R/T 讓位給塔熱鍵；只有非 TD 模式才觸發技能
+                if !self.shift_held && self.td_template_order.is_empty() {
                     if let Some(ability_index) = ability_key_index(key) {
                         self.send_cast_ability_input_from(
                             ability_index,
@@ -9063,8 +9222,24 @@ impl Plugin for Game {
                     }
                 }
 
+                // TD 模式：資料驅動熱鍵（F1 面板可重綁，預設對齊 BTD6）
+                if !self.td_template_order.is_empty() && !self.shift_held {
+                    if let Some(action_id) = self
+                        .hotkeys
+                        .resolve(key, self.ctrl_held)
+                        .map(|s| s.to_string())
+                    {
+                        if self.dispatch_td_hotkey(&action_id, event_us) {
+                            return Ok(());
+                        }
+                    }
+                }
+
                 match key {
-                    KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR | KeyCode::KeyT => {
+                    // TD 模式下此 arm 讓位；非 TD 模式下 Shift+WERT 升級技能
+                    KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR | KeyCode::KeyT
+                        if self.td_template_order.is_empty() =>
+                    {
                         let slot = match key {
                             KeyCode::KeyW => "W",
                             KeyCode::KeyE => "E",
@@ -9082,58 +9257,44 @@ impl Plugin for Game {
                                 );
                             }
                         } else {
-                            // 演員表已通過上面的 lockstep 發送；在這裡沒什麼可做的。
-                            // （樂觀的本地冷卻簿記是由
-                            // 遺留的 Hero_state 快取將隨 apply_event 一起消失。 ）
                             let _ = (slot, world);
                         }
                     }
-                    KeyCode::KeyB => {
+                    // TD 模式下 B/A 讓位給塔熱鍵（BTD6 對齊）
+                    KeyCode::KeyB if self.td_template_order.is_empty() => {
                         self.shop_visible = !self.shop_visible;
                     }
-                    KeyCode::KeyA => {
+                    KeyCode::KeyA if self.td_template_order.is_empty() => {
                         self.attack_move_armed = true;
                         log::info!("AttackMove armed");
                     }
+                    // P 更改目標優先（legacy 綁定，Tab 由熱鍵設定控制）
                     KeyCode::KeyP if self.selected_tower_entity.is_some() => {
-                        self.cycle_selected_tower_priority(event_us);
+                        self.cycle_selected_tower_priority(false, event_us);
                     }
-                    // TD 模式：1-9 鍵盤快捷選塔（依 td_template_order 順序）；Escape 取消選取
-                    KeyCode::Digit1
-                    | KeyCode::Digit2
-                    | KeyCode::Digit3
-                    | KeyCode::Digit4
-                    | KeyCode::Digit5
-                    | KeyCode::Digit6
-                    | KeyCode::Digit7
-                    | KeyCode::Digit8
-                    | KeyCode::Digit9
-                        if !self.shop_visible =>
-                    {
-                        let idx = match key {
-                            KeyCode::Digit1 => 0,
-                            KeyCode::Digit2 => 1,
-                            KeyCode::Digit3 => 2,
-                            KeyCode::Digit4 => 3,
-                            KeyCode::Digit5 => 4,
-                            KeyCode::Digit6 => 5,
-                            KeyCode::Digit7 => 6,
-                            KeyCode::Digit8 => 7,
-                            KeyCode::Digit9 => 8,
-                            _ => unreachable!(),
-                        };
-                        if let Some(uid) = self.td_template_order.get(idx).cloned() {
-                            self.selected_tower_kind = Some(uid.clone());
-                            log::info!("快捷選中塔: {}", uid);
-                        }
-                    }
+                    // TD 塔操作/選塔/沙箱熱鍵已全部改為資料驅動
+                    // （dispatch_td_hotkey，F1 面板可重綁），不再硬編碼。
                     KeyCode::Escape => {
+                        let mut consumed = false;
                         if self.attack_move_armed {
                             self.attack_move_armed = false;
+                            consumed = true;
                         }
                         if self.selected_tower_kind.is_some() {
                             self.selected_tower_kind = None;
                             log::info!("取消選塔");
+                            consumed = true;
+                        }
+                        // 遊戲中沒有東西可取消時，Esc 也能退出全螢幕
+                        if !consumed && self.display_fullscreen {
+                            let (w, h) = if self.last_windowed_size.0 > 0 {
+                                self.last_windowed_size
+                            } else {
+                                (1920, 1080)
+                            };
+                            self.pending_display_mode =
+                                Some(DisplayModeRequest::Windowed(w, h));
+                            log::info!("Esc → 退出全螢幕，還原 {}x{}", w, h);
                         }
                     }
                     // 數字鍵: shop 開啟時購買對應 index 裝備；否則使用對應背包 slot
@@ -9687,6 +9848,50 @@ impl Game {
         if !self.pregame_runtime.is_pregame() {
             return false;
         }
+        // 熱鍵面板開啟時為 modal，吃掉所有點擊
+        if self.hotkey_panel_visible {
+            self.handle_hotkey_panel_click(screen);
+            return true;
+        }
+        // 設定頁「熱鍵」按鈕 → 開啟熱鍵設定面板
+        if self.settings_hotkey_btn_rect.w > 0.0
+            && self.settings_hotkey_btn_rect.contains(screen)
+        {
+            self.hotkey_panel_visible = true;
+            self.hotkey_rebinding = None;
+            return true;
+        }
+        // 解析度下拉選單開啟中：選項 / 好的 / 外部點擊
+        if self.resolution_dropdown_open {
+            let mut hit_option: Option<usize> = None;
+            for (i, rect) in self.resolution_dropdown_ui.row_rects.iter().enumerate() {
+                if rect.contains(screen) {
+                    hit_option = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = hit_option {
+                let mode = match RESOLUTION_OPTIONS.get(i).copied().flatten() {
+                    None => DisplayModeRequest::Fullscreen,
+                    Some((w, h)) => DisplayModeRequest::Windowed(w, h),
+                };
+                self.pending_display_mode = Some(mode);
+                log::info!("解析度選項點選: {:?}", mode);
+            } else if self.resolution_dropdown_ui.ok_rect.contains(screen) {
+                self.resolution_dropdown_open = false;
+            } else if !self.settings_resolution_rect.contains(screen) {
+                // 點擊選單外側 → 關閉
+                self.resolution_dropdown_open = false;
+            }
+            return true;
+        }
+        // 設定頁「螢幕尺寸」badge → 開啟下拉選單
+        if self.settings_resolution_rect.w > 0.0
+            && self.settings_resolution_rect.contains(screen)
+        {
+            self.resolution_dropdown_open = true;
+            return true;
+        }
         let action = self
             .pregame_button_rects
             .iter()
@@ -10144,6 +10349,9 @@ impl Game {
         ui.send(self.ui_pregame.status, TextMessage::Text(status));
 
         self.pregame_button_rects.clear();
+        // 非設定頁時清掉設定頁專屬 rect（設定頁 layout 每 frame 會重新設定）
+        self.settings_hotkey_btn_rect = UiRect::default();
+        self.settings_resolution_rect = UiRect::default();
         let mut node_index = 0;
         match self.pregame_runtime.state {
             pregame::PregameState::MainMenu => {
@@ -10261,9 +10469,10 @@ impl Game {
         ui.send(self.ui_settings.title_text, WidgetMessage::Height(title_bar.h));
         ui.send(self.ui_settings.title_text, TextMessage::Text("設定".to_string()));
 
-        // 解析度 badge（右）
+        // 解析度 badge（右）——可點擊循環切換解析度
         let badge_w = full.w * 0.14;
         let badge = UiRect { x: full.w * 0.96 - badge_w, y: bar_y, w: badge_w, h: title_h };
+        self.settings_resolution_rect = badge;
         ui.send(self.ui_settings.resolution_badge_bg, WidgetMessage::DesiredPosition(badge.pos()));
         ui.send(self.ui_settings.resolution_badge_bg, WidgetMessage::Width(badge.w));
         ui.send(self.ui_settings.resolution_badge_bg, WidgetMessage::Height(badge.h));
@@ -10413,10 +10622,14 @@ impl Game {
         let total_btn_w = btn_size * btn_names.len() as f32 + btn_gap * (btn_names.len() - 1) as f32;
         let btn_start_x = (full.w - total_btn_w) * 0.5;
         let btn_row_y  = content_y + content_h + full.h * 0.03;
+        self.settings_hotkey_btn_rect = UiRect::default();
         for (i, btn) in self.ui_settings.placeholder_btns.iter().enumerate() {
             if i >= btn_names.len() { break; }
             let bx = btn_start_x + i as f32 * (btn_size + btn_gap);
             let br = UiRect { x: bx, y: btn_row_y, w: btn_size, h: btn_size };
+            if btn_names[i] == "熱鍵" {
+                self.settings_hotkey_btn_rect = br;
+            }
             ui.send(btn.bg, WidgetMessage::DesiredPosition(br.pos()));
             ui.send(btn.bg, WidgetMessage::Width(br.w));
             ui.send(btn.bg, WidgetMessage::Height(br.h));
@@ -10433,6 +10646,10 @@ impl Game {
 
         // Register back button
         self.pregame_button_rects.push((back, pregame::PregameAction::Back));
+
+        // 設定頁也要驅動解析度下拉選單與熱鍵面板
+        self.update_resolution_dropdown(ui);
+        self.update_hotkey_panel(ui);
     }
 
     fn hide_gameplay_ui_for_pregame(&mut self, ui: &mut UserInterface) {
@@ -10531,6 +10748,42 @@ impl Game {
             })
             .max_by_key(|variant| (variant.min_level, variant.count))
             .cloned()
+    }
+
+    fn play_sfx(&mut self, scene: &mut Scene, kind: SfxKind) {
+        let buf = match kind {
+            SfxKind::ButtonClick  => self.sfx_button_click.clone(),
+            SfxKind::TowerPlace   => self.sfx_tower_place.clone(),
+            SfxKind::CookieCrunch => self.sfx_cookie_crunch.clone(),
+        };
+        let Some(buf) = buf else { return; };
+        let gain = self.settings_sfx_volume;
+        if gain <= 0.001 { return; }
+        let node = SoundBuilder::new(BaseBuilder::new())
+            .with_buffer(Some(buf))
+            .with_looping(false)
+            .with_status(Status::Playing)
+            .with_gain(gain)
+            .build_node();
+        let h = scene.graph.add_node(node);
+        self.sfx_one_shots.push(h);
+    }
+
+    fn cleanup_sfx_one_shots(&mut self, scene: &mut Scene) {
+        use fyrox::scene::sound::Sound;
+        let finished: Vec<Handle<Node>> = self.sfx_one_shots.iter().copied()
+            .filter(|&h| {
+                scene.graph.try_get(h)
+                    .ok()
+                    .and_then(|n| n.cast::<Sound>())
+                    .map(|s| s.status() == Status::Stopped)
+                    .unwrap_or(true)
+            })
+            .collect();
+        for h in &finished {
+            scene.graph.remove_node(*h);
+        }
+        self.sfx_one_shots.retain(|h| !finished.contains(h));
     }
 
     fn remove_tower_composite(&mut self, scene: &mut Scene, entity_id: u32) {
@@ -11678,6 +11931,7 @@ impl Game {
                 continue;
             }
             alive.insert(e.entity_id);
+            self.entity_kind_cache.insert(e.entity_id, e.kind);
 
             let pos = render_bridge::world_to_render(e);
             let (color, size, z) = render_bridge::style_for_entity(e);
@@ -11923,6 +12177,14 @@ impl Game {
         // 遺留的線路端「entity.death」事件。下面的掃描保持為
         // 對早於第一個 prev_alive 集的早期幀 eids 的防禦。
         for &eid in &snapshot.removed_entity_ids {
+            // 每個 Creep 死亡各播一聲餅乾碎裂
+            if self.entity_kind_cache.get(&eid)
+                .map(|k| matches!(k, sim_runner::EntityKind::Creep))
+                .unwrap_or(false)
+            {
+                self.play_sfx(scene, SfxKind::CookieCrunch);
+            }
+            self.entity_kind_cache.remove(&eid);
             self.remove_tower_composite(scene, eid);
             self.remove_hero_model(scene, eid);
             if let Some(slots) = self.sim_entity_slots.remove(&eid) {
@@ -11954,6 +12216,14 @@ impl Game {
             .copied()
             .collect();
         for id in to_remove {
+            // 備用路徑的餅乾碎裂音效
+            if self.entity_kind_cache.get(&id)
+                .map(|k| matches!(k, sim_runner::EntityKind::Creep))
+                .unwrap_or(false)
+            {
+                self.play_sfx(scene, SfxKind::CookieCrunch);
+            }
+            self.entity_kind_cache.remove(&id);
             self.remove_tower_composite(scene, id);
             self.remove_hero_model(scene, id);
             if let Some(slots) = self.sim_entity_slots.remove(&id) {
@@ -12359,7 +12629,7 @@ impl Game {
         );
     }
 
-    fn cycle_selected_tower_priority(&mut self, origin_us: u64) {
+    fn cycle_selected_tower_priority(&mut self, reverse: bool, origin_us: u64) {
         let Some(tid) = self.selected_tower_entity else {
             return;
         };
@@ -12368,14 +12638,26 @@ impl Game {
             .get(&tid)
             .map(|ent| ent.tower_target_priority.as_str())
             .unwrap_or("first");
-        let next = match current {
-            "first" => 1,
-            "last" => 2,
-            "nearest" => 3,
-            "farthest" => 4,
-            "highest_health" => 5,
-            "lowest_health" => 0,
-            _ => 0,
+        let next = if reverse {
+            match current {
+                "first" => 5,
+                "last" => 0,
+                "nearest" => 1,
+                "farthest" => 2,
+                "highest_health" => 3,
+                "lowest_health" => 4,
+                _ => 0,
+            }
+        } else {
+            match current {
+                "first" => 1,
+                "last" => 2,
+                "nearest" => 3,
+                "farthest" => 4,
+                "highest_health" => 5,
+                "lowest_health" => 0,
+                _ => 0,
+            }
         };
         self.send_tower_target_priority_input_from(
             tid,
@@ -12383,6 +12665,803 @@ impl Game {
             lockstep_client::InputOriginKind::OsEvent,
             origin_us,
         );
+    }
+
+    /// 升級選中塔的指定路線（0/1/2）。UI 按鈕與 , . / 熱鍵共用。
+    /// 回傳是否實際送出 lockstep input。
+    fn send_tower_upgrade_for_selected(&mut self, path: u8, event_us: u64) -> bool {
+        let Some(tid) = self.selected_tower_entity else {
+            return false;
+        };
+        let owned_by_local = tower_owned_by_local(
+            self.network_entities
+                .get(&tid)
+                .and_then(|ent| ent.owner_player_id),
+            self.local_player_id,
+        );
+        if !owned_by_local {
+            log::warn!(
+                "Tower upgrade skipped locally: eid={} owner={:?} local_player_id={}",
+                tid,
+                self.network_entities
+                    .get(&tid)
+                    .and_then(|ent| ent.owner_player_id),
+                self.local_player_id
+            );
+            return false;
+        }
+        let current_level = self
+            .network_entities
+            .get(&tid)
+            .map(|e| e.upgrade_levels[path as usize])
+            .unwrap_or(0);
+        let target_level = current_level + 1;
+        let input = omoba_core::kcp::game_proto::PlayerInput {
+            action: Some(
+                omoba_core::kcp::game_proto::player_input::Action::TowerUpgrade(
+                    omoba_core::kcp::game_proto::TowerUpgradeInput {
+                        tower_entity_id: tid,
+                        path: path as u32,
+                        level: target_level as u32,
+                    },
+                ),
+            ),
+        };
+        self.send_lockstep_input_from(input, lockstep_client::InputOriginKind::OsEvent, event_us);
+        log::info!(
+            "Tower upgrade lockstep input submitted: eid={} path={} level={}",
+            tid,
+            path,
+            target_level
+        );
+        // 樂觀更新：立即更新本機快取讓 UI 即時反應，不用等 server snapshot
+        if let Some(ent) = self.network_entities.get_mut(&tid) {
+            ent.upgrade_levels[path as usize] = ent.upgrade_levels[path as usize].saturating_add(1);
+        }
+        true
+    }
+
+    /// 賣出選中塔。UI 賣出按鈕與 Backspace 熱鍵共用。
+    /// 回傳是否實際送出 lockstep input。
+    fn send_tower_sell_for_selected(&mut self, event_us: u64) -> bool {
+        let Some(tid) = self.selected_tower_entity else {
+            return false;
+        };
+        let owned_by_local = tower_owned_by_local(
+            self.network_entities
+                .get(&tid)
+                .and_then(|ent| ent.owner_player_id),
+            self.local_player_id,
+        );
+        if !owned_by_local {
+            log::warn!(
+                "Tower sell skipped locally: eid={} owner={:?} local_player_id={}",
+                tid,
+                self.network_entities
+                    .get(&tid)
+                    .and_then(|ent| ent.owner_player_id),
+                self.local_player_id
+            );
+            return false;
+        }
+        let input = omoba_core::kcp::game_proto::PlayerInput {
+            action: Some(
+                omoba_core::kcp::game_proto::player_input::Action::TowerSell(
+                    omoba_core::kcp::game_proto::TowerSell {
+                        tower_entity_id: tid,
+                    },
+                ),
+            ),
+        };
+        self.send_lockstep_input_from(input, lockstep_client::InputOriginKind::OsEvent, event_us);
+        log::info!("Tower sell lockstep input submitted: eid={}", tid);
+        self.selected_tower_entity = None;
+        self.ui_td_selected_panel.selected_path = 0;
+        true
+    }
+
+    /// Start Round 按鈕三態邏輯：暫停中→恢復、回合進行中→切換速度、閒置→開始回合。
+    /// UI 按鈕與 Space 熱鍵共用。
+    fn trigger_start_round_button(&mut self, event_us: u64) {
+        if self.is_game_paused {
+            let input = omoba_core::kcp::game_proto::PlayerInput {
+                action: Some(
+                    omoba_core::kcp::game_proto::player_input::Action::TogglePause(
+                        omoba_core::kcp::game_proto::TogglePause {},
+                    ),
+                ),
+            };
+            self.send_lockstep_input_from(
+                input,
+                lockstep_client::InputOriginKind::OsEvent,
+                event_us,
+            );
+            log::info!("Start/Resume → lockstep PlayerInput::TogglePause sent");
+        } else if self.round_is_running {
+            let input = omoba_core::kcp::game_proto::PlayerInput {
+                action: Some(
+                    omoba_core::kcp::game_proto::player_input::Action::ToggleGameSpeed(
+                        omoba_core::kcp::game_proto::ToggleGameSpeed {},
+                    ),
+                ),
+            };
+            self.send_lockstep_input_from(
+                input,
+                lockstep_client::InputOriginKind::OsEvent,
+                event_us,
+            );
+            log::info!("Start Speed Toggle → lockstep PlayerInput::ToggleGameSpeed sent");
+        } else if !(self.total_rounds > 0 && self.current_round >= self.total_rounds) {
+            let input = omoba_core::kcp::game_proto::PlayerInput {
+                action: Some(
+                    omoba_core::kcp::game_proto::player_input::Action::StartRound(
+                        omoba_core::kcp::game_proto::StartRound {},
+                    ),
+                ),
+            };
+            self.send_lockstep_input_from(
+                input,
+                lockstep_client::InputOriginKind::OsEvent,
+                event_us,
+            );
+            self.td_auto_start_sent_for_idle_round = true;
+            log::info!("Start Round → lockstep PlayerInput::StartRound sent");
+        }
+    }
+
+    /// TD 模式資料驅動熱鍵分派（來源：hotkeys::HotkeyConfig，F1 面板可重綁）。
+    /// 回傳 true 表示按鍵已被消耗。
+    fn dispatch_td_hotkey(&mut self, id: &str, event_us: u64) -> bool {
+        if let Some(rest) = id.strip_prefix("select_tower_") {
+            if self.shop_visible {
+                return false;
+            }
+            let Ok(n) = rest.parse::<usize>() else {
+                return false;
+            };
+            let idx = n.saturating_sub(1);
+            if let Some(uid) = self.td_template_order.get(idx).cloned() {
+                self.selected_tower_kind = Some(uid.clone());
+                self.selected_tower_entity = None;
+                log::info!("熱鍵選塔 [{}]: {}", idx, uid);
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("spawn_creep_") {
+            let Ok(n) = rest.parse::<u32>() else {
+                return false;
+            };
+            let emitter_index = n.saturating_sub(1);
+            let input = omoba_core::kcp::game_proto::PlayerInput {
+                action: Some(
+                    omoba_core::kcp::game_proto::player_input::Action::DebugSpawnCreep(
+                        omoba_core::kcp::game_proto::DebugSpawnCreep {
+                            emitter_index,
+                            count: 1,
+                        },
+                    ),
+                ),
+            };
+            self.send_lockstep_input_from(
+                input,
+                lockstep_client::InputOriginKind::OsEvent,
+                event_us,
+            );
+            log::info!("沙箱生怪熱鍵 → emitter_index={}", emitter_index);
+            return true;
+        }
+        match id {
+            "upgrade_path_1" | "upgrade_path_2" | "upgrade_path_3" => {
+                if self.selected_tower_entity.is_none() {
+                    return false;
+                }
+                let path: u8 = match id {
+                    "upgrade_path_1" => 0,
+                    "upgrade_path_2" => 1,
+                    _ => 2,
+                };
+                self.send_tower_upgrade_for_selected(path, event_us);
+                true
+            }
+            "sell_tower" => {
+                if self.selected_tower_entity.is_none() {
+                    return false;
+                }
+                self.send_tower_sell_for_selected(event_us);
+                true
+            }
+            "change_target" | "change_target_reverse" => {
+                if self.selected_tower_entity.is_none() {
+                    return false;
+                }
+                self.cycle_selected_tower_priority(id == "change_target_reverse", event_us);
+                true
+            }
+            "copy_tower" => {
+                let Some(kind) = self
+                    .selected_tower_entity
+                    .and_then(|tid| self.network_entities.get(&tid))
+                    .and_then(|ent| ent.tower_kind.clone())
+                else {
+                    return false;
+                };
+                self.selected_tower_kind = Some(kind.clone());
+                self.selected_tower_entity = None;
+                log::info!("複製塔: {}", kind);
+                true
+            }
+            "start_round" => {
+                self.trigger_start_round_button(event_us);
+                true
+            }
+            "toggle_pause" => {
+                let input = omoba_core::kcp::game_proto::PlayerInput {
+                    action: Some(
+                        omoba_core::kcp::game_proto::player_input::Action::TogglePause(
+                            omoba_core::kcp::game_proto::TogglePause {},
+                        ),
+                    ),
+                };
+                self.send_lockstep_input_from(
+                    input,
+                    lockstep_client::InputOriginKind::OsEvent,
+                    event_us,
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 設定頁解析度下拉選單：lazy 建立、每 frame 佈局與高亮更新。
+    fn update_resolution_dropdown(&mut self, ui: &mut UserInterface) {
+        let dd = &mut self.resolution_dropdown_ui;
+        let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        if !self.resolution_dropdown_open {
+            if dd.built && dd.visible_applied {
+                ui.send(dd.bg, WidgetMessage::DesiredPosition(hidden));
+                for (row_bg, text) in &dd.rows {
+                    ui.send(*row_bg, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(*text, WidgetMessage::DesiredPosition(hidden));
+                }
+                ui.send(dd.ok_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(dd.ok_text, WidgetMessage::DesiredPosition(hidden));
+                dd.row_rects.clear();
+                dd.ok_rect = UiRect::default();
+                dd.visible_applied = false;
+            }
+            return;
+        }
+
+        if !dd.built {
+            // 棕色圓角容器（BTD6 下拉風格）
+            dd.bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(96, 58, 26, 255)).into())
+                    .with_background(Brush::Solid(Color::from_rgba(130, 84, 42, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.5).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            for _ in RESOLUTION_OPTIONS.iter() {
+                let row_bg = BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_background(
+                            Brush::Solid(Color::from_rgba(70, 44, 20, 255)).into(),
+                        ),
+                )
+                .with_stroke_thickness(Thickness::uniform(0.0).into())
+                .with_corner_radius(8.0_f32.into())
+                .build(&mut ui.build_ctx())
+                .transmute();
+                let text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(
+                            Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into(),
+                        ),
+                )
+                .with_font_size(22.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                dd.rows.push((row_bg, text));
+            }
+            dd.ok_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
+                    .with_background(Brush::Solid(Color::from_rgba(110, 198, 50, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.5).into())
+            .with_corner_radius(14.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            dd.ok_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("好的".to_string())
+            .with_font_size(26.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            dd.built = true;
+        }
+
+        // 佈局：badge 正下方
+        let badge = self.settings_resolution_rect;
+        let row_h = (badge.h * 0.58).max(30.0);
+        let gap = row_h * 0.16;
+        let ok_h = row_h * 1.15;
+        let x = badge.x;
+        let w = badge.w;
+        let top = badge.y + badge.h + 6.0;
+        let total_h =
+            RESOLUTION_OPTIONS.len() as f32 * (row_h + gap) + ok_h + gap * 2.0 + 16.0;
+        let bg_rect = UiRect {
+            x: x - 10.0,
+            y: top - 8.0,
+            w: w + 20.0,
+            h: total_h,
+        };
+        ui.send(dd.bg, WidgetMessage::DesiredPosition(bg_rect.pos()));
+        ui.send(dd.bg, WidgetMessage::Width(bg_rect.w));
+        ui.send(dd.bg, WidgetMessage::Height(bg_rect.h));
+
+        dd.row_rects.clear();
+        let cur_w = self.window_size.x as u32;
+        let mut y = top;
+        for (i, opt) in RESOLUTION_OPTIONS.iter().enumerate() {
+            let rect = UiRect { x, y, w, h: row_h };
+            let (row_bg, text) = dd.rows[i];
+            let selected = match opt {
+                None => self.display_fullscreen,
+                Some((ow, _)) => !self.display_fullscreen && cur_w.abs_diff(*ow) < 40,
+            };
+            let color = if selected {
+                Color::from_rgba(110, 198, 50, 255)
+            } else {
+                Color::from_rgba(70, 44, 20, 255)
+            };
+            ui.send(row_bg, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(row_bg, WidgetMessage::Width(rect.w));
+            ui.send(row_bg, WidgetMessage::Height(rect.h));
+            ui.send(row_bg, WidgetMessage::Background(Brush::Solid(color).into()));
+            ui.send(text, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(text, WidgetMessage::Width(rect.w));
+            ui.send(text, WidgetMessage::Height(rect.h));
+            let label = match opt {
+                None => "Fullscreen".to_string(),
+                Some((ow, oh)) => format!("{} x {}", ow, oh),
+            };
+            ui.send(text, TextMessage::Text(label));
+            dd.row_rects.push(rect);
+            y += row_h + gap;
+        }
+        dd.ok_rect = UiRect {
+            x,
+            y: y + gap,
+            w,
+            h: ok_h,
+        };
+        ui.send(dd.ok_bg, WidgetMessage::DesiredPosition(dd.ok_rect.pos()));
+        ui.send(dd.ok_bg, WidgetMessage::Width(dd.ok_rect.w));
+        ui.send(dd.ok_bg, WidgetMessage::Height(dd.ok_rect.h));
+        ui.send(dd.ok_text, WidgetMessage::DesiredPosition(dd.ok_rect.pos()));
+        ui.send(dd.ok_text, WidgetMessage::Width(dd.ok_rect.w));
+        ui.send(dd.ok_text, WidgetMessage::Height(dd.ok_rect.h));
+        dd.visible_applied = true;
+    }
+
+    /// 熱鍵設定面板點擊處理（in-game 與 pregame 設定頁共用）。
+    fn handle_hotkey_panel_click(&mut self, screen: Vector2<f32>) {
+        let close_rect = self.hotkey_panel_ui.close_rect;
+        let reset_rect = self.hotkey_panel_ui.reset_rect;
+        if close_rect.contains(screen) {
+            self.hotkey_panel_visible = false;
+            self.hotkey_rebinding = None;
+        } else if reset_rect.contains(screen) {
+            self.hotkeys = hotkeys::HotkeyConfig::defaults();
+            self.hotkeys.save();
+            self.hotkey_rebinding = None;
+            log::info!("熱鍵已恢復預設值");
+        } else {
+            let mut hit_row: Option<&'static str> = None;
+            for (i, rect) in self.hotkey_panel_ui.row_rects.iter().enumerate() {
+                if rect.contains(screen) {
+                    hit_row = self.hotkey_panel_ui.row_ids.get(i).copied();
+                    break;
+                }
+            }
+            if let Some(id) = hit_row {
+                self.hotkey_rebinding = Some(id.to_string());
+            }
+        }
+    }
+
+    /// 熱鍵設定面板：lazy 建立節點、每 frame 更新位置與文字。
+    fn update_hotkey_panel(&mut self, ui: &mut UserInterface) {
+        let panel = &mut self.hotkey_panel_ui;
+        if !self.hotkey_panel_visible {
+            if panel.built && panel.visible_applied {
+                let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+                ui.send(panel.backdrop, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.header_banner, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.title, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.reset_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.reset_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.close_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.close_text, WidgetMessage::DesiredPosition(hidden));
+                for h in &panel.cat_titles {
+                    ui.send(*h, WidgetMessage::DesiredPosition(hidden));
+                }
+                for (row_bg, label, key_bg, key_text) in &panel.rows {
+                    ui.send(*row_bg, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(*label, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(*key_bg, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(*key_text, WidgetMessage::DesiredPosition(hidden));
+                }
+                panel.row_rects.clear();
+                panel.reset_rect = UiRect::default();
+                panel.close_rect = UiRect::default();
+                panel.visible_applied = false;
+            }
+            return;
+        }
+
+        let defs = hotkeys::hotkey_defs();
+        if !panel.built {
+            let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+            // BTD6 全螢幕深藍 backdrop
+            panel.backdrop = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_background(Brush::Solid(Color::from_rgba(16, 28, 58, 245)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            // 內容大卡片：亮藍灰圓角容器
+            panel.bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_background(Brush::Solid(Color::from_rgba(150, 172, 212, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(18.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            // 棕色木質標題橫幅（BTD6 頂部）
+            // 注意：LinearGradient 需要 build 時就有 width/height，否則漸層
+            // 以整個畫面空間計算，顏色會隨位置漂移（賣出按鈕同 pattern）。
+            panel.header_banner = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_width(440.0)
+                    .with_height(72.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(96, 58, 26, 255)).into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 72.0),
+                            stops: vec![
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(168, 116, 66, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(120, 76, 38, 255),
+                                },
+                            ],
+                        }
+                        .into(),
+                    ),
+            )
+            .with_stroke_thickness(Thickness::uniform(3.0).into())
+            .with_corner_radius(14.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            panel.title = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("熱鍵".to_string())
+            .with_font_size(40.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            // 恢復預設值：BTD6 亮藍 + 白描邊
+            panel.reset_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_width(230.0)
+                    .with_height(52.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 44.0),
+                            stops: vec![
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(95, 200, 250, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(35, 130, 215, 255),
+                                },
+                            ],
+                        }
+                        .into(),
+                    ),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.5).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            panel.reset_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("恢復預設值".to_string())
+            .with_font_size(22.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            // 左上返回鈕（BTD6 藍色圓角，作為關閉）
+            panel.close_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_width(66.0)
+                    .with_height(58.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 58.0),
+                            stops: vec![
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(95, 200, 250, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(35, 130, 215, 255),
+                                },
+                            ],
+                        }
+                        .into(),
+                    ),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.5).into())
+            .with_corner_radius(14.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            panel.close_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("<".to_string())
+            .with_font_size(36.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            // 分類標題：白色大字（放在深藍 backdrop 上，BTD6 風格）
+            for cat_label in ["塔選擇", "遊戲玩法", "沙箱"] {
+                let h = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(
+                            Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into(),
+                        ),
+                )
+                .with_text(cat_label.to_string())
+                .with_font_size(32.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                panel.cat_titles.push(h);
+            }
+            for def in &defs {
+                // 每列灰藍圓角卡片（BTD6 row：比容器暗一階）
+                let row_bg = BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_background(
+                            Brush::Solid(Color::from_rgba(122, 142, 186, 255)).into(),
+                        ),
+                )
+                .with_stroke_thickness(Thickness::uniform(0.0).into())
+                .with_corner_radius(6.0_f32.into())
+                .build(&mut ui.build_ctx())
+                .transmute();
+                let label = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(
+                            Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into(),
+                        ),
+                )
+                .with_text(def.label.to_string())
+                .with_font_size(32.0.into())
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                // BTD6 綠色膠囊鈕：純色亮綠 + 白描邊（漸層在絕對座標空間會隨
+                // 位置變色，Doris 拍板改純色）
+                let key_bg = BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(
+                            Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into(),
+                        )
+                        .with_background(
+                            Brush::Solid(Color::from_rgba(110, 198, 50, 255)).into(),
+                        ),
+                )
+                .with_stroke_thickness(Thickness::uniform(2.5).into())
+                .with_corner_radius(16.0_f32.into())
+                .build(&mut ui.build_ctx())
+                .transmute();
+                let key_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(
+                            Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into(),
+                        ),
+                )
+                .with_font_size(26.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                panel.rows.push((row_bg, label, key_bg, key_text));
+                panel.row_ids.push(def.id);
+            }
+            panel.built = true;
+        }
+
+        // 每 frame 佈局（跟隨視窗尺寸縮放）
+        let ws = self.window_size;
+        let rr = |x: f32, y: f32, w: f32, h: f32| td_ui_ref_rect(ws, x, y, w, h);
+        let send_rect = |ui: &mut UserInterface, h: Handle<UiNode>, r: UiRect| {
+            ui.send(h, WidgetMessage::DesiredPosition(r.pos()));
+            ui.send(h, WidgetMessage::Width(r.w));
+            ui.send(h, WidgetMessage::Height(r.h));
+        };
+        let send_rect_text = |ui: &mut UserInterface, h: Handle<Text>, r: UiRect| {
+            ui.send(h, WidgetMessage::DesiredPosition(r.pos()));
+            ui.send(h, WidgetMessage::Width(r.w));
+            ui.send(h, WidgetMessage::Height(r.h));
+        };
+
+        // 全螢幕深藍 backdrop + 中央亮藍灰容器（BTD6 頁面結構）
+        send_rect(ui, panel.backdrop, rr(0.0, 0.0, TD_UI_REF_W, TD_UI_REF_H));
+        send_rect(ui, panel.bg, rr(30.0, 148.0, 1860.0, 916.0));
+        // 棕色標題橫幅置中
+        send_rect(ui, panel.header_banner, rr(710.0, 10.0, 500.0, 80.0));
+        send_rect_text(ui, panel.title, rr(710.0, 10.0, 500.0, 80.0));
+        panel.reset_rect = rr(1660.0, 22.0, 230.0, 52.0);
+        send_rect(ui, panel.reset_bg, panel.reset_rect);
+        send_rect_text(ui, panel.reset_text, panel.reset_rect);
+        // 左上返回鈕 = 關閉
+        panel.close_rect = rr(22.0, 14.0, 66.0, 58.0);
+        send_rect(ui, panel.close_bg, panel.close_rect);
+        send_rect_text(ui, panel.close_text, panel.close_rect);
+
+        // 三欄佈局：塔選擇 / 遊戲玩法 / 沙箱，各占一欄。
+        // 列高加大（BTD6 chunky 風格），每欄最多約 9 列。
+        const COL_X: [f32; 3] = [70.0, 690.0, 1310.0];
+        const CARD_W: f32 = 540.0;
+        const ROW_PITCH: f32 = 92.0;
+        const CARD_H: f32 = 78.0;
+        let cat_rects = [
+            rr(COL_X[0], 100.0, CARD_W, 42.0),
+            rr(COL_X[1], 100.0, CARD_W, 42.0),
+            rr(COL_X[2], 100.0, CARD_W, 42.0),
+        ];
+        for (i, h) in panel.cat_titles.iter().enumerate() {
+            send_rect_text(ui, *h, cat_rects[i]);
+        }
+
+        panel.row_rects.clear();
+        let hidden_pos = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        let hidden_rect = UiRect {
+            x: UI_HIDDEN_POS,
+            y: UI_HIDDEN_POS,
+            w: 0.0,
+            h: 0.0,
+        };
+        let mut gameplay_row = 0usize;
+        let mut sandbox_row = 0usize;
+        // tower_seen = 模板位置索引（對應熱鍵綁定）；tower_row = 顯示列（壓縮
+        // 掉隱藏列）。td_template_order 會被商店排版 debug padding 塞入重複的
+        // placeholder 塔，面板只顯示每個 uid 的第一次出現 + 有模板的位置。
+        let mut tower_seen = 0usize;
+        let mut tower_row = 0usize;
+        for (i, def) in defs.iter().enumerate() {
+            let mut tower_idx: Option<usize> = None;
+            let visible = match def.category {
+                hotkeys::HotkeyCategory::Tower => {
+                    let t_idx = tower_seen;
+                    tower_seen += 1;
+                    let slot_ok = if self.td_template_order.is_empty() {
+                        // pregame/設定頁（無地圖塔模板）：顯示已知的固定塔名
+                        t_idx < hotkeys::KNOWN_TOWER_COUNT
+                    } else {
+                        match self.td_template_order.get(t_idx) {
+                            Some(uid) => !self.td_template_order[..t_idx].contains(uid),
+                            None => false,
+                        }
+                    };
+                    // 單欄最多 9 列，超過的隱藏避免爆版
+                    slot_ok && tower_row < 9
+                }
+                _ => true,
+            };
+            if !visible {
+                let (row_bg, label, key_bg, key_text) = panel.rows[i];
+                for h in [row_bg, key_bg] {
+                    ui.send(h, WidgetMessage::DesiredPosition(hidden_pos));
+                }
+                ui.send(label, WidgetMessage::DesiredPosition(hidden_pos));
+                ui.send(key_text, WidgetMessage::DesiredPosition(hidden_pos));
+                panel.row_rects.push(hidden_rect);
+                continue;
+            }
+            let (col, row) = match def.category {
+                hotkeys::HotkeyCategory::Tower => {
+                    tower_idx = Some(tower_seen - 1);
+                    let r = tower_row;
+                    tower_row += 1;
+                    (0, r)
+                }
+                hotkeys::HotkeyCategory::Gameplay => {
+                    let r = gameplay_row;
+                    gameplay_row += 1;
+                    (1, r)
+                }
+                hotkeys::HotkeyCategory::Sandbox => {
+                    let r = sandbox_row;
+                    sandbox_row += 1;
+                    (2, r)
+                }
+            };
+            let x = COL_X[col];
+            let y = 175.0 + row as f32 * ROW_PITCH;
+            let (row_bg, label, key_bg, key_text) = panel.rows[i];
+            send_rect(ui, row_bg, rr(x, y, CARD_W, CARD_H));
+            send_rect_text(ui, label, rr(x + 24.0, y, 280.0, CARD_H));
+            // 塔列顯示實際塔名（來自後端 tower templates）；沒有對應塔時
+            // 回退顯示「選塔 N」
+            if let Some(t_idx) = tower_idx {
+                let name = self
+                    .td_template_order
+                    .get(t_idx)
+                    .and_then(|uid| self.td_templates.get(uid))
+                    .map(|tpl| tpl.label.clone())
+                    .unwrap_or_else(|| def.label.to_string());
+                ui.send(label, TextMessage::Text(name));
+            }
+            let key_rect = rr(x + 310.0, y + 11.0, 210.0, 56.0);
+            send_rect(ui, key_bg, key_rect);
+            send_rect_text(ui, key_text, key_rect);
+            panel.row_rects.push(key_rect);
+            let display = if self.hotkey_rebinding.as_deref() == Some(def.id) {
+                "按新鍵…".to_string()
+            } else {
+                self.hotkeys.binding_display(def.id)
+            };
+            ui.send(key_text, TextMessage::Text(display));
+        }
+        panel.visible_applied = true;
     }
 
     fn draw_hero_command_queue_overlay(&self, scene: &mut Scene) {

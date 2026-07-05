@@ -11,6 +11,8 @@ version = " 1.0.1"
 default-features = false
 [workspace.dependencies.fyrox-build-tools]
 version = " 1.0.1"
+[workspace.dependencies.fyrox-sound]
+version = " 1.0.1"
 
 [patch.crates-io]
 fyrox-impl = { path = "../third_party/fyrox-impl-1.0.1" }

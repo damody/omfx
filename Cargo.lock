@@ -3933,6 +3933,7 @@ dependencies = [
  "crossbeam-channel",
  "failure",
  "fyrox",
+ "fyrox-sound",
  "js-sys",
  "log",
  "omoba-core",
