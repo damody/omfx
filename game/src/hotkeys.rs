@@ -63,20 +63,21 @@ pub const SPAWN_CREEP_IDS: [&str; 9] = [
     "spawn_creep_9",
 ];
 
-/// 目前遊戲內容的固定塔名（依 snapshot.tower_templates 順序）。
+/// 目前遊戲內容的固定塔名（依 base_content lib.rs 註冊順序）。
 /// Doris 拍板：塔名不會變，直接寫死；之後有新塔再補。
-pub const KNOWN_TOWER_COUNT: usize = 6;
+pub const KNOWN_TOWER_COUNT: usize = 7;
 
 pub fn hotkey_defs() -> Vec<HotkeyDef> {
     let mut defs = Vec::with_capacity(42);
     const TOWER_LABELS: [&str; 24] = [
+        "糖球砲手",
+        "馬卡龍砲車",
+        "刺蝟射手",
+        "冰晶泰迪",
+        "香蕉回力鏢",
         "吉拿棒迫擊砲",
-        "飛鏢猴",
-        "炸彈射手",
-        "鐵釘射手",
-        "冰凍猴",
         "蛋糕濺射塔",
-        "選塔 7", "選塔 8", "選塔 9",
+        "選塔 8", "選塔 9",
         "選塔 10", "選塔 11", "選塔 12", "選塔 13", "選塔 14", "選塔 15", "選塔 16", "選塔 17",
         "選塔 18", "選塔 19", "選塔 20", "選塔 21", "選塔 22", "選塔 23", "選塔 24",
     ];
