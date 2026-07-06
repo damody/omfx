@@ -1,0 +1,4 @@
+# fyrox-ui/fyrox-impl 在低記憶體機器上並行編譯會爆記憶體
+# (rustc-LLVM ERROR: out of memory)，限制為單一 job 建置。
+[build]
+jobs = 1
