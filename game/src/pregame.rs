@@ -258,6 +258,7 @@ impl PregameCatalog {
                 description: map.description.unwrap_or_default(),
                 story: map.story.unwrap_or_default(),
                 runtime: map.runtime.unwrap_or_default(),
+                difficulty_id: map.difficulty_id.unwrap_or_default(),
                 image: map.image,
                 enabled: map.enabled.unwrap_or(true),
                 locked: map.locked.unwrap_or(false),
@@ -351,21 +352,120 @@ impl PregameCatalog {
                     }],
                 },
             ],
-            maps: vec![MapEntry {
-                id: "td_1".into(),
-                label: "綠野路口".into(),
-                description: "預設塔防流程的小型路線".into(),
-                story: "TD_1".into(),
-                runtime: "TD_1".into(),
-                image: None,
-                enabled: true,
-                locked: false,
-                reward: "100 金幣".into(),
-            }],
+            maps: vec![
+                MapEntry {
+                    id: "td_green_crossroads".into(),
+                    label: "綠野路口".into(),
+                    description: "基準 zigzag 路線，教放塔、轉角火力與升級節奏。".into(),
+                    story: "TD_GREEN_CROSSROADS".into(),
+                    runtime: "TD_GREEN_CROSSROADS".into(),
+                    difficulty_id: "novice".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "100 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_riverside_path".into(),
+                    label: "河畔小徑".into(),
+                    description: "長 S 型路線，中央塔位能覆蓋多段路徑。".into(),
+                    story: "TD_RIVERSIDE_PATH".into(),
+                    runtime: "TD_RIVERSIDE_PATH".into(),
+                    difficulty_id: "novice".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "100 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_farmstead_bends".into(),
+                    label: "農莊彎道".into(),
+                    description: "兩個大彎與少量快速怪，教減速塔與範圍塔。".into(),
+                    story: "TD_FARMSTEAD_BENDS".into(),
+                    runtime: "TD_FARMSTEAD_BENDS".into(),
+                    difficulty_id: "novice".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "100 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_twin_gate_outpost".into(),
+                    label: "雙門哨站".into(),
+                    description: "兩入口中段匯合，考驗前期分火力。".into(),
+                    story: "TD_TWIN_GATE_OUTPOST".into(),
+                    runtime: "TD_TWIN_GATE_OUTPOST".into(),
+                    difficulty_id: "intermediate".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "150 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_tidal_harbor".into(),
+                    label: "潮汐港灣".into(),
+                    description: "港灣水域切割塔位，護盾波測試覆蓋規劃。".into(),
+                    story: "TD_TIDAL_HARBOR".into(),
+                    runtime: "TD_TIDAL_HARBOR".into(),
+                    difficulty_id: "intermediate".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "150 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_mine_corridor".into(),
+                    label: "礦坑迴廊".into(),
+                    description: "短路線反覆經過中央火力區，岩壁限制射線。".into(),
+                    story: "TD_MINE_CORRIDOR".into(),
+                    runtime: "TD_MINE_CORRIDOR".into(),
+                    difficulty_id: "intermediate".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "150 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_molten_fork".into(),
+                    label: "熔火岔道".into(),
+                    description: "三路晚匯合，熔岩區讓部分波次加速。".into(),
+                    story: "TD_MOLTEN_FORK".into(),
+                    runtime: "TD_MOLTEN_FORK".into(),
+                    difficulty_id: "advanced".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "200 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_twilight_maze".into(),
+                    label: "暮色迷宮".into(),
+                    description: "長折線與稀少塔位，後續加入隱匿怪壓力。".into(),
+                    story: "TD_TWILIGHT_MAZE".into(),
+                    runtime: "TD_TWILIGHT_MAZE".into(),
+                    difficulty_id: "advanced".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "200 金幣".into(),
+                },
+                MapEntry {
+                    id: "td_frozen_broken_bridge".into(),
+                    label: "冰封斷橋".into(),
+                    description: "三條短線並行，低容錯並考驗爆發升級。".into(),
+                    story: "TD_FROZEN_BRIDGE".into(),
+                    runtime: "TD_FROZEN_BRIDGE".into(),
+                    difficulty_id: "advanced".into(),
+                    image: None,
+                    enabled: true,
+                    locked: false,
+                    reward: "200 金幣".into(),
+                },
+            ],
             difficulties: vec![
                 DifficultyEntry {
                     id: "novice".into(),
-                    label: "新手".into(),
+                    label: "初級".into(),
                     description: "200 HP，40 關，塔與升級價格 0.7 倍".into(),
                     config: "novice".into(),
                     reward: String::new(),
@@ -386,15 +486,6 @@ impl PregameCatalog {
                     label: "高級".into(),
                     description: "125 HP，85 關，塔與升級價格 0.9 倍".into(),
                     config: "advanced".into(),
-                    reward: String::new(),
-                    image: None,
-                    enabled: true,
-                },
-                DifficultyEntry {
-                    id: "expert".into(),
-                    label: "專家".into(),
-                    description: "100 HP，100 關，塔與升級價格 1 倍".into(),
-                    config: "expert".into(),
                     reward: String::new(),
                     image: None,
                     enabled: true,
@@ -424,6 +515,14 @@ impl PregameCatalog {
         self.maps.iter().filter(|map| map.is_playable()).collect()
     }
 
+    pub fn maps_for_difficulty(&self, difficulty_id: &str) -> Vec<&MapEntry> {
+        self.maps
+            .iter()
+            .filter(|map| map.is_playable())
+            .filter(|map| map.difficulty_id == difficulty_id)
+            .collect()
+    }
+
     pub fn enabled_difficulties(&self) -> Vec<&DifficultyEntry> {
         self.difficulties
             .iter()
@@ -436,6 +535,13 @@ impl PregameCatalog {
             if map.enabled && !map.locked && map.story.trim().is_empty() {
                 self.diagnostics.push(format!(
                     "pregame map '{}' missing story/runtime id; disabling",
+                    map.id
+                ));
+                map.enabled = false;
+            }
+            if map.enabled && !map.locked && map.difficulty_id.trim().is_empty() {
+                self.diagnostics.push(format!(
+                    "pregame map '{}' missing difficulty_id; disabling",
                     map.id
                 ));
                 map.enabled = false;
@@ -525,6 +631,7 @@ pub struct MapEntry {
     pub description: String,
     pub story: String,
     pub runtime: String,
+    pub difficulty_id: String,
     pub image: Option<String>,
     pub enabled: bool,
     pub locked: bool,
@@ -631,6 +738,8 @@ struct RawMapEntry {
     story: Option<String>,
     #[serde(default)]
     runtime: Option<String>,
+    #[serde(default)]
+    difficulty_id: Option<String>,
     #[serde(default)]
     image: Option<String>,
     #[serde(default)]
@@ -793,6 +902,7 @@ mod tests {
               "id": "mod_map",
               "label": "Mod Map",
               "story": "TD_MOD",
+              "difficulty_id": "nightmare",
               "enabled": true,
               "locked": false,
               "image": "assets/pregame_ui/mod_map.png"
@@ -820,6 +930,50 @@ mod tests {
                 target: "map_select".to_string()
             }
         );
+    }
+
+    #[test]
+    fn catalog_loader_keeps_map_difficulty_id() {
+        let json = r#"
+        {
+          "screens": [],
+          "maps": [
+            {
+              "id": "td_green_crossroads",
+              "label": "綠野路口",
+              "story": "TD_GREEN_CROSSROADS",
+              "difficulty_id": "novice",
+              "enabled": true
+            }
+          ],
+          "difficulties": [
+            { "id": "novice", "label": "初級", "enabled": true }
+          ]
+        }
+        "#;
+
+        let catalog = PregameCatalog::from_json_str(json).expect("catalog parses");
+
+        let map = catalog.map("td_green_crossroads").expect("map exists");
+        assert_eq!(map.difficulty_id, "novice");
+        assert_eq!(
+            catalog
+                .maps_for_difficulty("novice")
+                .into_iter()
+                .map(|map| map.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["td_green_crossroads"]
+        );
+    }
+
+    #[test]
+    fn fallback_catalog_has_three_maps_per_supported_difficulty() {
+        let catalog = PregameCatalog::fallback();
+
+        assert_eq!(catalog.maps_for_difficulty("novice").len(), 3);
+        assert_eq!(catalog.maps_for_difficulty("intermediate").len(), 3);
+        assert_eq!(catalog.maps_for_difficulty("advanced").len(), 3);
+        assert!(catalog.difficulty("expert").is_none());
     }
 
     #[test]
@@ -922,6 +1076,7 @@ mod tests {
               "id": "td_1",
               "label": "TD",
               "story": "TD_1",
+              "difficulty_id": "easy",
               "image": "missing_map.png",
               "enabled": true
             }
@@ -1000,12 +1155,12 @@ mod tests {
 
         let selection = runtime
             .dispatch(&PregameAction::SelectMap {
-                map_id: "td_1".to_string(),
+                map_id: "td_green_crossroads".to_string(),
             })
             .expect("map selection starts the session");
 
         assert!(matches!(runtime.state, PregameState::StartingSession));
-        assert_eq!(selection.map.id, "td_1");
+        assert_eq!(selection.map.id, "td_green_crossroads");
         assert_eq!(selection.difficulty.id, "novice");
     }
 
@@ -1080,10 +1235,9 @@ mod tests {
         assert_eq!(
             difficulties,
             vec![
-                ("novice", "新手", "novice"),
+                ("novice", "初級", "novice"),
                 ("intermediate", "中級", "intermediate"),
                 ("advanced", "高級", "advanced"),
-                ("expert", "專家", "expert"),
             ]
         );
     }
