@@ -9774,7 +9774,7 @@ impl Game {
                     true,
                     pregame::PregameAction::Back,
                 )];
-                buttons.extend(self.pregame_runtime.catalog.maps.iter().map(|map| {
+                buttons.extend(self.current_selectable_maps().into_iter().map(|map| {
                     (
                         map.label.clone(),
                         if map.reward.trim().is_empty() {
@@ -9844,6 +9844,23 @@ impl Game {
         }
     }
 
+    fn current_selectable_maps(&self) -> Vec<pregame::MapEntry> {
+        let Some(difficulty) = self.pregame_runtime.selected_difficulty.as_ref() else {
+            return self
+                .pregame_runtime
+                .catalog
+                .enabled_maps()
+                .into_iter()
+                .cloned()
+                .collect();
+        };
+        self.pregame_runtime
+            .catalog
+            .maps_for_difficulty(&difficulty.id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
     fn handle_pregame_click(&mut self, screen: Vector2<f32>) -> bool {
         if !self.pregame_runtime.is_pregame() {
             return false;
@@ -10173,7 +10190,7 @@ impl Game {
             (834.0, 470.0, 380.0, 170.0),
             (1298.0, 470.0, 380.0, 170.0),
         ];
-        let maps = self.pregame_runtime.catalog.maps.clone();
+        let maps = self.current_selectable_maps();
         for (map, (x, y, w, h)) in maps.iter().take(6).zip(rects) {
             let description = if map.reward.trim().is_empty() {
                 map.description.clone()
@@ -14463,7 +14480,7 @@ mod input_latency_tests {
         assert!(matches!(difficulties[0].3, pregame::PregameAction::Back));
         assert_eq!(difficulties[0].0, "返回");
         assert!(difficulties.iter().any(|(label, _, active, action)| {
-            label == "新手"
+            label == "初級"
                 && *active
                 && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "novice")
         }));
@@ -14482,13 +14499,30 @@ mod input_latency_tests {
         assert!(maps.iter().any(|(label, _, active, action)| {
             label == "綠野路口"
                 && *active
-                && matches!(action, pregame::PregameAction::SelectMap { map_id } if map_id == "td_1")
+                && matches!(action, pregame::PregameAction::SelectMap { map_id } if map_id == "td_green_crossroads")
         }));
         assert!(maps.iter().any(|(label, _, active, action)| {
             label == "高級"
                 && *active
                 && matches!(action, pregame::PregameAction::SelectDifficulty { difficulty_id } if difficulty_id == "advanced")
         }));
+
+        game.pregame_runtime.selected_difficulty = Some(
+            game.pregame_runtime
+                .catalog
+                .difficulty("intermediate")
+                .unwrap()
+                .clone(),
+        );
+        game.pregame_runtime.state = pregame::PregameState::MapSelect;
+        let maps = game.current_pregame_buttons();
+        let map_labels = maps
+            .iter()
+            .filter(|(_, _, _, action)| matches!(action, pregame::PregameAction::SelectMap { .. }))
+            .map(|(label, _, _, _)| label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(map_labels, vec!["雙門哨站", "潮汐港灣", "礦坑迴廊"]);
+        assert!(!maps.iter().any(|(label, _, _, _)| label == "綠野路口"));
     }
 
     #[test]
