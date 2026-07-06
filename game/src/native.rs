@@ -14535,8 +14535,8 @@ mod input_latency_tests {
             .default_session_selection()
             .expect("fallback catalog has playable selection");
 
-        assert_eq!(selection.map.id, "td_1");
-        assert_eq!(selection.map.story_id(), "TD_1");
+        assert_eq!(selection.map.id, "td_green_crossroads");
+        assert_eq!(selection.map.story_id(), "TD_GREEN_CROSSROADS");
         assert_eq!(selection.difficulty.id, "novice");
         assert_eq!(selection.difficulty.config_value(), "novice");
     }
@@ -14551,8 +14551,8 @@ mod input_latency_tests {
         let config = game.build_backend_launch_config(&selection, "session-test".to_string());
 
         assert_eq!(config.session_id, "session-test");
-        assert_eq!(config.map_id, "td_1");
-        assert_eq!(config.story, "TD_1");
+        assert_eq!(config.map_id, "td_green_crossroads");
+        assert_eq!(config.story, "TD_GREEN_CROSSROADS");
         assert_eq!(config.difficulty_id, "novice");
         assert_eq!(config.difficulty_config, "novice");
         assert!(!config.kcp_addr.trim().is_empty());
