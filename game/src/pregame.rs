@@ -977,6 +977,21 @@ mod tests {
     }
 
     #[test]
+    fn shipped_catalog_has_three_maps_per_tier() {
+        let catalog_path = Path::new("../../scripts/base_content/assets/pregame_ui/catalog.json");
+        let text = std::fs::read_to_string(catalog_path)
+            .or_else(|_| std::fs::read_to_string("scripts/base_content/assets/pregame_ui/catalog.json"))
+            .expect("shipped catalog is readable");
+        let catalog = PregameCatalog::from_json_str(&text).expect("shipped catalog parses");
+
+        assert_eq!(catalog.enabled_difficulties().len(), 3);
+        assert_eq!(catalog.maps_for_difficulty("novice").len(), 3);
+        assert_eq!(catalog.maps_for_difficulty("intermediate").len(), 3);
+        assert_eq!(catalog.maps_for_difficulty("advanced").len(), 3);
+        assert_eq!(catalog.enabled_maps().len(), 9);
+    }
+
+    #[test]
     fn malformed_or_unknown_action_is_safe_noop() {
         let json = r#"
         {
