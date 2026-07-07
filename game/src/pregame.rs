@@ -980,7 +980,9 @@ mod tests {
     fn shipped_catalog_has_three_maps_per_tier() {
         let catalog_path = Path::new("../../scripts/base_content/assets/pregame_ui/catalog.json");
         let text = std::fs::read_to_string(catalog_path)
-            .or_else(|_| std::fs::read_to_string("scripts/base_content/assets/pregame_ui/catalog.json"))
+            .or_else(|_| {
+                std::fs::read_to_string("scripts/base_content/assets/pregame_ui/catalog.json")
+            })
             .expect("shipped catalog is readable");
         let catalog = PregameCatalog::from_json_str(&text).expect("shipped catalog parses");
 
@@ -989,6 +991,37 @@ mod tests {
         assert_eq!(catalog.maps_for_difficulty("intermediate").len(), 3);
         assert_eq!(catalog.maps_for_difficulty("advanced").len(), 3);
         assert_eq!(catalog.enabled_maps().len(), 9);
+    }
+
+    #[test]
+    fn shipped_catalog_maps_have_route_preview_pngs() {
+        use std::collections::HashSet;
+
+        let catalog_path = Path::new("../../scripts/base_content/assets/pregame_ui/catalog.json");
+        let (catalog_path, text) = std::fs::read_to_string(catalog_path)
+            .map(|text| (catalog_path.to_path_buf(), text))
+            .or_else(|_| {
+                let fallback = Path::new("scripts/base_content/assets/pregame_ui/catalog.json");
+                std::fs::read_to_string(fallback).map(|text| (fallback.to_path_buf(), text))
+            })
+            .expect("shipped catalog is readable");
+        let catalog = PregameCatalog::from_json_str(&text).expect("shipped catalog parses");
+        let asset_dir = catalog_path.parent().expect("catalog has parent directory");
+
+        let mut image_names = HashSet::new();
+        for map in catalog.enabled_maps() {
+            let image = map.image.as_deref().expect("map has preview image");
+            assert!(image.ends_with(".png"), "{image} is a png preview");
+            assert!(
+                asset_dir.join(image).is_file(),
+                "{image} exists next to pregame catalog"
+            );
+            assert!(
+                image_names.insert(image.to_string()),
+                "{image} is unique per shipped map"
+            );
+        }
+        assert_eq!(image_names.len(), 9);
     }
 
     #[test]
