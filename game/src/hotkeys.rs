@@ -77,9 +77,23 @@ pub fn hotkey_defs() -> Vec<HotkeyDef> {
         "香蕉回力鏢",
         "吉拿棒迫擊砲",
         "蛋糕濺射塔",
-        "選塔 8", "選塔 9",
-        "選塔 10", "選塔 11", "選塔 12", "選塔 13", "選塔 14", "選塔 15", "選塔 16", "選塔 17",
-        "選塔 18", "選塔 19", "選塔 20", "選塔 21", "選塔 22", "選塔 23", "選塔 24",
+        "選塔 8",
+        "選塔 9",
+        "選塔 10",
+        "選塔 11",
+        "選塔 12",
+        "選塔 13",
+        "選塔 14",
+        "選塔 15",
+        "選塔 16",
+        "選塔 17",
+        "選塔 18",
+        "選塔 19",
+        "選塔 20",
+        "選塔 21",
+        "選塔 22",
+        "選塔 23",
+        "選塔 24",
     ];
     for (i, id) in SELECT_TOWER_IDS.iter().enumerate() {
         defs.push(HotkeyDef {
@@ -198,11 +212,17 @@ const KEY_NAMES: &[(KeyCode, &str, &str)] = &[
 ];
 
 fn key_to_name(key: KeyCode) -> Option<&'static str> {
-    KEY_NAMES.iter().find(|(k, _, _)| *k == key).map(|(_, n, _)| *n)
+    KEY_NAMES
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, n, _)| *n)
 }
 
 fn key_from_name(name: &str) -> Option<KeyCode> {
-    KEY_NAMES.iter().find(|(_, n, _)| *n == name).map(|(k, _, _)| *k)
+    KEY_NAMES
+        .iter()
+        .find(|(_, n, _)| *n == name)
+        .map(|(k, _, _)| *k)
 }
 
 pub fn key_display(key: KeyCode) -> &'static str {
