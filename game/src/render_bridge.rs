@@ -268,12 +268,15 @@ fn kind_histogram(entities: &[EntityRenderData]) -> [usize; 5] {
 /// 無條件分配；hp_* slot 僅在 `max_hp > 0` 時建立，`turret_slot`
 /// 僅適用有朝向意義的類型（Hero / Tower / Creep），子彈不需要。
 /// 專門針對 projectile。
+/// `proj_accent_slot`：子彈甜點特效的額外裝飾 quad（馬卡龍引信火花 / 冰霜點 /
+/// 香蕉殘影）。僅在該甜點需要且 body_batch 尚有容量時惰性配置，多數子彈為 None。
 #[derive(Debug, Clone, Copy)]
 pub struct SimEntitySlots {
     pub body_slot: u32,
     pub hp_bg_slot: Option<u32>,
     pub hp_fg_slot: Option<u32>,
     pub turret_slot: Option<u32>,
+    pub proj_accent_slot: Option<u32>,
 }
 
 /// 回傳給 lib.rs batched-mesh 寫入器的樣式。顏色採

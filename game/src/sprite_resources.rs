@@ -276,6 +276,13 @@ impl BatchedSpriteMesh {
         }
     }
 
+    /// 是否還能安全再配置一個 slot（free_list 有回收的、或 next_slot 未達容量）。
+    /// 用於子彈 accent quad 的惰性配置：stress 場景 body_batch 可能逼近容量，
+    /// 先問過再 alloc，避免撞上 `alloc` 的 debug_assert 而 panic。
+    pub fn can_alloc(&self) -> bool {
+        !self.free_list.is_empty() || self.next_slot < self.capacity
+    }
+
     pub fn alloc(&mut self) -> u32 {
         if let Some(slot) = self.free_list.pop() {
             return slot;
