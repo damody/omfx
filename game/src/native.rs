@@ -1015,6 +1015,7 @@ fn td_mode_from_snapshot(lives: i32, total_rounds: u32) -> bool {
 }
 
 const TOWER_ABILITY_BAR_PAGE_SIZE: usize = 6;
+const TOWER_ABILITY_BAR_BOTTOM_MARGIN: f32 = 88.0;
 const TOWER_ABILITY_REJECTION_VISIBLE_FOR: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1128,6 +1129,10 @@ fn ability_bar_elapsed_sim(
     } else {
         elapsed_wall_clock.max(0.0) * game_speed_multiplier as f32
     }
+}
+
+fn tower_ability_bar_y(window_height: f32, slot_height: f32) -> f32 {
+    (window_height - slot_height - TOWER_ABILITY_BAR_BOTTOM_MARGIN).max(0.0)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -10372,7 +10377,7 @@ impl Game {
         let count = self.tower_ability_bar_items.len();
         let total_w = count as f32 * slot_w + count.saturating_sub(1) as f32 * gap;
         let start_x = (self.window_size.x - total_w) * 0.5;
-        let y = (self.window_size.y - slot_h - 18.0).max(0.0);
+        let y = tower_ability_bar_y(self.window_size.y, slot_h);
 
         for index in 0..TOWER_ABILITY_BAR_PAGE_SIZE {
             let Some(&handle) = self.ui_tower_ability_bar_slots.get(index) else {
@@ -16035,6 +16040,13 @@ mod input_latency_tests {
     #[test]
     fn ability_bar_elapsed_sim_freezes_while_paused() {
         assert_eq!(ability_bar_elapsed_sim(1.25, true, 2), 0.0);
+    }
+
+    #[test]
+    fn tower_ability_bar_uses_eighty_eight_pixel_bottom_margin() {
+        assert_eq!(tower_ability_bar_y(1080.0, 88.0), 904.0);
+        assert_eq!(tower_ability_bar_y(720.0, 88.0), 544.0);
+        assert_eq!(tower_ability_bar_y(120.0, 88.0), 0.0);
     }
 
     #[test]
