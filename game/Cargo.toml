@@ -16,7 +16,7 @@ omoba-core = { path = "../../omoba-core", features = ["kcp"] }
 crossbeam-channel = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time"] }
 
 specs = { path = "../../specs", features = ["derive", "serde"] }
 omoba-sim = { path = "../../omoba-sim", features = ["abi-stable"] }

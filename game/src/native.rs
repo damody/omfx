@@ -2888,6 +2888,9 @@ pub struct Game {
     render_bridge: render_bridge::RenderBridge,
     #[visit(skip)]
     #[reflect(hidden)]
+    session_render_reset_pending: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
     connection_status: ConnectionStatus,
     // 階段 5.1：刪除了 `event_buffer: Option<EventBuffer>` 欄位。
     // EventBuffer 驅動了舊版 GameEvent 重新排序/重播管道。
@@ -5502,6 +5505,17 @@ impl Plugin for Game {
                         }
                     }
                 }
+            }
+        }
+
+        if self.session_render_reset_pending {
+            self.reset_session_render_state(scene);
+            self.session_render_reset_pending = false;
+        }
+        if !self.pending_label_deletions.is_empty() {
+            let ui = context.user_interfaces.first_mut();
+            for label in self.pending_label_deletions.drain(..) {
+                ui.send(label, WidgetMessage::Remove);
             }
         }
 
@@ -11042,22 +11056,149 @@ impl Game {
     }
 
     fn shutdown_game_session(&mut self, return_to_menu: bool) {
-        self.lockstep_handle = None;
-        self.sim_runner_handle = None;
+        if let Some(lockstep) = self.lockstep_handle.take() {
+            lockstep.shutdown();
+        }
+        if let Some(sim_runner) = self.sim_runner_handle.take() {
+            sim_runner.shutdown();
+        }
         if let Some(mut backend) = self.backend_session.take() {
             backend.shutdown();
         }
-        self.connection_status = ConnectionStatus::Disconnected;
-        self.current_sim_tick = 0;
-        self.current_sim_tick_observed_at = None;
-        self.pending_inputs.clear();
-        self.pending_inputs_evict_at = None;
-        self.selected_tower_kind = None;
-        self.selected_tower_entity = None;
-        self.td_shop_scroll_dragging = false;
+        self.reset_session_state();
         if return_to_menu {
             self.pregame_runtime.return_to_menu();
         }
+    }
+
+    fn reset_session_state(&mut self) {
+        self.connection_status = ConnectionStatus::Disconnected;
+        self.current_sim_tick = 0;
+        self.current_sim_tick_observed_at = None;
+        self.server_step_fps = 0;
+        self.pending_inputs.clear();
+        self.pending_inputs_evict_at = None;
+        self.pending_inputs_evicted = 0;
+        self.pending_inputs_stale = 0;
+        self.input_latency_meter = InputLatencyMeter::default();
+        self.net_bytes_current = 0;
+        self.net_bytes_last_sec = 0;
+        self.net_wire_bytes_current = 0;
+        self.net_wire_bytes_last_sec = 0;
+        self.latest_rtt_us = None;
+        self.sim_lua_content_generation = 0;
+        self.sim_lua_content_hash.clear();
+        self.sim_dev_lua_reload_error = None;
+        self.sim_speed_last_tick = 0;
+        self.sim_speed_last_at = None;
+        self.sim_speed_tps = 0.0;
+        self.render_pacing_last_frame_at = None;
+        self.render_pacing_last_snapshot_tick = None;
+        self.sim_batches_last_snapshot_tick = None;
+        self.network_entities.clear();
+        self.latest_entities.clear();
+        self.selected_tower_kind = None;
+        self.selected_tower_entity = None;
+        self.td_shop_scroll_offset = 0.0;
+        self.td_shop_max_scroll = 0.0;
+        self.td_shop_scroll_dragging = false;
+        self.current_round = 0;
+        self.total_rounds = 0;
+        self.round_is_running = false;
+        self.is_game_paused = false;
+        self.game_speed_multiplier = 1;
+        self.td_auto_start_sent_for_idle_round = false;
+        self.is_td_mode = false;
+        self.td_camera_configured = false;
+        self.active_explosions.clear();
+        self.sim_last_explosion_tick = None;
+        self.td_paths_render.clear();
+        self.td_regions_render.clear();
+        self.tower_anim_dt_acc = 0.0;
+        self.sim_seen_tower_fire_fx.clear();
+        self.sim_seen_attack_phase_fx.clear();
+        self.sim_seen_attack_cancel_fx.clear();
+        self.pending_pred_dmg.clear();
+        self.heartbeat = HeartbeatInfo::default();
+        self.projectile_spawn_pos.clear();
+        self.projectile_trail_dir.clear();
+        self.pending_label_deletions.extend(
+            self.sim_entity_labels
+                .drain()
+                .map(|(_, label)| label.handle),
+        );
+        self.tower_ability_bar_interaction = AbilityBarInteractionState::default();
+        self.tower_ability_bar_snapshot_at = None;
+        self.tower_ability_bar_items.clear();
+        self.tower_ability_bar_rejection = AbilityBarRejectionState::default();
+        self.tower_ability_bar_cached_tooltip = None;
+        self.tower_ability_bar_slot_bindings.fill(None);
+        self.tower_ability_bar_cached_visual.fill(None);
+        self.tower_ability_bar_cached_text.fill(String::new());
+        self.tower_ability_bar_cached_icon.fill(String::new());
+        self.clear_lua_metadata_caches();
+        self.auto_clock_start = None;
+        self.auto_start_sent = false;
+        self.auto_noop_next_at_s = None;
+        self.game_ended = false;
+        self.session_render_reset_pending = true;
+    }
+
+    fn reset_session_render_state(&mut self, scene: &mut Scene) {
+        self.render_bridge.reset(scene);
+
+        let tower_ids: Vec<u32> = self.tower_composites.keys().copied().collect();
+        for entity_id in tower_ids {
+            self.remove_tower_composite(scene, entity_id);
+        }
+        let hero_ids: Vec<u32> = self.hero_model_nodes.keys().copied().collect();
+        for entity_id in hero_ids {
+            self.remove_hero_model(scene, entity_id);
+        }
+        for (_, projectile) in self.client_projectiles.drain() {
+            if scene.graph.is_valid_handle(projectile.node) {
+                scene.graph.remove_node(projectile.node);
+            }
+            for (ring_node, _) in projectile.hit_ring {
+                if scene.graph.is_valid_handle(ring_node) {
+                    scene.graph.remove_node(ring_node);
+                }
+            }
+        }
+
+        let slots: Vec<render_bridge::SimEntitySlots> = self
+            .sim_entity_slots
+            .drain()
+            .map(|(_, slots)| slots)
+            .collect();
+        for slots in slots {
+            if let Some(batch) = self.body_batch.as_mut() {
+                batch.free(slots.body_slot);
+            }
+            if let Some(batch) = self.hp_batch.as_mut() {
+                if let Some(slot) = slots.hp_bg_slot {
+                    batch.free(slot);
+                }
+                if let Some(slot) = slots.hp_fg_slot {
+                    batch.free(slot);
+                }
+            }
+            if let Some(batch) = self.facing_batch.as_mut() {
+                if let Some(slot) = slots.turret_slot {
+                    batch.free(slot);
+                }
+            }
+        }
+        if let Some(batch) = self.body_batch.as_mut() {
+            batch.flush(scene);
+        }
+        if let Some(batch) = self.hp_batch.as_mut() {
+            batch.flush(scene);
+        }
+        if let Some(batch) = self.facing_batch.as_mut() {
+            batch.flush(scene);
+        }
+        self.entity_kind_cache.clear();
     }
 
     fn current_pregame_buttons(&self) -> Vec<(String, String, bool, pregame::PregameAction)> {
@@ -16690,6 +16831,45 @@ mod input_latency_tests {
             w: 96.0,
             h: 40.0,
         };
+        game.current_sim_tick = 42;
+        game.current_round = 7;
+        game.round_is_running = true;
+        game.is_game_paused = true;
+        game.game_speed_multiplier = 2;
+        game.td_auto_start_sent_for_idle_round = true;
+        game.is_td_mode = true;
+        game.td_camera_configured = true;
+        game.tower_ability_bar_snapshot_at = Some(Instant::now());
+        game.sim_lua_content_generation = 9;
+        game.sim_lua_content_hash = "stale".to_string();
+        game.sim_dev_lua_reload_error = Some("stale error".to_string());
+        game.sim_batches_last_snapshot_tick = Some(42);
+        game.sim_last_explosion_tick = Some(42);
+        game.sim_seen_tower_fire_fx.insert((1, 2, 42));
+        game.sim_seen_attack_phase_fx.insert((1, 2, 3, 42));
+        game.sim_seen_attack_cancel_fx.insert((1, 2, 3, 42));
+        game.active_explosions.push(ActiveExplosion {
+            pos: Vector2::new(1.0, 2.0),
+            max_radius: 3.0,
+            duration: 1.0,
+            elapsed: 0.5,
+        });
+        game.td_paths_render.push(vec![Vector2::new(1.0, 2.0)]);
+        game.td_regions_render.push(vec![Vector2::new(3.0, 4.0)]);
+        game.pending_pred_dmg.insert(
+            7,
+            PendingPredDmg {
+                target_id: 8,
+                dmg: 9.0,
+                applied: true,
+            },
+        );
+        game.heartbeat.tick = 42;
+        game.net_bytes_current = 100;
+        game.net_bytes_last_sec = 200;
+        game.net_wire_bytes_current = 300;
+        game.net_wire_bytes_last_sec = 400;
+        game.latest_rtt_us = Some(5_000);
 
         assert!(game.handle_in_game_return_click(Vector2::new(24.0, 24.0)));
         assert!(matches!(
@@ -16699,8 +16879,58 @@ mod input_latency_tests {
         assert!(game.lockstep_handle.is_none());
         assert!(game.sim_runner_handle.is_none());
         assert!(game.backend_session.is_none());
+        assert_eq!(game.current_sim_tick, 0);
+        assert_eq!(game.current_round, 0);
+        assert!(!game.round_is_running);
+        assert!(!game.is_game_paused);
+        assert_eq!(game.game_speed_multiplier, 1);
+        assert!(!game.td_auto_start_sent_for_idle_round);
+        assert!(!game.is_td_mode);
+        assert!(!game.td_camera_configured);
+        assert!(game.tower_ability_bar_snapshot_at.is_none());
+        assert_eq!(game.sim_lua_content_generation, 0);
+        assert!(game.sim_lua_content_hash.is_empty());
+        assert!(game.sim_dev_lua_reload_error.is_none());
+        assert!(game.sim_batches_last_snapshot_tick.is_none());
+        assert!(game.sim_last_explosion_tick.is_none());
+        assert!(game.sim_seen_tower_fire_fx.is_empty());
+        assert!(game.sim_seen_attack_phase_fx.is_empty());
+        assert!(game.sim_seen_attack_cancel_fx.is_empty());
+        assert!(game.active_explosions.is_empty());
+        assert!(game.td_paths_render.is_empty());
+        assert!(game.td_regions_render.is_empty());
+        assert!(game.pending_pred_dmg.is_empty());
+        assert_eq!(game.heartbeat.tick, 0);
+        assert_eq!(game.net_bytes_current, 0);
+        assert_eq!(game.net_bytes_last_sec, 0);
+        assert_eq!(game.net_wire_bytes_current, 0);
+        assert_eq!(game.net_wire_bytes_last_sec, 0);
+        assert!(game.latest_rtt_us.is_none());
+        assert!(game.session_render_reset_pending);
 
         assert!(!game.handle_in_game_return_click(Vector2::new(24.0, 24.0)));
+    }
+
+    #[test]
+    fn session_render_reset_releases_entity_slot_state() {
+        let mut game = Game::default();
+        game.sim_entity_slots.insert(
+            7,
+            render_bridge::SimEntitySlots {
+                body_slot: 3,
+                hp_bg_slot: Some(4),
+                hp_fg_slot: Some(5),
+                turret_slot: Some(6),
+            },
+        );
+        game.entity_kind_cache
+            .insert(7, sim_runner::EntityKind::Tower);
+        let mut scene = Scene::new();
+
+        game.reset_session_render_state(&mut scene);
+
+        assert!(game.sim_entity_slots.is_empty());
+        assert!(game.entity_kind_cache.is_empty());
     }
 
     #[test]
