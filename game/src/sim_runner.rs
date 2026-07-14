@@ -50,9 +50,9 @@ pub use omoba_core::runtime::{
     retain_recent_render_fx, AbilityDefSnapshot, AppliedInputMeta, AttackCancelFx, AttackPhaseFx,
     BlockedRegionSnapshot, BuffSnapshot, EntityKind, EntityRenderData, ExplosionFx,
     HeroAnimationBindingSnapshot, HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt,
-    SimWorldSnapshot, TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot,
-    TowerRenderAnimationSnapshot, TowerRenderPointSnapshot, TowerTemplateSnapshot,
-    TowerUpgradeDefSnapshot,
+    SimWorldSnapshot, TowerAbilityCastResultSnapshot, TowerActiveAbilitySnapshot,
+    TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot, TowerRenderAnimationSnapshot,
+    TowerRenderPointSnapshot, TowerTemplateSnapshot, TowerUpgradeDefSnapshot,
 };
 
 pub const DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS: u32 = 1;
@@ -512,11 +512,6 @@ fn run_sim_loop(
         omoba_core::runtime::drain_pending_tower_sells(&mut world);
         world.maintain();
 
-        // 階段 2.3：drain TowerUpgrade input queue。扣金、upgrade_levels 增量與
-        // BuffStore stat-mod 必須在 authoritative/local replica 同步執行。
-        omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
-        world.maintain();
-
         omoba_core::runtime::drain_pending_tower_target_priorities(&mut world);
         world.maintain();
 
@@ -538,6 +533,7 @@ fn run_sim_loop(
         // MoveTo (右鍵移動): drain `PendingMoveQueue`，在玩家英雄寫入 MoveTarget。
         omoba_core::runtime::drain_pending_moves(&mut world);
         world.maintain();
+
         profile_drains_ns += t_drains.elapsed().as_nanos();
         drop(drains_span);
 
@@ -557,6 +553,23 @@ fn run_sim_loop(
         world.maintain();
         drop(pre_script_outcomes_span);
 
+        // Mirror the authoritative active-ability phase exactly: upgrades ->
+        // casts -> scheduler -> callbacks -> ordinary unit script ticks. The
+        // maintain above closes pre-script outcomes; the next maintain remains
+        // after post-script outcomes so no ECS lifecycle boundary can split
+        // this phase.
+        omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
+        omoba_core::runtime::drain_pending_tower_ability_casts(&mut world);
+        let scaled_dt = world
+            .read_resource::<omoba_core::comp::resources::DeltaTime>()
+            .0;
+        omoba_core::runtime::tick_tower_abilities(&mut world, scaled_dt);
+        omoba_core::runtime::drain_pending_tower_ability_callbacks(
+            &mut world,
+            &script_registry,
+            batch.tick as u64,
+        );
+
         let t_script = Instant::now();
         let script_span =
             tracing::trace_span!("omfx::sim_runner::script_dispatch", perfetto = true).entered();
@@ -571,7 +584,7 @@ fn run_sim_loop(
             &mut world,
             &script_registry,
             batch.tick as u64,
-            omoba_sim::Fixed64::from_raw(timing.fixed_raw_for_tick(batch.tick as u64)),
+            scaled_dt,
         );
         // 處理推送的任何結果腳本（投射物/損壞/等）。
         let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
@@ -1073,6 +1086,64 @@ pub fn smoke() -> &'static str {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn replica_runner_keeps_tower_ability_phase_order_and_scaled_delta() {
+        let source = include_str!("sim_runner.rs");
+        let upgrades = source
+            .find(concat!(
+                "omoba_core::runtime::drain_pending_tower_",
+                "upgrades(&mut world)"
+            ))
+            .expect("tower upgrade drain");
+        let suffix = &source[upgrades..];
+        let casts = suffix
+            .find(concat!(
+                "omoba_core::runtime::drain_pending_tower_ability_",
+                "casts(&mut world)"
+            ))
+            .expect("tower ability cast drain");
+        let scheduler = suffix
+            .find(concat!(
+                "omoba_core::runtime::tick_tower_",
+                "abilities(&mut world, scaled_dt)"
+            ))
+            .expect("tower ability scheduler");
+        let callbacks = suffix
+            .find(concat!(
+                "omoba_core::runtime::drain_pending_tower_ability_",
+                "callbacks("
+            ))
+            .expect("tower ability callback drain");
+        let ordinary_ticks = suffix
+            .find(concat!("omoba_core::runtime::run_script_", "dispatch("))
+            .expect("ordinary unit script ticks");
+
+        assert!(casts < scheduler);
+        assert!(scheduler < callbacks);
+        assert!(callbacks < ordinary_ticks);
+        let phase = &suffix[..ordinary_ticks];
+        assert_eq!(phase.matches("drain_pending_").count(), 3);
+        assert_eq!(
+            phase
+                .matches(concat!(
+                    "drain_pending_tower_ability_",
+                    "callbacks("
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(phase.matches("tick_tower_abilities(").count(), 1);
+        assert!(!phase.contains(concat!("world.", "maintain()")));
+        assert!(!phase.contains(concat!("process_", "outcomes(")));
+        assert!(!phase.contains(concat!("dispatcher.", "dispatch(")));
+        let before_scheduler = &suffix[..scheduler];
+        assert!(before_scheduler.contains(concat!("let scaled_", "dt = world")));
+        assert!(before_scheduler.contains(concat!(
+            "read_resource::<omoba_core::comp::resources::",
+            "DeltaTime>()"
+        )));
+    }
 
     #[test]
     fn smoke_links() {

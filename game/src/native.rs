@@ -23,6 +23,7 @@ use fyrox::{
         image::{ImageBuilder, ImageMessage},
         message::{MessageDirection, UiMessage},
         text::{Text, TextBuilder, TextMessage},
+        text_box::TextBox,
         widget::{WidgetBuilder, WidgetMessage},
         HorizontalAlignment, Thickness, UiNode, UserInterface, VerticalAlignment,
     },
@@ -329,6 +330,7 @@ pub enum InputActionKind {
     TowerPlace,
     TowerSell,
     TowerUpgrade,
+    TowerAbilityCast,
     ItemUse,
     StartRound,
     TogglePause,
@@ -350,6 +352,7 @@ impl InputActionKind {
             Some(Action::TowerPlace(_)) => Self::TowerPlace,
             Some(Action::TowerSell(_)) => Self::TowerSell,
             Some(Action::TowerUpgrade(_)) => Self::TowerUpgrade,
+            Some(Action::TowerAbilityCast(_)) => Self::TowerAbilityCast,
             Some(Action::ItemUse(_)) => Self::ItemUse,
             Some(Action::StartRound(_)) => Self::StartRound,
             Some(Action::TogglePause(_)) => Self::TogglePause,
@@ -720,7 +723,7 @@ fn td_camera_view_config() -> TdCameraViewConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct UiRect {
     x: f32,
     y: f32,
@@ -1009,6 +1012,404 @@ fn td_round_status_label(_round_is_running: bool, current_round: u32, total_roun
 
 fn td_mode_from_snapshot(lives: i32, total_rounds: u32) -> bool {
     lives > 0 || total_rounds > 0
+}
+
+const TOWER_ABILITY_BAR_PAGE_SIZE: usize = 6;
+const TOWER_ABILITY_REJECTION_VISIBLE_FOR: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AbilityBarKey {
+    tower_entity_id: u32,
+    ability_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AbilityBarIcon {
+    Asset(String),
+    Fallback {
+        tower_unit_id: String,
+        initial: char,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbilityBarTextureKind {
+    AbilityAsset,
+    TowerBase,
+    None,
+}
+
+fn ability_bar_texture_kind(icon: &AbilityBarIcon) -> AbilityBarTextureKind {
+    match icon {
+        AbilityBarIcon::Asset(_) => AbilityBarTextureKind::AbilityAsset,
+        AbilityBarIcon::Fallback { .. } => AbilityBarTextureKind::TowerBase,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AbilityBarItem {
+    key: AbilityBarKey,
+    tower_label: String,
+    ability_name: String,
+    description: String,
+    icon: AbilityBarIcon,
+    fallback_icon: AbilityBarIcon,
+    cooldown_total: f32,
+    cooldown_remaining: f32,
+    cooldown_text: String,
+    active_remaining: f32,
+    activation_serial: u32,
+    shortcut: Option<u8>,
+    visual_state: AbilityBarVisualState,
+}
+
+fn resolved_ability_bar_icon(item: &AbilityBarItem, authored_asset_loaded: bool) -> AbilityBarIcon {
+    match &item.icon {
+        AbilityBarIcon::Asset(_) if !authored_asset_loaded => item.fallback_icon.clone(),
+        icon => icon.clone(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AbilityBarVisualState {
+    Ready,
+    Cooling {
+        fraction: f32,
+        text: String,
+    },
+    Active {
+        cooldown_fraction: f32,
+        active_remaining: f32,
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AbilityBarRenderedState {
+    key: AbilityBarKey,
+    visual: AbilityBarVisualState,
+    enabled: bool,
+}
+
+fn ability_bar_visual_state(
+    cooldown_total: f32,
+    cooldown_remaining: f32,
+    active_remaining: f32,
+) -> AbilityBarVisualState {
+    let fraction = if cooldown_total > 0.0 {
+        (cooldown_remaining / cooldown_total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if active_remaining > 0.0 {
+        let display_active = (active_remaining * 10.0).round() / 10.0;
+        AbilityBarVisualState::Active {
+            cooldown_fraction: fraction,
+            active_remaining,
+            text: format!("ACTIVE {display_active:.1}"),
+        }
+    } else if cooldown_remaining > 0.0 {
+        AbilityBarVisualState::Cooling {
+            fraction,
+            text: format!("{cooldown_remaining:.1}"),
+        }
+    } else {
+        AbilityBarVisualState::Ready
+    }
+}
+
+fn ability_bar_elapsed_sim(
+    elapsed_wall_clock: f32,
+    is_paused: bool,
+    game_speed_multiplier: u32,
+) -> f32 {
+    if is_paused {
+        0.0
+    } else {
+        elapsed_wall_clock.max(0.0) * game_speed_multiplier as f32
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AbilityBarInteractionState {
+    page: usize,
+    debounced: HashSet<AbilityBarKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AbilityBarRejection {
+    key: AbilityBarKey,
+    reason: String,
+    shown_at: Instant,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AbilityBarRejectionState {
+    last_result_serial: u32,
+    visible: Option<AbilityBarRejection>,
+}
+
+impl AbilityBarRejectionState {
+    fn observe_results(
+        &mut self,
+        results: &[sim_runner::TowerAbilityCastResultSnapshot],
+        local_player_id: u32,
+        now: Instant,
+    ) {
+        let Some(result) = results
+            .iter()
+            .find(|result| result.player_id == local_player_id)
+        else {
+            return;
+        };
+        if result.result_serial == self.last_result_serial {
+            return;
+        }
+        self.last_result_serial = result.result_serial;
+        if !result.accepted {
+            self.visible = Some(AbilityBarRejection {
+                key: AbilityBarKey {
+                    tower_entity_id: result.tower_entity_id,
+                    ability_id: result.ability_id.clone(),
+                },
+                reason: result.reason.clone(),
+                shown_at: now,
+            });
+        } else {
+            self.visible = None;
+        }
+    }
+
+    fn retain_visible(&mut self, available_keys: &[AbilityBarKey], now: Instant) {
+        let should_clear = self.visible.as_ref().is_some_and(|rejection| {
+            now.saturating_duration_since(rejection.shown_at) >= TOWER_ABILITY_REJECTION_VISIBLE_FOR
+                || !available_keys.iter().any(|key| key == &rejection.key)
+        });
+        if should_clear {
+            self.visible = None;
+        }
+    }
+}
+
+impl AbilityBarInteractionState {
+    fn change_page(&mut self, direction: i32, page_count: usize) {
+        let last = page_count.max(1) - 1;
+        self.page = if direction > 0 {
+            (self.page + 1).min(last)
+        } else if direction < 0 {
+            self.page.saturating_sub(1)
+        } else {
+            self.page.min(last)
+        };
+    }
+
+    fn authoritative_boundary(&mut self) {
+        self.debounced.clear();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AbilityBarPageModel {
+    page: usize,
+    page_count: usize,
+    previous_enabled: bool,
+    next_enabled: bool,
+    indicator: String,
+}
+
+fn ability_bar_page_model(item_count: usize, requested_page: usize) -> AbilityBarPageModel {
+    let page_count = item_count.div_ceil(TOWER_ABILITY_BAR_PAGE_SIZE).max(1);
+    let page = requested_page.min(page_count - 1);
+    AbilityBarPageModel {
+        page,
+        page_count,
+        previous_enabled: page > 0,
+        next_enabled: page + 1 < page_count,
+        indicator: format!("{} / {}", page + 1, page_count),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AbilityBarTooltipModel {
+    title: String,
+    description: String,
+}
+
+fn ability_bar_tooltip_model(item: Option<&AbilityBarItem>) -> Option<AbilityBarTooltipModel> {
+    item.map(|item| AbilityBarTooltipModel {
+        title: item.ability_name.clone(),
+        description: item.description.clone(),
+    })
+}
+
+fn reconcile_ability_bar_slots(
+    bindings: &mut [Option<AbilityBarKey>],
+    visible_keys: &[AbilityBarKey],
+) {
+    let visible = visible_keys.iter().cloned().collect::<HashSet<_>>();
+    for binding in bindings.iter_mut() {
+        if binding.as_ref().is_some_and(|key| !visible.contains(key)) {
+            *binding = None;
+        }
+    }
+    for key in visible_keys {
+        if bindings.iter().flatten().any(|bound| bound == key) {
+            continue;
+        }
+        if let Some(vacancy) = bindings.iter_mut().find(|binding| binding.is_none()) {
+            *vacancy = Some(key.clone());
+        }
+    }
+}
+
+fn fallback_tower_display_name(unit_id: &str) -> String {
+    unit_id
+        .strip_prefix("tower_")
+        .unwrap_or(unit_id)
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ability_bar_items(
+    entities: &[sim_runner::EntityRenderData],
+    local_player_id: u32,
+    page: usize,
+    elapsed_since_snapshot: f32,
+) -> Vec<AbilityBarItem> {
+    ability_bar_items_with_names(
+        entities,
+        &HashMap::new(),
+        local_player_id,
+        page,
+        elapsed_since_snapshot,
+    )
+}
+
+fn ability_bar_available_keys(
+    entities: &[sim_runner::EntityRenderData],
+    local_player_id: u32,
+) -> Vec<AbilityBarKey> {
+    entities
+        .iter()
+        .filter(|entity| entity.owner_player_id == Some(local_player_id) && entity.hp > 0)
+        .filter_map(|entity| {
+            entity
+                .tower_active_ability
+                .as_ref()
+                .map(|ability| AbilityBarKey {
+                    tower_entity_id: entity.entity_id,
+                    ability_id: ability.ability_id.clone(),
+                })
+        })
+        .collect()
+}
+
+fn ability_bar_items_with_names(
+    entities: &[sim_runner::EntityRenderData],
+    tower_names: &HashMap<String, String>,
+    local_player_id: u32,
+    page: usize,
+    elapsed_since_snapshot: f32,
+) -> Vec<AbilityBarItem> {
+    let mut source = entities
+        .iter()
+        .filter(|entity| {
+            matches!(entity.kind, sim_runner::EntityKind::Tower)
+                && entity.owner_player_id == Some(local_player_id)
+                && entity.hp > 0
+                && entity.tower_active_ability.is_some()
+        })
+        .collect::<Vec<_>>();
+    source.sort_by_key(|entity| (entity.spawn_order, entity.entity_id));
+
+    let mut duplicate_counts = HashMap::<&str, usize>::new();
+    for entity in &source {
+        *duplicate_counts.entry(entity.unit_id.as_str()).or_default() += 1;
+    }
+    let mut duplicate_indices = HashMap::<&str, usize>::new();
+    let all_items = source
+        .into_iter()
+        .map(|entity| {
+            let ability = entity.tower_active_ability.as_ref().unwrap();
+            let duplicate_key = entity.unit_id.as_str();
+            let duplicate_index = duplicate_indices.entry(duplicate_key).or_default();
+            *duplicate_index += 1;
+            let tower_name = tower_names
+                .get(&entity.unit_id)
+                .cloned()
+                .unwrap_or_else(|| fallback_tower_display_name(&entity.unit_id));
+            let tower_label = if duplicate_counts[&duplicate_key] > 1 {
+                format!("{} #{}", tower_name, duplicate_index)
+            } else {
+                tower_name
+            };
+            let cooldown_remaining =
+                (ability.cooldown_remaining - elapsed_since_snapshot.max(0.0)).max(0.0);
+            let fallback_icon = AbilityBarIcon::Fallback {
+                tower_unit_id: entity.unit_id.clone(),
+                initial: ability.display_name.chars().next().unwrap_or('?'),
+            };
+            AbilityBarItem {
+                key: AbilityBarKey {
+                    tower_entity_id: entity.entity_id,
+                    ability_id: ability.ability_id.clone(),
+                },
+                tower_label,
+                ability_name: ability.display_name.clone(),
+                description: ability.description.clone(),
+                icon: if ability.icon.trim().is_empty() {
+                    fallback_icon.clone()
+                } else {
+                    AbilityBarIcon::Asset(ability.icon.clone())
+                },
+                fallback_icon,
+                cooldown_total: ability.cooldown_total,
+                cooldown_remaining,
+                cooldown_text: if cooldown_remaining > 0.0 {
+                    format!("{cooldown_remaining:.1}")
+                } else {
+                    "READY".into()
+                },
+                active_remaining: (ability.active_remaining - elapsed_since_snapshot.max(0.0))
+                    .max(0.0),
+                activation_serial: ability.activation_serial,
+                shortcut: None,
+                visual_state: ability_bar_visual_state(
+                    ability.cooldown_total,
+                    cooldown_remaining,
+                    (ability.active_remaining - elapsed_since_snapshot.max(0.0)).max(0.0),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    all_items
+        .into_iter()
+        .skip(page.saturating_mul(TOWER_ABILITY_BAR_PAGE_SIZE))
+        .take(TOWER_ABILITY_BAR_PAGE_SIZE)
+        .enumerate()
+        .map(|(index, mut item)| {
+            item.shortcut = Some(index as u8 + 1);
+            item
+        })
+        .collect()
+}
+
+fn text_input_has_focus(ui: &UserInterface) -> bool {
+    ui.nodes().pair_iter().any(|(_, node)| {
+        node.query_component::<TextBox>()
+            .map(|text_box| text_box.has_focus)
+            .unwrap_or(false)
+    })
 }
 
 fn td_pause_control_label(is_paused: bool) -> &'static str {
@@ -2840,6 +3241,79 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ui_ability_upgrade_buttons: [Handle<Text>; 4],
+    /// Six persistent bottom-center tower ability slots; contents are diffed by stable key.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_slots: Vec<Handle<Text>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_icons: Vec<Handle<UiNode>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_backgrounds: Vec<Handle<UiNode>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_cooldown_overlays: Vec<Handle<UiNode>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_active_overlays: Vec<Handle<UiNode>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_rects: Vec<UiRect>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_cached_text: Vec<String>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_cached_icon: Vec<String>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_cached_visual: Vec<Option<AbilityBarRenderedState>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_slot_bindings: Vec<Option<AbilityBarKey>>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_interaction: AbilityBarInteractionState,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_snapshot_at: Option<Instant>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_items: Vec<AbilityBarItem>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_tower_names: HashMap<String, String>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_rejection: AbilityBarRejectionState,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_previous: Handle<Text>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_next: Handle<Text>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_bar_page_indicator: Handle<Text>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_previous_rect: UiRect,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_next_rect: UiRect,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_tooltip_bg: Handle<UiNode>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_tooltip_title: Handle<Text>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_tower_ability_tooltip_description: Handle<Text>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    tower_ability_bar_cached_tooltip: Option<AbilityBarTooltipModel>,
     /// 4 技能圖片資源（HUD icon + tooltip icon 共用）
     #[visit(skip)]
     #[reflect(hidden)]
@@ -3145,6 +3619,123 @@ impl Plugin for Game {
                 ui.default_font = font_resource;
             }
         }
+
+        // Fixed pool: never allocate widgets per snapshot/frame.
+        for _ in 0..TOWER_ABILITY_BAR_PAGE_SIZE {
+            let background = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(132.0)
+                    .with_height(72.0)
+                    .with_background(Brush::Solid(Color::from_rgba(30, 70, 42, 245)).into())
+                    .with_foreground(Brush::Solid(Color::from_rgba(100, 220, 130, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.0).into())
+            .with_corner_radius(6.0.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            let icon: Handle<UiNode> = ImageBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(48.0)
+                    .with_height(48.0),
+            )
+            .build(&mut ui.build_ctx())
+            .transmute();
+            let cooldown_overlay = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(132.0)
+                    .with_height(0.0)
+                    .with_background(Brush::Solid(Color::from_rgba(5, 8, 12, 185)).into()),
+            )
+            .build(&mut ui.build_ctx())
+            .transmute();
+            let active_overlay = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(132.0)
+                    .with_height(0.0)
+                    .with_background(Brush::Solid(Color::from_rgba(55, 125, 235, 95)).into()),
+            )
+            .build(&mut ui.build_ctx())
+            .transmute();
+            let slot = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(132.0)
+                    .with_height(72.0)
+                    .with_foreground(Brush::Solid(Color::from_rgba(245, 245, 245, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(15.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            self.ui_tower_ability_bar_backgrounds.push(background);
+            self.ui_tower_ability_bar_icons.push(icon);
+            self.ui_tower_ability_bar_cooldown_overlays
+                .push(cooldown_overlay);
+            self.ui_tower_ability_bar_active_overlays
+                .push(active_overlay);
+            self.ui_tower_ability_bar_slots.push(slot);
+            self.tower_ability_bar_rects.push(UiRect::default());
+            self.tower_ability_bar_cached_text.push(String::new());
+            self.tower_ability_bar_cached_icon.push(String::new());
+            self.tower_ability_bar_cached_visual.push(None);
+            self.tower_ability_bar_slot_bindings.push(None);
+        }
+        let page_control = |text: &str, ui: &mut UserInterface| {
+            TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_width(36.0)
+                    .with_height(36.0)
+                    .with_background(Brush::Solid(Color::from_rgba(25, 35, 50, 240)).into())
+                    .with_foreground(Brush::Solid(Color::from_rgba(245, 245, 245, 255)).into()),
+            )
+            .with_text(text.to_string())
+            .with_font_size(24.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx())
+        };
+        self.ui_tower_ability_bar_previous = page_control("‹", ui);
+        self.ui_tower_ability_bar_next = page_control("›", ui);
+        self.ui_tower_ability_bar_page_indicator = page_control("1 / 1", ui);
+        self.ui_tower_ability_tooltip_bg = BorderBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(340.0)
+                .with_height(118.0)
+                .with_background(Brush::Solid(Color::from_rgba(20, 25, 36, 245)).into())
+                .with_foreground(Brush::Solid(Color::from_rgba(100, 140, 210, 255)).into()),
+        )
+        .with_stroke_thickness(Thickness::uniform(2.0).into())
+        .with_corner_radius(7.0.into())
+        .build(&mut ui.build_ctx())
+        .transmute();
+        self.ui_tower_ability_tooltip_title = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(316.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 80, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(18.0.into())
+        .with_wrap(WrapMode::Word)
+        .build(&mut ui.build_ctx());
+        self.ui_tower_ability_tooltip_description = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(316.0)
+                .with_height(72.0)
+                .with_foreground(Brush::Solid(Color::from_rgba(235, 235, 240, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(14.0.into())
+        .with_wrap(WrapMode::Word)
+        .build(&mut ui.build_ctx());
 
         // 先用通用 placeholder 建立 4 個 Image node；實際技能 icon 會在收到
         // AbilityRegistry snapshot 後依 AbilityDef.icon 置換。
@@ -5258,6 +5849,38 @@ impl Plugin for Game {
                     render_bridge_ns += t_render_bridge.elapsed().as_nanos();
                     applied_inputs_to_pair = Some(snapshot.applied_input_meta.clone());
                     self.latest_entities = snapshot.entities.clone();
+                    self.tower_ability_bar_interaction.authoritative_boundary();
+                    let owned_ability_count = snapshot
+                        .entities
+                        .iter()
+                        .filter(|entity| {
+                            entity.owner_player_id == Some(self.local_player_id)
+                                && entity.hp > 0
+                                && entity.tower_active_ability.is_some()
+                        })
+                        .count();
+                    let page_model = ability_bar_page_model(
+                        owned_ability_count,
+                        self.tower_ability_bar_interaction.page,
+                    );
+                    self.tower_ability_bar_interaction.page = page_model.page;
+                    self.tower_ability_bar_items = ability_bar_items_with_names(
+                        &snapshot.entities,
+                        &self.tower_ability_bar_tower_names,
+                        self.local_player_id,
+                        self.tower_ability_bar_interaction.page,
+                        0.0,
+                    );
+                    self.tower_ability_bar_snapshot_at = Some(now);
+                    self.tower_ability_bar_rejection.observe_results(
+                        &snapshot.tower_ability_cast_results,
+                        self.local_player_id,
+                        now,
+                    );
+                    self.tower_ability_bar_rejection.retain_visible(
+                        &ability_bar_available_keys(&snapshot.entities, self.local_player_id),
+                        now,
+                    );
 
                     // 階段 5.x：HUD 心跳源自 sim 快照
                     // （NetworkBridge GameEvent 串流在第 5.1 階段被刪除；這
@@ -5361,6 +5984,8 @@ impl Plugin for Game {
                     if self.td_template_order.is_empty() && !snapshot.tower_templates.is_empty() {
                         for t in snapshot.tower_templates.iter() {
                             self.td_template_order.push(t.unit_id.clone());
+                            self.tower_ability_bar_tower_names
+                                .insert(t.unit_id.clone(), t.label.clone());
                             self.td_templates
                                 .insert(t.unit_id.clone(), td_template_from_snapshot(t));
                         }
@@ -6196,6 +6821,7 @@ impl Plugin for Game {
         .entered();
         let ui = context.user_interfaces.first_mut();
         let win = self.window_size;
+        self.update_tower_ability_bar_ui(ui, now);
 
         // 刪除已刪除實體的標籤
         for label in self.pending_label_deletions.drain(..) {
@@ -8331,7 +8957,9 @@ impl Plugin for Game {
                     .to_string();
                 if self.ability_icon_paths[i] != icon_path {
                     self.ability_icon_paths[i] = icon_path.clone();
-                    let icon_tex = self.ability_icon_texture(&icon_path);
+                    let icon_tex = self
+                        .ability_icon_texture(&icon_path)
+                        .or_else(|| self.ability_icon_texture(ABILITY_ICON_FALLBACK_PATH));
                     self.ability_textures[i] = icon_tex.clone();
                     if self.ui_ability_icons[i] != Handle::<UiNode>::NONE {
                         ui.send(self.ui_ability_icons[i], ImageMessage::Texture(icon_tex));
@@ -8786,6 +9414,34 @@ impl Plugin for Game {
                 ..
             } => {
                 let screen = self.mouse_screen_pos;
+                if self
+                    .tower_ability_bar_rects
+                    .iter()
+                    .any(|rect| rect.x > -9000.0 && rect.contains(screen))
+                {
+                    let direction = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => x + y,
+                        MouseScrollDelta::PixelDelta(pos) => (pos.x + pos.y) as f32,
+                    };
+                    let ability_count = self
+                        .latest_entities
+                        .iter()
+                        .filter(|entity| {
+                            entity.owner_player_id == Some(self.local_player_id)
+                                && entity.hp > 0
+                                && entity.tower_active_ability.is_some()
+                        })
+                        .count();
+                    let page_count = ability_count.div_ceil(TOWER_ABILITY_BAR_PAGE_SIZE).max(1);
+                    if direction < 0.0 {
+                        self.tower_ability_bar_interaction
+                            .change_page(1, page_count);
+                    } else if direction > 0.0 {
+                        self.tower_ability_bar_interaction
+                            .change_page(-1, page_count);
+                    }
+                    return Ok(());
+                }
                 let viewport = self.ui_td_right_panel.viewport_rect;
                 let track = self.ui_td_right_panel.scroll_track_rect;
                 if self.td_shop_max_scroll > 0.0
@@ -8860,7 +9516,58 @@ impl Plugin for Game {
                 let mut hit_ui = false;
                 let mut play_button_sfx = false;
 
+                let item_count = self
+                    .latest_entities
+                    .iter()
+                    .filter(|entity| {
+                        entity.owner_player_id == Some(self.local_player_id)
+                            && entity.hp > 0
+                            && entity.tower_active_ability.is_some()
+                    })
+                    .count();
+                let page_model =
+                    ability_bar_page_model(item_count, self.tower_ability_bar_interaction.page);
+                if self.tower_ability_bar_previous_rect.contains(screen)
+                    && page_model.previous_enabled
+                {
+                    self.tower_ability_bar_interaction
+                        .change_page(-1, page_model.page_count);
+                    hit_ui = true;
+                    play_button_sfx = true;
+                } else if self.tower_ability_bar_next_rect.contains(screen)
+                    && page_model.next_enabled
+                {
+                    self.tower_ability_bar_interaction
+                        .change_page(1, page_model.page_count);
+                    hit_ui = true;
+                    play_button_sfx = true;
+                }
+
+                if !hit_ui {
+                    if let Some(index) = self
+                        .tower_ability_bar_rects
+                        .iter()
+                        .position(|rect| rect.x > -9000.0 && rect.contains(screen))
+                    {
+                        let item = self.tower_ability_bar_slot_bindings[index]
+                            .as_ref()
+                            .and_then(|key| {
+                                self.tower_ability_bar_items
+                                    .iter()
+                                    .find(|item| &item.key == key)
+                            })
+                            .cloned();
+                        if let Some(item) = item {
+                            play_button_sfx = self.send_tower_ability_cast(item, event_us);
+                        }
+                        hit_ui = true;
+                    }
+                }
+
                 for i in 0..4 {
+                    if hit_ui {
+                        break;
+                    }
                     let (bx, by, bw, bh) = self.ability_upgrade_button_rects[i];
                     if bx > -9000.0
                         && screen.x >= bx
@@ -9411,6 +10118,25 @@ impl Plugin for Game {
                     log::info!("[phase5.1] legacy {} send removed (args={})", label, args);
                 };
 
+                let tower_ability_slot = match key {
+                    KeyCode::Digit1 => Some(0),
+                    KeyCode::Digit2 => Some(1),
+                    KeyCode::Digit3 => Some(2),
+                    KeyCode::Digit4 => Some(3),
+                    KeyCode::Digit5 => Some(4),
+                    KeyCode::Digit6 => Some(5),
+                    _ => None,
+                };
+                if let Some(slot) = tower_ability_slot {
+                    let typing = text_input_has_focus(context.user_interfaces.first());
+                    if !typing {
+                        if let Some(item) = self.tower_ability_bar_items.get(slot).cloned() {
+                            self.send_tower_ability_cast(item, event_us);
+                            return Ok(());
+                        }
+                    }
+                }
+
                 // 按 W/E/R/T → lockstep PlayerInput::CastAbility (ability_index
                 // 0/1/2/3)。滑鼠 world pos 會成為 optional `target_pos`。
                 // Modifier 按住的情境（Shift = 升級，不是施法）會排除。
@@ -9586,6 +10312,377 @@ impl Plugin for Game {
 // ---------------------------------------------------------------------------
 
 impl Game {
+    fn update_tower_ability_bar_ui(&mut self, ui: &mut UserInterface, now: Instant) {
+        let elapsed_wall_clock = self
+            .tower_ability_bar_snapshot_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+            .unwrap_or(0.0);
+        let elapsed_sim = ability_bar_elapsed_sim(
+            elapsed_wall_clock,
+            self.is_game_paused,
+            self.game_speed_multiplier,
+        );
+        let item_count = self
+            .latest_entities
+            .iter()
+            .filter(|entity| {
+                entity.owner_player_id == Some(self.local_player_id)
+                    && entity.hp > 0
+                    && entity.tower_active_ability.is_some()
+            })
+            .count();
+        let page_model =
+            ability_bar_page_model(item_count, self.tower_ability_bar_interaction.page);
+        self.tower_ability_bar_interaction.page = page_model.page;
+        self.tower_ability_bar_items = ability_bar_items_with_names(
+            &self.latest_entities,
+            &self.tower_ability_bar_tower_names,
+            self.local_player_id,
+            page_model.page,
+            elapsed_sim,
+        );
+        self.tower_ability_bar_rejection.retain_visible(
+            &ability_bar_available_keys(&self.latest_entities, self.local_player_id),
+            now,
+        );
+        let visible_keys = self
+            .tower_ability_bar_items
+            .iter()
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
+        reconcile_ability_bar_slots(&mut self.tower_ability_bar_slot_bindings, &visible_keys);
+
+        let slot_w = 142.0;
+        let slot_h = 88.0;
+        let gap = 8.0;
+        let count = self.tower_ability_bar_items.len();
+        let total_w = count as f32 * slot_w + count.saturating_sub(1) as f32 * gap;
+        let start_x = (self.window_size.x - total_w) * 0.5;
+        let y = (self.window_size.y - slot_h - 18.0).max(0.0);
+
+        for index in 0..TOWER_ABILITY_BAR_PAGE_SIZE {
+            let Some(&handle) = self.ui_tower_ability_bar_slots.get(index) else {
+                break;
+            };
+            let logical_item = self.tower_ability_bar_slot_bindings[index]
+                .as_ref()
+                .and_then(|key| {
+                    self.tower_ability_bar_items
+                        .iter()
+                        .enumerate()
+                        .find(|(_, item)| &item.key == key)
+                });
+            let logical_index = logical_item.map(|(logical_index, _)| logical_index);
+            let item = logical_item.map(|(_, item)| item.clone());
+            let (rect, text, icon_key, texture_kind) = if let Some(item) = item.as_ref() {
+                let authored_asset_loaded = match &item.icon {
+                    AbilityBarIcon::Asset(path) => self.ability_icon_texture(path).is_some(),
+                    AbilityBarIcon::Fallback { .. } => false,
+                };
+                let resolved_icon = resolved_ability_bar_icon(item, authored_asset_loaded);
+                let icon = match &resolved_icon {
+                    AbilityBarIcon::Asset(_) => String::new(),
+                    AbilityBarIcon::Fallback {
+                        tower_unit_id,
+                        initial,
+                    } => format!("{tower_unit_id} {initial}\n"),
+                };
+                let rejection = self
+                    .tower_ability_bar_rejection
+                    .visible
+                    .as_ref()
+                    .filter(|rejection| rejection.key == item.key)
+                    .map(|rejection| format!("\n{}", rejection.reason))
+                    .unwrap_or_default();
+                let state_text = match &item.visual_state {
+                    AbilityBarVisualState::Ready => "READY".to_string(),
+                    AbilityBarVisualState::Cooling { text, .. }
+                    | AbilityBarVisualState::Active { text, .. } => text.clone(),
+                };
+                (
+                    UiRect {
+                        x: start_x + logical_index.unwrap_or(0) as f32 * (slot_w + gap),
+                        y,
+                        w: slot_w,
+                        h: slot_h,
+                    },
+                    format!(
+                        "[{}] {icon}{}\n{}\n{}{}",
+                        item.shortcut.unwrap_or(0),
+                        item.tower_label,
+                        item.ability_name,
+                        state_text,
+                        rejection
+                    ),
+                    match &resolved_icon {
+                        AbilityBarIcon::Asset(path) => path.clone(),
+                        AbilityBarIcon::Fallback { tower_unit_id, .. } => self
+                            .td_templates
+                            .get(tower_unit_id)
+                            .map(|template| template.base_image.clone())
+                            .unwrap_or_default(),
+                    },
+                    ability_bar_texture_kind(&resolved_icon),
+                )
+            } else {
+                (
+                    UiRect {
+                        x: UI_HIDDEN_POS,
+                        y: UI_HIDDEN_POS,
+                        w: slot_w,
+                        h: slot_h,
+                    },
+                    String::new(),
+                    String::new(),
+                    AbilityBarTextureKind::None,
+                )
+            };
+            if self.tower_ability_bar_rects.get(index).copied() != Some(rect) {
+                ui.send(handle, WidgetMessage::DesiredPosition(rect.pos()));
+                ui.send(handle, WidgetMessage::Width(rect.w));
+                ui.send(handle, WidgetMessage::Height(rect.h));
+                self.tower_ability_bar_rects[index] = rect;
+                for node in [
+                    self.ui_tower_ability_bar_backgrounds[index],
+                    self.ui_tower_ability_bar_cooldown_overlays[index],
+                    self.ui_tower_ability_bar_active_overlays[index],
+                ] {
+                    ui.send(node, WidgetMessage::DesiredPosition(rect.pos()));
+                    ui.send(node, WidgetMessage::Width(rect.w));
+                }
+                if let Some(&icon_handle) = self.ui_tower_ability_bar_icons.get(index) {
+                    ui.send(
+                        icon_handle,
+                        WidgetMessage::DesiredPosition(Vector2::new(rect.x + 4.0, rect.y + 12.0)),
+                    );
+                    ui.send(icon_handle, WidgetMessage::Width(48.0));
+                    ui.send(icon_handle, WidgetMessage::Height(48.0));
+                }
+            }
+            if self.tower_ability_bar_cached_text.get(index) != Some(&text) {
+                ui.send(handle, TextMessage::Text(text.clone()));
+                self.tower_ability_bar_cached_text[index] = text;
+            }
+            if self.tower_ability_bar_cached_icon.get(index) != Some(&icon_key) {
+                let texture = match texture_kind {
+                    AbilityBarTextureKind::AbilityAsset if !icon_key.is_empty() => {
+                        self.ability_icon_texture(&icon_key)
+                    }
+                    AbilityBarTextureKind::TowerBase if !icon_key.is_empty() => {
+                        self.tower_texture_for_key(&icon_key)
+                    }
+                    AbilityBarTextureKind::AbilityAsset
+                    | AbilityBarTextureKind::TowerBase
+                    | AbilityBarTextureKind::None => None,
+                };
+                if let Some(&icon_handle) = self.ui_tower_ability_bar_icons.get(index) {
+                    ui.send(icon_handle, ImageMessage::Texture(texture));
+                }
+                self.tower_ability_bar_cached_icon[index] = icon_key;
+            }
+            let rendered_state = item.as_ref().map(|item| AbilityBarRenderedState {
+                key: item.key.clone(),
+                visual: item.visual_state.clone(),
+                enabled: matches!(item.visual_state, AbilityBarVisualState::Ready)
+                    && !self
+                        .tower_ability_bar_interaction
+                        .debounced
+                        .contains(&item.key),
+            });
+            if self.tower_ability_bar_cached_visual[index] != rendered_state {
+                let (color, cooldown_fraction, active) = match rendered_state.as_ref() {
+                    Some(AbilityBarRenderedState {
+                        visual: AbilityBarVisualState::Ready,
+                        enabled: true,
+                        ..
+                    }) => (Color::from_rgba(30, 90, 48, 245), 0.0, false),
+                    Some(AbilityBarRenderedState {
+                        visual: AbilityBarVisualState::Cooling { fraction, .. },
+                        ..
+                    }) => (Color::from_rgba(45, 48, 55, 245), *fraction, false),
+                    Some(AbilityBarRenderedState {
+                        visual:
+                            AbilityBarVisualState::Active {
+                                cooldown_fraction, ..
+                            },
+                        ..
+                    }) => (Color::from_rgba(28, 65, 125, 245), *cooldown_fraction, true),
+                    Some(_) => (Color::from_rgba(65, 58, 35, 245), 0.0, false),
+                    None => (Color::TRANSPARENT, 0.0, false),
+                };
+                ui.send(
+                    self.ui_tower_ability_bar_backgrounds[index],
+                    WidgetMessage::Background(Brush::Solid(color).into()),
+                );
+                ui.send(
+                    self.ui_tower_ability_bar_backgrounds[index],
+                    WidgetMessage::Height(rect.h),
+                );
+                let cooldown_h = rect.h * cooldown_fraction.clamp(0.0, 1.0);
+                ui.send(
+                    self.ui_tower_ability_bar_cooldown_overlays[index],
+                    WidgetMessage::DesiredPosition(Vector2::new(
+                        rect.x,
+                        rect.y + rect.h - cooldown_h,
+                    )),
+                );
+                ui.send(
+                    self.ui_tower_ability_bar_cooldown_overlays[index],
+                    WidgetMessage::Height(cooldown_h),
+                );
+                ui.send(
+                    self.ui_tower_ability_bar_active_overlays[index],
+                    WidgetMessage::Height(if active { rect.h } else { 0.0 }),
+                );
+                self.tower_ability_bar_cached_visual[index] = rendered_state;
+            }
+        }
+
+        let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        if item_count > 0 {
+            let control_y = (y - 40.0).max(0.0);
+            let center = self.window_size.x * 0.5;
+            self.tower_ability_bar_previous_rect = UiRect {
+                x: center - 76.0,
+                y: control_y,
+                w: 36.0,
+                h: 34.0,
+            };
+            self.tower_ability_bar_next_rect = UiRect {
+                x: center + 40.0,
+                y: control_y,
+                w: 36.0,
+                h: 34.0,
+            };
+            ui.send(
+                self.ui_tower_ability_bar_previous,
+                WidgetMessage::DesiredPosition(self.tower_ability_bar_previous_rect.pos()),
+            );
+            ui.send(
+                self.ui_tower_ability_bar_next,
+                WidgetMessage::DesiredPosition(self.tower_ability_bar_next_rect.pos()),
+            );
+            ui.send(
+                self.ui_tower_ability_bar_page_indicator,
+                WidgetMessage::DesiredPosition(Vector2::new(center - 36.0, control_y)),
+            );
+            ui.send(
+                self.ui_tower_ability_bar_page_indicator,
+                WidgetMessage::Width(72.0),
+            );
+            ui.send(
+                self.ui_tower_ability_bar_page_indicator,
+                TextMessage::Text(page_model.indicator.clone()),
+            );
+            for (handle, enabled) in [
+                (
+                    self.ui_tower_ability_bar_previous,
+                    page_model.previous_enabled,
+                ),
+                (self.ui_tower_ability_bar_next, page_model.next_enabled),
+            ] {
+                ui.send(
+                    handle,
+                    WidgetMessage::Foreground(
+                        Brush::Solid(if enabled {
+                            Color::from_rgba(245, 245, 245, 255)
+                        } else {
+                            Color::from_rgba(100, 100, 105, 255)
+                        })
+                        .into(),
+                    ),
+                );
+            }
+        } else {
+            self.tower_ability_bar_previous_rect = UiRect::default();
+            self.tower_ability_bar_next_rect = UiRect::default();
+            for handle in [
+                self.ui_tower_ability_bar_previous,
+                self.ui_tower_ability_bar_next,
+                self.ui_tower_ability_bar_page_indicator,
+            ] {
+                ui.send(handle, WidgetMessage::DesiredPosition(hidden));
+            }
+        }
+
+        let hovered = self
+            .tower_ability_bar_rects
+            .iter()
+            .enumerate()
+            .find(|(_, rect)| rect.x > -9000.0 && rect.contains(self.mouse_screen_pos))
+            .and_then(|(slot, _)| self.tower_ability_bar_slot_bindings[slot].as_ref())
+            .and_then(|key| {
+                self.tower_ability_bar_items
+                    .iter()
+                    .find(|item| &item.key == key)
+            });
+        let tooltip = ability_bar_tooltip_model(hovered);
+        if self.tower_ability_bar_cached_tooltip != tooltip {
+            let pos = if tooltip.is_some() {
+                Vector2::new(
+                    (self.mouse_screen_pos.x + 16.0).min((self.window_size.x - 350.0).max(0.0)),
+                    (y - 128.0).max(0.0),
+                )
+            } else {
+                hidden
+            };
+            ui.send(
+                self.ui_tower_ability_tooltip_bg,
+                WidgetMessage::DesiredPosition(pos),
+            );
+            ui.send(
+                self.ui_tower_ability_tooltip_title,
+                WidgetMessage::DesiredPosition(pos + Vector2::new(12.0, 8.0)),
+            );
+            ui.send(
+                self.ui_tower_ability_tooltip_description,
+                WidgetMessage::DesiredPosition(pos + Vector2::new(12.0, 36.0)),
+            );
+            ui.send(
+                self.ui_tower_ability_tooltip_title,
+                TextMessage::Text(
+                    tooltip
+                        .as_ref()
+                        .map(|m| m.title.clone())
+                        .unwrap_or_default(),
+                ),
+            );
+            ui.send(
+                self.ui_tower_ability_tooltip_description,
+                TextMessage::Text(
+                    tooltip
+                        .as_ref()
+                        .map(|m| m.description.clone())
+                        .unwrap_or_default(),
+                ),
+            );
+            self.tower_ability_bar_cached_tooltip = tooltip;
+        }
+    }
+
+    fn send_tower_ability_cast(&mut self, item: AbilityBarItem, event_us: u64) -> bool {
+        if !matches!(item.visual_state, AbilityBarVisualState::Ready)
+            || !self
+                .tower_ability_bar_interaction
+                .debounced
+                .insert(item.key.clone())
+        {
+            return false;
+        }
+        let input = omoba_core::kcp::game_proto::PlayerInput {
+            action: Some(
+                omoba_core::kcp::game_proto::player_input::Action::TowerAbilityCast(
+                    omoba_core::kcp::game_proto::TowerAbilityCastInput {
+                        tower_entity_id: item.key.tower_entity_id,
+                        ability_id: item.key.ability_id,
+                    },
+                ),
+            ),
+        };
+        self.send_lockstep_input_from(input, lockstep_client::InputOriginKind::OsEvent, event_us);
+        true
+    }
+
     fn server_timing(&self) -> LockstepTiming {
         LockstepTiming::new(if self.server_step_fps == 0 {
             LOCKSTEP_TPS
@@ -9620,6 +10717,7 @@ impl Game {
     fn clear_lua_metadata_caches(&mut self) {
         self.td_templates.clear();
         self.td_template_order.clear();
+        self.tower_ability_bar_tower_names.clear();
         self.td_upgrade_defs.clear();
         self.ability_info_map.clear();
         self.ability_icon_texture_cache.clear();
@@ -9755,11 +10853,7 @@ impl Game {
         if let Some(cached) = self.ability_icon_texture_cache.get(key) {
             return cached.clone();
         }
-        let texture = load_texture_from_rel_path(key).or_else(|| {
-            (key != ABILITY_ICON_FALLBACK_PATH)
-                .then(|| load_texture_from_rel_path(ABILITY_ICON_FALLBACK_PATH))
-                .flatten()
-        });
+        let texture = load_texture_from_rel_path(key);
         self.ability_icon_texture_cache
             .insert(key.to_string(), texture.clone());
         texture
@@ -14738,6 +15832,375 @@ fn circle_hits_polygon(center: Vector2<f32>, r: f32, poly: &[Vector2<f32>]) -> b
 #[cfg(test)]
 mod input_latency_tests {
     use super::*;
+
+    fn ability_entity(
+        entity_id: u32,
+        spawn_order: u64,
+        unit_id: &str,
+        display_name: &str,
+        icon: &str,
+        cooldown_remaining: f32,
+    ) -> sim_runner::EntityRenderData {
+        sim_runner::EntityRenderData {
+            entity_id,
+            spawn_order,
+            kind: sim_runner::EntityKind::Tower,
+            unit_id: unit_id.into(),
+            hp: 100,
+            max_hp: 100,
+            owner_player_id: Some(7),
+            tower_active_ability: Some(sim_runner::TowerActiveAbilitySnapshot {
+                ability_id: format!("ability_{entity_id}"),
+                display_name: display_name.into(),
+                description: "description".into(),
+                icon: icon.into(),
+                cooldown_total: 10.0,
+                cooldown_remaining,
+                active_remaining: 0.0,
+                activation_serial: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ability_bar_orders_by_spawn_then_entity_and_limits_shortcuts() {
+        let entities = (0..9)
+            .rev()
+            .map(|i| ability_entity(900 - i, i as u64, "tower_dart", "Volley", "icon.png", 0.0))
+            .collect::<Vec<_>>();
+
+        let items = ability_bar_items(&entities, 7, 0, 0.0);
+
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[0].key.tower_entity_id, 900);
+        assert_eq!(items[1].key.tower_entity_id, 899);
+        assert_eq!(items[0].shortcut, Some(1));
+        assert_eq!(items[5].shortcut, Some(6));
+        let second_page = ability_bar_items(&entities, 7, 1, 0.0);
+        assert_eq!(second_page.len(), 3);
+        assert_eq!(second_page[0].shortcut, Some(1));
+    }
+
+    #[test]
+    fn ability_bar_formats_interpolated_countdown_to_one_decimal() {
+        let entities = vec![ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 2.04)];
+
+        let items = ability_bar_items(&entities, 7, 0, 0.55);
+
+        assert_eq!(items[0].cooldown_text, "1.5");
+    }
+
+    #[test]
+    fn ability_bar_elapsed_sim_freezes_while_paused() {
+        assert_eq!(ability_bar_elapsed_sim(1.25, true, 2), 0.0);
+    }
+
+    #[test]
+    fn ability_bar_elapsed_sim_tracks_wall_clock_at_one_x() {
+        assert_eq!(ability_bar_elapsed_sim(1.25, false, 1), 1.25);
+    }
+
+    #[test]
+    fn ability_bar_elapsed_sim_scales_wall_clock_at_two_x() {
+        assert_eq!(ability_bar_elapsed_sim(1.25, false, 2), 2.5);
+    }
+
+    #[test]
+    fn ability_bar_authoritative_snapshot_corrects_interpolated_countdown() {
+        let before = vec![ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 8.0)];
+        let interpolated = ability_bar_items(&before, 7, 0, ability_bar_elapsed_sim(1.0, false, 2));
+        assert_eq!(interpolated[0].cooldown_remaining, 6.0);
+
+        let corrected = vec![ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 5.5)];
+        let items = ability_bar_items(&corrected, 7, 0, ability_bar_elapsed_sim(0.0, false, 2));
+        assert_eq!(items[0].cooldown_remaining, 5.5);
+    }
+
+    #[test]
+    fn ability_bar_uses_tower_and_initial_fallback_when_icon_missing() {
+        let entities = vec![ability_entity(1, 0, "tower_arty", "Fire", "", 0.0)];
+
+        let items = ability_bar_items(&entities, 7, 0, 0.0);
+
+        assert_eq!(
+            items[0].icon,
+            AbilityBarIcon::Fallback {
+                tower_unit_id: "tower_arty".into(),
+                initial: 'F',
+            }
+        );
+        assert_eq!(items[0].cooldown_text, "READY");
+    }
+
+    #[test]
+    fn ability_bar_uses_tower_and_initial_fallback_when_nonempty_icon_fails_to_load() {
+        let entities = vec![ability_entity(
+            1,
+            0,
+            "tower_arty",
+            "Fire",
+            "assets/ui/abilities/missing.png",
+            0.0,
+        )];
+        let items = ability_bar_items(&entities, 7, 0, 0.0);
+
+        let resolved = resolved_ability_bar_icon(&items[0], false);
+        assert_eq!(
+            resolved,
+            AbilityBarIcon::Fallback {
+                tower_unit_id: "tower_arty".into(),
+                initial: 'F',
+            }
+        );
+        assert_eq!(
+            ability_bar_texture_kind(&resolved),
+            AbilityBarTextureKind::TowerBase
+        );
+    }
+
+    #[test]
+    fn ability_bar_suffixes_duplicate_tower_names() {
+        let entities = vec![
+            ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 0.0),
+            ability_entity(2, 1, "tower_arty", "Fire", "icon.png", 0.0),
+        ];
+
+        let tower_names = HashMap::from([("tower_arty".to_string(), "Artillery".to_string())]);
+        let items = ability_bar_items_with_names(&entities, &tower_names, 7, 0, 0.0);
+
+        assert_eq!(items[0].tower_label, "Artillery #1");
+        assert_eq!(items[1].tower_label, "Artillery #2");
+        assert_eq!(items[0].ability_name, "Fire");
+        assert_eq!(items[1].ability_name, "Fire");
+    }
+
+    #[test]
+    fn ability_bar_authored_icon_still_shows_tower_identity() {
+        let entities = vec![ability_entity(
+            1,
+            0,
+            "tower_boomerang",
+            "Turbo Charge",
+            "turbo.png",
+            0.0,
+        )];
+        let tower_names = HashMap::from([("tower_boomerang".to_string(), "Boomerang".to_string())]);
+
+        let items = ability_bar_items_with_names(&entities, &tower_names, 7, 0, 0.0);
+
+        assert_eq!(items[0].tower_label, "Boomerang");
+        assert_eq!(items[0].ability_name, "Turbo Charge");
+        assert_eq!(items[0].icon, AbilityBarIcon::Asset("turbo.png".into()));
+    }
+
+    #[test]
+    fn ability_bar_visual_state_distinguishes_ready_cooling_and_active() {
+        assert_eq!(
+            ability_bar_visual_state(10.0, 0.0, 0.0),
+            AbilityBarVisualState::Ready
+        );
+        assert_eq!(
+            ability_bar_visual_state(10.0, 2.5, 0.0),
+            AbilityBarVisualState::Cooling {
+                fraction: 0.25,
+                text: "2.5".into(),
+            }
+        );
+        assert_eq!(
+            ability_bar_visual_state(10.0, 8.0, 1.25),
+            AbilityBarVisualState::Active {
+                cooldown_fraction: 0.8,
+                active_remaining: 1.25,
+                text: "ACTIVE 1.3".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn ability_bar_page_model_exposes_controls_and_indicator() {
+        assert_eq!(
+            ability_bar_page_model(8, 0),
+            AbilityBarPageModel {
+                page: 0,
+                page_count: 2,
+                previous_enabled: false,
+                next_enabled: true,
+                indicator: "1 / 2".into(),
+            }
+        );
+        assert_eq!(ability_bar_page_model(8, 1).indicator, "2 / 2");
+    }
+
+    #[test]
+    fn ability_bar_paging_preserves_debounce_until_authoritative_boundary() {
+        let key = AbilityBarKey {
+            tower_entity_id: 42,
+            ability_id: "turbo".into(),
+        };
+        let mut state = AbilityBarInteractionState::default();
+        state.debounced.insert(key.clone());
+
+        state.change_page(1, 2);
+        assert_eq!(state.page, 1);
+        assert!(state.debounced.contains(&key));
+
+        state.authoritative_boundary();
+        assert!(state.debounced.is_empty());
+    }
+
+    #[test]
+    fn ability_bar_slot_reconciliation_preserves_handles_for_stable_keys() {
+        let key = |tower_entity_id| AbilityBarKey {
+            tower_entity_id,
+            ability_id: format!("ability_{tower_entity_id}"),
+        };
+        let mut bindings = vec![Some(key(1)), Some(key(2)), Some(key(3)), None, None, None];
+
+        reconcile_ability_bar_slots(&mut bindings, &[key(2), key(3), key(4)]);
+
+        assert_eq!(bindings[1], Some(key(2)));
+        assert_eq!(bindings[2], Some(key(3)));
+        assert_eq!(bindings[0], Some(key(4)));
+        assert_eq!(bindings.iter().flatten().count(), 3);
+    }
+
+    #[test]
+    fn ability_bar_tooltip_is_dedicated_and_uses_ability_copy() {
+        let entities = vec![ability_entity(
+            1,
+            0,
+            "tower_boomerang",
+            "Turbo Charge",
+            "turbo.png",
+            0.0,
+        )];
+        let tower_names = HashMap::from([("tower_boomerang".to_string(), "Boomerang".to_string())]);
+        let item = ability_bar_items_with_names(&entities, &tower_names, 7, 0, 0.0).remove(0);
+
+        assert_eq!(
+            ability_bar_tooltip_model(Some(&item)),
+            Some(AbilityBarTooltipModel {
+                title: "Turbo Charge".into(),
+                description: "description".into(),
+            })
+        );
+        assert_eq!(ability_bar_tooltip_model(None), None);
+    }
+
+    #[test]
+    fn ability_bar_removes_tower_missing_from_authoritative_snapshot() {
+        let entities = vec![ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 0.0)];
+        assert_eq!(ability_bar_items(&entities, 7, 0, 0.0).len(), 1);
+
+        assert!(ability_bar_items(&[], 7, 0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn ability_bar_filters_to_local_owner() {
+        let mut foreign = ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 0.0);
+        foreign.owner_player_id = Some(8);
+
+        assert!(ability_bar_items(&[foreign], 7, 0, 0.0).is_empty());
+    }
+
+    fn rejected_cast_result(
+        player_id: u32,
+        tower_entity_id: u32,
+        result_serial: u32,
+    ) -> sim_runner::TowerAbilityCastResultSnapshot {
+        sim_runner::TowerAbilityCastResultSnapshot {
+            player_id,
+            tower_entity_id,
+            ability_id: format!("ability_{tower_entity_id}"),
+            accepted: false,
+            reason: "cooldown_active".into(),
+            result_serial,
+        }
+    }
+
+    #[test]
+    fn ability_bar_rejection_selects_local_players_result() {
+        let now = Instant::now();
+        let mut state = AbilityBarRejectionState::default();
+        state.observe_results(
+            &[
+                rejected_cast_result(8, 80, 1),
+                rejected_cast_result(7, 70, 2),
+            ],
+            7,
+            now,
+        );
+
+        assert_eq!(state.visible.as_ref().unwrap().key.tower_entity_id, 70);
+    }
+
+    #[test]
+    fn ability_bar_rejection_survives_ordinary_authoritative_snapshots() {
+        let now = Instant::now();
+        let result = rejected_cast_result(7, 70, 2);
+        let key = AbilityBarKey {
+            tower_entity_id: 70,
+            ability_id: "ability_70".into(),
+        };
+        let mut state = AbilityBarRejectionState::default();
+        state.observe_results(std::slice::from_ref(&result), 7, now);
+
+        for seconds in [0.5, 1.0, 2.9] {
+            state.observe_results(
+                std::slice::from_ref(&result),
+                7,
+                now + Duration::from_secs_f32(seconds),
+            );
+            state.retain_visible(
+                std::slice::from_ref(&key),
+                now + Duration::from_secs_f32(seconds),
+            );
+            assert!(state.visible.is_some(), "rejection hidden at {seconds}s");
+        }
+    }
+
+    #[test]
+    fn ability_bar_rejection_expires_after_three_wall_clock_seconds() {
+        let now = Instant::now();
+        let mut state = AbilityBarRejectionState::default();
+        state.observe_results(&[rejected_cast_result(7, 70, 2)], 7, now);
+        state.retain_visible(
+            &[AbilityBarKey {
+                tower_entity_id: 70,
+                ability_id: "ability_70".into(),
+            }],
+            now + Duration::from_secs_f32(3.0),
+        );
+
+        assert!(state.visible.is_none());
+    }
+
+    #[test]
+    fn ability_bar_accepted_result_clears_visible_rejection_before_timeout() {
+        let now = Instant::now();
+        let mut state = AbilityBarRejectionState::default();
+        state.observe_results(&[rejected_cast_result(7, 70, 2)], 7, now);
+        assert!(state.visible.is_some());
+
+        let mut accepted = rejected_cast_result(7, 70, 3);
+        accepted.accepted = true;
+        accepted.reason.clear();
+        state.observe_results(&[accepted], 7, now + Duration::from_secs(1));
+
+        assert_eq!(state.last_result_serial, 3);
+        assert!(state.visible.is_none());
+    }
+
+    #[test]
+    fn ability_bar_rejection_clears_when_keyed_tower_disappears() {
+        let now = Instant::now();
+        let mut state = AbilityBarRejectionState::default();
+        state.observe_results(&[rejected_cast_result(7, 70, 2)], 7, now);
+        state.retain_visible(&[], now + Duration::from_millis(100));
+
+        assert!(state.visible.is_none());
+    }
 
     fn sample(input_id: u32, total_ms: u32) -> LatencySample {
         LatencySample {
