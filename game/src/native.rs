@@ -12468,6 +12468,18 @@ impl Game {
         self.update_hotkey_panel(ui);
     }
 
+    fn clear_td_tower_shop_cards(&mut self, ui: &mut UserInterface) {
+        for card in self.ui_td_tower_cards.drain(..) {
+            for node in [card.bg, card.icon] {
+                ui.send(node, WidgetMessage::Remove);
+            }
+            for text in [card.key_text, card.name_text, card.price_text] {
+                ui.send(text, WidgetMessage::Remove);
+            }
+        }
+        self.td_tower_button_rects.clear();
+    }
+
     fn hide_gameplay_ui_for_pregame(&mut self, ui: &mut UserInterface) {
         ui.send(self.ui_status_text, TextMessage::Text(String::new()));
         ui.send(self.ui_hud_text, TextMessage::Text(String::new()));
@@ -12512,7 +12524,7 @@ impl Game {
         self.start_round_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.auto_start_checkbox_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.pause_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
-        self.td_tower_button_rects.clear();
+        self.clear_td_tower_shop_cards(ui);
         self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.td_target_priority_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.td_upgrade_button_rects = [(UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0); 3];
@@ -16943,6 +16955,49 @@ mod input_latency_tests {
 
         assert!(game.sim_entity_slots.is_empty());
         assert!(game.entity_kind_cache.is_empty());
+    }
+
+    #[test]
+    fn returning_to_pregame_removes_dynamic_td_shop_cards() {
+        let mut game = Game::default();
+        let mut ui = UserInterface::new(Default::default());
+        let bg: Handle<UiNode> = ImageBuilder::new(WidgetBuilder::new())
+            .build(&mut ui.build_ctx())
+            .transmute();
+        let icon: Handle<UiNode> = ImageBuilder::new(WidgetBuilder::new())
+            .build(&mut ui.build_ctx())
+            .transmute();
+        let key_text = TextBuilder::new(WidgetBuilder::new()).build(&mut ui.build_ctx());
+        let name_text = TextBuilder::new(WidgetBuilder::new()).build(&mut ui.build_ctx());
+        let price_text = TextBuilder::new(WidgetBuilder::new()).build(&mut ui.build_ctx());
+        let handles: [Handle<UiNode>; 5] = [
+            bg,
+            icon,
+            key_text.transmute(),
+            name_text.transmute(),
+            price_text.transmute(),
+        ];
+        game.ui_td_tower_cards.push(TdTowerShopCard {
+            bg,
+            icon,
+            key_text,
+            name_text,
+            price_text,
+        });
+        game.td_tower_button_rects.push((1.0, 2.0, 3.0, 4.0));
+
+        game.clear_td_tower_shop_cards(&mut ui);
+        while ui.poll_message().is_some() {}
+
+        assert!(game.ui_td_tower_cards.is_empty());
+        assert!(game.td_tower_button_rects.is_empty());
+        assert_eq!(
+            game.ui_td_tower_cards.len(),
+            game.td_tower_button_rects.len()
+        );
+        for handle in handles {
+            assert!(!ui.nodes().is_valid_handle(handle));
+        }
     }
 
     #[test]
