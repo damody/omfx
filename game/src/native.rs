@@ -6052,6 +6052,29 @@ impl Plugin for Game {
                         self.is_td_mode = true;
                     }
 
+                    // 遊戲結束偵測：從 sim 快照推導 defeat / victory 條件。
+                    // 舊版 GameEvent game_end 處理器在第 5.1 階段被移除，
+                    // 因此改由快照欄位判斷：
+                    //   Defeat  — lives <= 0（TD 模式下生命耗盡）
+                    //   Victory — round >= total_rounds 且目前波次已結束
+                    if !self.game_ended && snapshot.tick > 0 && snapshot.total_rounds > 0 {
+                        let is_defeat = snapshot.lives <= 0;
+                        let is_victory = snapshot.round >= snapshot.total_rounds
+                            && !snapshot.round_is_running;
+                        if is_defeat || is_victory {
+                            log::info!(
+                                "[game_end] defeat={} victory={} lives={} round={}/{} running={}",
+                                is_defeat,
+                                is_victory,
+                                snapshot.lives,
+                                snapshot.round,
+                                snapshot.total_rounds,
+                                snapshot.round_is_running,
+                            );
+                            self.game_ended = true;
+                        }
+                    }
+
                     // 階段 4.2：將模擬爆炸排入本地
                     // `active_explosions` 環形緩衝區。按刻度進行重複資料刪除
                     // 重新讀取相同快照的渲染幀不會
