@@ -50,9 +50,9 @@ pub use omoba_core::runtime::{
     retain_recent_render_fx, AbilityDefSnapshot, AppliedInputMeta, AttackCancelFx, AttackPhaseFx,
     BlockedRegionSnapshot, BuffSnapshot, EntityKind, EntityRenderData, ExplosionFx,
     HeroAnimationBindingSnapshot, HeroAnimationSourceSnapshot, HeroRenderSnapshot, HeroStatsExt,
-    SimWorldSnapshot, TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot,
-    TowerRenderAnimationSnapshot, TowerRenderPointSnapshot, TowerTemplateSnapshot,
-    TowerUpgradeDefSnapshot,
+    SimWorldSnapshot, TowerAbilityCastResultSnapshot, TowerActiveAbilitySnapshot,
+    TowerBarrelVariantSnapshot, TowerFireFx, TowerRecoilSnapshot, TowerRenderAnimationSnapshot,
+    TowerRenderPointSnapshot, TowerTemplateSnapshot, TowerUpgradeDefSnapshot,
 };
 
 pub const DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS: u32 = 1;
@@ -128,9 +128,28 @@ pub struct SimRunnerHandle {
     /// 在初始化世界之前，工作人員會阻止此操作，因此
     /// MasterSeed 資源在第一個tick 運行之前設定。
     pub master_seed_tx: Sender<SimStartMetadata>,
+    cancel_tx: Sender<()>,
     /// 工作線程連接句柄。持有但未加入；線程退出於
     /// 當“SimRunnerHandle”被刪除時，通道會中斷。
     _thread: thread::JoinHandle<()>,
+}
+
+impl SimRunnerHandle {
+    pub fn shutdown(self) {
+        let Self {
+            tick_input_tx,
+            master_seed_tx,
+            cancel_tx,
+            _thread,
+            ..
+        } = self;
+        let _ = cancel_tx.send(());
+        drop(tick_input_tx);
+        drop(master_seed_tx);
+        if _thread.join().is_err() {
+            error!("sim_runner worker panicked during shutdown");
+        }
+    }
 }
 
 /// 生成模擬器工人。使用初始化規格世界
@@ -157,6 +176,7 @@ pub fn spawn_sim_runner_with_render_extract_rate(
 
     let (tick_input_tx, tick_input_rx) = unbounded::<TickBatchPayload>();
     let (master_seed_tx, master_seed_rx) = unbounded::<SimStartMetadata>();
+    let (cancel_tx, cancel_rx) = unbounded::<()>();
 
     let handle = thread::Builder::new()
         .name("omfx-sim-runner".into())
@@ -166,6 +186,7 @@ pub fn spawn_sim_runner_with_render_extract_rate(
                 diagnostics_for_thread,
                 tick_input_rx,
                 master_seed_rx,
+                cancel_rx,
                 base_content_dll_path,
                 scene_path,
                 normalize_extract_data_for_render_every_ticks(extract_data_for_render_every_ticks),
@@ -178,6 +199,7 @@ pub fn spawn_sim_runner_with_render_extract_rate(
         tick_input_tx,
         diagnostics,
         master_seed_tx,
+        cancel_tx,
         _thread: handle,
     }
 }
@@ -200,6 +222,7 @@ fn run_sim_loop(
     diagnostics_out: Arc<Mutex<SimRunnerDiagnostics>>,
     tick_input_rx: Receiver<TickBatchPayload>,
     master_seed_rx: Receiver<SimStartMetadata>,
+    cancel_rx: Receiver<()>,
     dll_path: PathBuf,
     scene_path: PathBuf,
     extract_data_for_render_every_ticks: u32,
@@ -213,7 +236,17 @@ fn run_sim_loop(
     // 遊戲開始於階段 3.3)。提早返回——沒有滴答作響——
     // 是預期的第 3.2 階段結果，因為 LockstepClient 不
     // 還餵這個頻道。
-    let start = match master_seed_rx.recv() {
+    if cancel_rx.try_recv().is_ok() {
+        info!("sim_runner: cancelled before GameStart, exiting");
+        return;
+    }
+    let start = match crossbeam_channel::select_biased! {
+        recv(cancel_rx) -> _ => {
+            info!("sim_runner: cancelled before GameStart, exiting");
+            return;
+        }
+        recv(master_seed_rx) -> result => result
+    } {
         Ok(s) => s,
         Err(_) => {
             info!("sim_runner: master_seed channel dropped before GameStart, exiting");
@@ -244,6 +277,11 @@ fn run_sim_loop(
                 return;
             }
         };
+
+    if cancel_rx.try_recv().is_ok() {
+        info!("sim_runner: cancelled during world initialization, exiting");
+        return;
+    }
 
     let mut dispatcher = match omoba_core::runtime::build_phase3_dispatcher() {
         Ok(d) => d,
@@ -309,6 +347,10 @@ fn run_sim_loop(
     let mut profile_max_queue_len: usize = 0;
     let mut last_tick_started_at = Instant::now();
     loop {
+        if cancel_rx.try_recv().is_ok() {
+            info!("sim_runner: cancelled, exiting");
+            break;
+        }
         let queue_len_before_receive = tick_input_rx.len();
         profile_max_queue_len = profile_max_queue_len.max(queue_len_before_receive);
         let (batch, received_from_backlog) = match tick_input_rx.try_recv() {
@@ -324,6 +366,7 @@ fn run_sim_loop(
                 let wait_started = Instant::now();
                 let batch = match wait_tick_batch(
                     &tick_input_rx,
+                    &cancel_rx,
                     last_tick_started_at,
                     timing,
                     WAIT_PRECISION_WINDOW,
@@ -348,6 +391,11 @@ fn run_sim_loop(
                     }
                     Err(WaitTickBatchError::Disconnected) => {
                         info!("sim_runner: input channel closed, exiting");
+                        drop(wait_span);
+                        break;
+                    }
+                    Err(WaitTickBatchError::Cancelled) => {
+                        info!("sim_runner: cancelled while waiting for TickBatch, exiting");
                         drop(wait_span);
                         break;
                     }
@@ -512,11 +560,6 @@ fn run_sim_loop(
         omoba_core::runtime::drain_pending_tower_sells(&mut world);
         world.maintain();
 
-        // 階段 2.3：drain TowerUpgrade input queue。扣金、upgrade_levels 增量與
-        // BuffStore stat-mod 必須在 authoritative/local replica 同步執行。
-        omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
-        world.maintain();
-
         omoba_core::runtime::drain_pending_tower_target_priorities(&mut world);
         world.maintain();
 
@@ -538,6 +581,7 @@ fn run_sim_loop(
         // MoveTo (右鍵移動): drain `PendingMoveQueue`，在玩家英雄寫入 MoveTarget。
         omoba_core::runtime::drain_pending_moves(&mut world);
         world.maintain();
+
         profile_drains_ns += t_drains.elapsed().as_nanos();
         drop(drains_span);
 
@@ -557,6 +601,23 @@ fn run_sim_loop(
         world.maintain();
         drop(pre_script_outcomes_span);
 
+        // Mirror the authoritative active-ability phase exactly: upgrades ->
+        // casts -> scheduler -> callbacks -> ordinary unit script ticks. The
+        // maintain above closes pre-script outcomes; the next maintain remains
+        // after post-script outcomes so no ECS lifecycle boundary can split
+        // this phase.
+        omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
+        omoba_core::runtime::drain_pending_tower_ability_casts(&mut world);
+        let scaled_dt = world
+            .read_resource::<omoba_core::comp::resources::DeltaTime>()
+            .0;
+        omoba_core::runtime::tick_tower_abilities(&mut world, scaled_dt);
+        omoba_core::runtime::drain_pending_tower_ability_callbacks(
+            &mut world,
+            &script_registry,
+            batch.tick as u64,
+        );
+
         let t_script = Instant::now();
         let script_span =
             tracing::trace_span!("omfx::sim_runner::script_dispatch", perfetto = true).entered();
@@ -571,7 +632,7 @@ fn run_sim_loop(
             &mut world,
             &script_registry,
             batch.tick as u64,
-            omoba_sim::Fixed64::from_raw(timing.fixed_raw_for_tick(batch.tick as u64)),
+            scaled_dt,
         );
         // 處理推送的任何結果腳本（投射物/損壞/等）。
         let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
@@ -759,10 +820,12 @@ fn run_sim_loop(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitTickBatchError {
     Disconnected,
+    Cancelled,
 }
 
 fn wait_tick_batch(
     rx: &Receiver<TickBatchPayload>,
+    cancel_rx: &Receiver<()>,
     last_tick_started_at: Instant,
     timing: LockstepTiming,
     precision_window: Duration,
@@ -770,6 +833,9 @@ fn wait_tick_batch(
 ) -> Result<Option<TickBatchPayload>, WaitTickBatchError> {
     let wait_started = Instant::now();
     loop {
+        if cancel_rx.try_recv().is_ok() {
+            return Err(WaitTickBatchError::Cancelled);
+        }
         match rx.try_recv() {
             Ok(batch) => return Ok(Some(batch)),
             Err(TryRecvError::Disconnected) => return Err(WaitTickBatchError::Disconnected),
@@ -785,35 +851,46 @@ fn wait_tick_batch(
         if let Some(sleep_duration) = plan.sleep {
             let timeout =
                 sleep_duration.min(starvation_timeout.saturating_sub(wait_started.elapsed()));
-            match rx.recv_timeout(timeout) {
-                Ok(batch) => return Ok(Some(batch)),
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return Err(WaitTickBatchError::Disconnected);
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            match recv_tick_or_cancel(rx, cancel_rx, timeout)? {
+                Some(batch) => return Ok(Some(batch)),
+                None => continue,
             }
         }
 
         if plan.remaining.is_zero() {
             let timeout =
                 precision_window.min(starvation_timeout.saturating_sub(wait_started.elapsed()));
-            match rx.recv_timeout(timeout) {
-                Ok(batch) => return Ok(Some(batch)),
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return Err(WaitTickBatchError::Disconnected);
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            match recv_tick_or_cancel(rx, cancel_rx, timeout)? {
+                Some(batch) => return Ok(Some(batch)),
+                None => continue,
             }
         }
 
         let deadline = last_tick_started_at + plan.tick_interval;
         while Instant::now() < deadline && wait_started.elapsed() < starvation_timeout {
+            if cancel_rx.try_recv().is_ok() {
+                return Err(WaitTickBatchError::Cancelled);
+            }
             match rx.try_recv() {
                 Ok(batch) => return Ok(Some(batch)),
                 Err(TryRecvError::Disconnected) => return Err(WaitTickBatchError::Disconnected),
                 Err(TryRecvError::Empty) => thread::yield_now(),
             }
         }
+    }
+}
+
+fn recv_tick_or_cancel(
+    rx: &Receiver<TickBatchPayload>,
+    cancel_rx: &Receiver<()>,
+    timeout: Duration,
+) -> Result<Option<TickBatchPayload>, WaitTickBatchError> {
+    crossbeam_channel::select_biased! {
+        recv(cancel_rx) -> _ => Err(WaitTickBatchError::Cancelled),
+        recv(rx) -> result => result
+            .map(Some)
+            .map_err(|_| WaitTickBatchError::Disconnected),
+        default(timeout) => Ok(None),
     }
 }
 
@@ -1075,6 +1152,110 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn shutdown_joins_runner_waiting_for_game_start() {
+        let (master_seed_tx, master_seed_rx) = unbounded::<SimStartMetadata>();
+        let (tick_input_tx, _tick_input_rx) = unbounded::<TickBatchPayload>();
+        let (cancel_tx, cancel_rx) = unbounded::<()>();
+        let thread = std::thread::spawn(move || {
+            crossbeam_channel::select! {
+                recv(cancel_rx) -> result => assert!(result.is_ok()),
+                recv(master_seed_rx) -> result => assert!(result.is_err()),
+            }
+        });
+        let handle = SimRunnerHandle {
+            state: Arc::new(Mutex::new(SimWorldSnapshot::default())),
+            tick_input_tx,
+            diagnostics: Arc::new(Mutex::new(SimRunnerDiagnostics::default())),
+            master_seed_tx,
+            cancel_tx,
+            _thread: thread,
+        };
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn wait_tick_batch_cancellation_wins_over_backlog() {
+        let (tick_tx, tick_rx) = unbounded();
+        let (cancel_tx, cancel_rx) = unbounded();
+        tick_tx
+            .send(TickBatchPayload {
+                tick: 42,
+                inputs: Vec::new(),
+                lua_content_generation: 0,
+                lua_content_hash: String::new(),
+            })
+            .unwrap();
+        cancel_tx.send(()).unwrap();
+
+        let result = wait_tick_batch(
+            &tick_rx,
+            &cancel_rx,
+            Instant::now(),
+            LockstepTiming::DEFAULT,
+            Duration::from_millis(2),
+            Duration::from_secs(1),
+        );
+
+        assert!(matches!(result, Err(WaitTickBatchError::Cancelled)));
+    }
+
+    #[test]
+    fn replica_runner_keeps_tower_ability_phase_order_and_scaled_delta() {
+        let source = include_str!("sim_runner.rs");
+        let upgrades = source
+            .find(concat!(
+                "omoba_core::runtime::drain_pending_tower_",
+                "upgrades(&mut world)"
+            ))
+            .expect("tower upgrade drain");
+        let suffix = &source[upgrades..];
+        let casts = suffix
+            .find(concat!(
+                "omoba_core::runtime::drain_pending_tower_ability_",
+                "casts(&mut world)"
+            ))
+            .expect("tower ability cast drain");
+        let scheduler = suffix
+            .find(concat!(
+                "omoba_core::runtime::tick_tower_",
+                "abilities(&mut world, scaled_dt)"
+            ))
+            .expect("tower ability scheduler");
+        let callbacks = suffix
+            .find(concat!(
+                "omoba_core::runtime::drain_pending_tower_ability_",
+                "callbacks("
+            ))
+            .expect("tower ability callback drain");
+        let ordinary_ticks = suffix
+            .find(concat!("omoba_core::runtime::run_script_", "dispatch("))
+            .expect("ordinary unit script ticks");
+
+        assert!(casts < scheduler);
+        assert!(scheduler < callbacks);
+        assert!(callbacks < ordinary_ticks);
+        let phase = &suffix[..ordinary_ticks];
+        assert_eq!(phase.matches("drain_pending_").count(), 3);
+        assert_eq!(
+            phase
+                .matches(concat!("drain_pending_tower_ability_", "callbacks("))
+                .count(),
+            1
+        );
+        assert_eq!(phase.matches("tick_tower_abilities(").count(), 1);
+        assert!(!phase.contains(concat!("world.", "maintain()")));
+        assert!(!phase.contains(concat!("process_", "outcomes(")));
+        assert!(!phase.contains(concat!("dispatcher.", "dispatch(")));
+        let before_scheduler = &suffix[..scheduler];
+        assert!(before_scheduler.contains(concat!("let scaled_", "dt = world")));
+        assert!(before_scheduler.contains(concat!(
+            "read_resource::<omoba_core::comp::resources::",
+            "DeltaTime>()"
+        )));
+    }
+
+    #[test]
     fn smoke_links() {
         assert_eq!(smoke(), "omoba-core runtime linked");
     }
@@ -1118,6 +1299,7 @@ mod tests {
     #[test]
     fn wait_tick_batch_returns_ready_payload_without_pacing_sleep() {
         let (tx, rx) = unbounded();
+        let (_cancel_tx, cancel_rx) = unbounded();
         tx.send(TickBatchPayload {
             tick: 7,
             inputs: Vec::new(),
@@ -1128,6 +1310,7 @@ mod tests {
         let started = Instant::now();
         let batch = wait_tick_batch(
             &rx,
+            &cancel_rx,
             started,
             LockstepTiming::new(60).unwrap(),
             Duration::from_millis(2),

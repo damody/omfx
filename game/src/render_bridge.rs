@@ -66,6 +66,18 @@ impl RenderBridge {
         Self::default()
     }
 
+    pub fn reset(&mut self, scene: &mut Scene) {
+        for node in self.path_nodes.drain(..) {
+            scene.graph.remove_node(node);
+        }
+        for node in self.region_nodes.drain(..) {
+            scene.graph.remove_node(node);
+        }
+        self.last_applied_tick = None;
+        self.paths_drawn = false;
+        self.regions_drawn = false;
+    }
+
     /// 每個 tick 的 path 初始化與診斷 log。實體 sprite 與 HP bar 現在由
     /// `Game::update_sim_batches` 的批次 mesh 渲染。
     pub fn update(&mut self, snapshot: &SimWorldSnapshot, scene: &mut Scene) {
@@ -354,6 +366,25 @@ mod tests {
         let b = RenderBridge::new();
         assert_eq!(b.last_applied_tick, None);
         assert!(!b.paths_drawn);
+    }
+
+    #[test]
+    fn reset_restores_empty_session_state() {
+        let mut bridge = RenderBridge {
+            last_applied_tick: Some(42),
+            paths_drawn: true,
+            regions_drawn: true,
+            ..Default::default()
+        };
+        let mut scene = Scene::new();
+
+        bridge.reset(&mut scene);
+
+        assert_eq!(bridge.last_applied_tick, None);
+        assert!(!bridge.paths_drawn);
+        assert!(!bridge.regions_drawn);
+        assert!(bridge.path_nodes.is_empty());
+        assert!(bridge.region_nodes.is_empty());
     }
 
     #[test]

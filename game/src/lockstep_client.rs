@@ -20,6 +20,7 @@
 //!   尚未接上 UI 輸入；階段 3 將接鍵盤／滑鼠輸入。
 //!
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -32,6 +33,7 @@ use omoba_core::kcp::client::LockstepInbound;
 use omoba_core::kcp::game_proto::{PlayerInput, ServerEvent};
 use omoba_core::lockstep_timing::LOCKSTEP_TPS;
 use omoba_core::KcpClient;
+use tokio::sync::watch;
 
 fn wall_clock_us() -> u64 {
     SystemTime::now()
@@ -122,7 +124,7 @@ pub enum LockstepEvent {
 }
 
 /// 背景 lockstep client 的操作句柄。
-/// 丟棄時會關閉通道，下一輪迴圈使背景執行緒自然結束。
+/// Session 結束時必須呼叫 `shutdown`，取消所有非同步等待並 join 背景執行緒。
 #[derive(Debug)]
 pub struct LockstepClientHandle {
     pub events_rx: Receiver<LockstepEvent>,
@@ -131,8 +133,8 @@ pub struct LockstepClientHandle {
     pub input_tx: Sender<LockstepInputMsg>,
     input_id_counter: AtomicU32,
     latest_tick: Arc<AtomicU32>,
-    /// 保留 join handle，讓 Handle 被釋放時也能關閉背景執行緒；
-    /// 通道關閉後背景執行緒會跳出迴圈。
+    cancel_tx: watch::Sender<bool>,
+    /// 保留 join handle，讓 session shutdown 能等待背景執行緒結束。
     _thread: thread::JoinHandle<()>,
 }
 
@@ -144,6 +146,37 @@ impl LockstepClientHandle {
     pub fn latest_tick(&self) -> u32 {
         self.latest_tick.load(Ordering::Relaxed)
     }
+
+    pub fn shutdown(self) {
+        let Self {
+            input_tx,
+            cancel_tx,
+            _thread,
+            ..
+        } = self;
+        let _ = cancel_tx.send(true);
+        drop(input_tx);
+        if _thread.join().is_err() {
+            error!("lockstep-client worker panicked during shutdown");
+        }
+    }
+}
+
+async fn cancel_or<F>(cancel_rx: &mut watch::Receiver<bool>, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    if *cancel_rx.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        changed = cancel_rx.changed() => {
+            let _ = changed;
+            None
+        }
+        output = future => Some(output),
+    }
 }
 
 /// 啟動 lockstep 客戶端背景執行緒。
@@ -154,6 +187,7 @@ pub fn spawn_lockstep_client(
 ) -> LockstepClientHandle {
     let (events_tx, events_rx) = unbounded();
     let (input_tx, input_rx) = unbounded::<LockstepInputMsg>();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     let latest_tick = Arc::new(AtomicU32::new(0));
     let latest_tick_for_thread = latest_tick.clone();
 
@@ -181,6 +215,7 @@ pub fn spawn_lockstep_client(
                     events_tx,
                     input_rx,
                     latest_tick_for_thread,
+                    cancel_rx,
                 )
                 .await;
             });
@@ -192,6 +227,7 @@ pub fn spawn_lockstep_client(
         input_tx,
         input_id_counter: AtomicU32::new(1),
         latest_tick,
+        cancel_tx,
         _thread: handle,
     }
 }
@@ -203,9 +239,13 @@ async fn run_client(
     events_tx: Sender<LockstepEvent>,
     input_rx: Receiver<LockstepInputMsg>,
     latest_tick: Arc<AtomicU32>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) {
     let mut attempt = 0u32;
     loop {
+        if *cancel_rx.borrow() {
+            return;
+        }
         attempt += 1;
         if attempt > 1 {
             // 指數退避：1s, 2s, 4s, 8s 上限
@@ -214,7 +254,15 @@ async fn run_client(
                 "lockstep-client: reconnect attempt {} (waiting {}s)",
                 attempt, wait_secs
             );
-            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            if cancel_or(
+                &mut cancel_rx,
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)),
+            )
+            .await
+            .is_none()
+            {
+                return;
+            }
             // 清空上一個 session 殘留的輸入
             while input_rx.try_recv().is_ok() {}
         }
@@ -236,9 +284,15 @@ async fn run_client(
         // 用新的 KcpClient，舊的 NetworkBridge 會有自己的。`connect`
         // 會附帶送出 SubscribeRequest；階段 2 在行為上可接受，
         // 伺服器可容忍，且 lockstep tag 仍走同一 socket。
-        let mut client = match KcpClient::connect(&addr, player_name.clone()).await {
-            Ok(c) => c,
-            Err(e) => {
+        let mut client = match cancel_or(
+            &mut cancel_rx,
+            KcpClient::connect(&addr, player_name.clone()),
+        )
+        .await
+        {
+            None => return,
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
                 warn!("lockstep-client connect failed: {}", e);
                 send_or_return!(LockstepEvent::Disconnected {
                     reason: format!("connect: {}", e),
@@ -251,11 +305,18 @@ async fn run_client(
         // `master_seed`。階段 2 固定以 Player 身分加入（observer = false）。
         // 10 秒 timeout：若伺服器拒絕 JoinRequest（不回 GameStart），
         // 避免永遠卡住，讓外層重連邏輯可以繼續。
-        let join_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client.join_lockstep(player_name.clone(), player_id, false),
+        let join_result = match cancel_or(
+            &mut cancel_rx,
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.join_lockstep(player_name.clone(), player_id, false),
+            ),
         )
-        .await;
+        .await
+        {
+            Some(result) => result,
+            None => return,
+        };
         let master_seed = match join_result {
             Err(_timeout) => {
                 warn!("lockstep-client join_lockstep timed out after 10s (server may have rejected player_id={} as duplicate)", player_id);
@@ -317,8 +378,15 @@ async fn run_client(
         'inner: loop {
             wire_delta = 0;
             logical_delta = 0;
-            let recv_result =
-                tokio::time::timeout(std::time::Duration::from_millis(2), rx.recv()).await;
+            let recv_result = match cancel_or(
+                &mut cancel_rx,
+                tokio::time::timeout(std::time::Duration::from_millis(2), rx.recv()),
+            )
+            .await
+            {
+                Some(result) => result,
+                None => return,
+            };
             match recv_result {
                 Err(_elapsed) => {
                     let now = std::time::Instant::now();
@@ -455,10 +523,16 @@ async fn run_client(
             // lockstep 流量總數。
             while let Ok(msg) = input_rx.try_recv() {
                 let submit_start_us = wall_clock_us();
-                match client
-                    .submit_input(msg.target_tick, msg.input, msg.input_id)
-                    .await
+                let submit_result = match cancel_or(
+                    &mut cancel_rx,
+                    client.submit_input(msg.target_tick, msg.input, msg.input_id),
+                )
+                .await
                 {
+                    Some(result) => result,
+                    None => return,
+                };
+                match submit_result {
                     Ok((logical, wire)) => {
                         let submit_done_us = wall_clock_us();
                         wire_delta += wire as u64;
@@ -481,5 +555,30 @@ async fn run_client(
             }
         }
         // inner loop ended → outer loop retries the connection
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cancellation_interrupts_a_pending_handshake() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            cancel_tx.send(true).unwrap();
+        });
+
+        let started = Instant::now();
+        let result = runtime.block_on(cancel_or(&mut cancel_rx, std::future::pending::<()>()));
+
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
