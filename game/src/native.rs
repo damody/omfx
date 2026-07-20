@@ -62,6 +62,8 @@ use omoba_core::lockstep_timing::{LockstepTiming, LOCKSTEP_ONE_SECOND_TICKS_U32,
 
 pub use fyrox;
 
+#[path = "audio_settings.rs"]
+pub(crate) mod audio_settings;
 #[path = "backend_session.rs"]
 pub(crate) mod backend_session;
 
@@ -5056,7 +5058,7 @@ impl Plugin for Game {
 
         // 設定面板初始化
         self.settings_sfx_volume = 1.0;
-        self.settings_music_volume = 1.0;
+        self.settings_music_volume = audio_settings::AudioSettings::load_or_create().music_volume;
         self.settings_speed_value = 1.0;
         self.ui_settings.bg = BorderBuilder::new(
             WidgetBuilder::new()
@@ -11373,6 +11375,7 @@ impl Game {
         let Some(action) = action else {
             return true;
         };
+        let was_settings = self.pregame_runtime.state == pregame::PregameState::Settings;
         if let Some(selection) = self.pregame_runtime.dispatch(&action) {
             if let Err(err) = self.start_game_session(selection) {
                 log::error!("session start failed: {}", err);
@@ -11380,6 +11383,12 @@ impl Game {
                 self.pregame_runtime.recover_to_difficulty(err.clone());
                 self.connection_status = ConnectionStatus::Failed(err);
             }
+        }
+        if was_settings && self.pregame_runtime.state != pregame::PregameState::Settings {
+            audio_settings::AudioSettings {
+                music_volume: self.settings_music_volume,
+            }
+            .save();
         }
         true
     }

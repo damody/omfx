@@ -3944,6 +3944,7 @@ dependencies = [
  "serde_json",
  "specs",
  "tokio",
+ "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "uuid",
  "wasm-bindgen-futures",
