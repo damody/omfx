@@ -2339,6 +2339,260 @@ fn projectile_trail_quad(
     (mid, len, rotation)
 }
 
+/// 甜點子彈種類：「甜點戰爭」每座塔的子彈都有專屬糖果甜點特效。
+///
+/// 分類優先序：先看「子彈自身 unit_id」（本機 sim 目前子彈實體沒有 ScriptUnitTag，
+/// unit_id 為空字串；保留這條讓未來若替子彈打標籤能自動細分 tack/tack_blade 等升級變體），
+/// 對不到再退用「發射者（塔／英雄）unit_id」——每座塔對應一種甜點主題，天然涵蓋升級。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DessertBullet {
+    CandyBall,  // 糖球砲手 dart：亮彩小糖球
+    Toothpick,  // 刺蝟射手 tack：牙籤糖針（白／焦糖細長）
+    TackBlade,  // 刺蝟射手升級 tack_blade：旋轉銀色小刀片
+    Macaron,    // 馬卡龍砲車 bomb：粉彩馬卡龍 + 引信火花
+    BombFrag,   // 馬卡龍砲車碎片 bomb_frag：焦糖小碎餅
+    Snowflake,  // 冰晶泰迪 ice：淡藍雪花結晶 + 冰霜點
+    Icicle,     // 冰晶泰迪升級 icicle：尖長冰刺
+    Churro,     // 吉拿棒迫擊砲 arty：金黃吉拿棒砲彈（體積大、慢飛微旋轉）
+    Banana,     // 香蕉回力鏢 boomerang：旋轉香蕉彎月 + 淡殘影
+    Shuriken,   // 香蕉回力鏢升級 shuriken：旋轉銀灰星形
+    HeroPellet, // 英雄 saika_shot：白熱槍口鉛彈
+    Fallback,   // 未知：沿用原橘黃拖尾
+}
+
+/// 依子彈自身 unit_id（優先）與發射者 unit_id／kind（退路）判定甜點種類。
+/// 比對用 `contains`／`strip_prefix` 容忍前綴後綴差異；全對不到回 `Fallback`。
+fn classify_dessert_bullet(
+    proj_unit_id: &str,
+    owner_unit_id: Option<&str>,
+    owner_kind: Option<sim_runner::EntityKind>,
+) -> DessertBullet {
+    // 1) 子彈自身 unit_id（本機 sim 為空，但未來標籤化後這條會自動生效並細分升級變體）。
+    let pid = proj_unit_id.trim();
+    let pid = pid.strip_prefix("proj_").unwrap_or(pid); // 容忍 proj_ 前綴
+    match pid {
+        "dart" | "spike_opult" => return DessertBullet::CandyBall,
+        "tack" => return DessertBullet::Toothpick,
+        "tack_blade" => return DessertBullet::TackBlade,
+        "bomb" => return DessertBullet::Macaron,
+        "bomb_frag" => return DessertBullet::BombFrag,
+        "ice" => return DessertBullet::Snowflake,
+        "icicle" => return DessertBullet::Icicle,
+        "boomerang" => return DessertBullet::Banana,
+        "shuriken" => return DessertBullet::Shuriken,
+        "saika_shot" => return DessertBullet::HeroPellet,
+        _ => {}
+    }
+    // 2) 退用發射者（本機 sim 的實際可靠來源：tower_dart / tower_tack / ... / hero_saika_*）。
+    if let Some(owner) = owner_unit_id {
+        if owner.contains("saika") {
+            return DessertBullet::HeroPellet;
+        }
+        if owner.contains("dart") {
+            return DessertBullet::CandyBall;
+        }
+        if owner.contains("tack") {
+            return DessertBullet::Toothpick;
+        }
+        if owner.contains("bomb") {
+            return DessertBullet::Macaron;
+        }
+        if owner.contains("ice") {
+            return DessertBullet::Snowflake;
+        }
+        if owner.contains("arty") {
+            return DessertBullet::Churro;
+        }
+        if owner.contains("boomerang") {
+            return DessertBullet::Banana;
+        }
+    }
+    // 3) 英雄發射但名字沒對到 → 當英雄鉛彈；其餘 fallback。
+    if matches!(owner_kind, Some(sim_runner::EntityKind::Hero)) {
+        return DessertBullet::HeroPellet;
+    }
+    DessertBullet::Fallback
+}
+
+/// 一片要寫進 sprite batch 的甜點 quad（座標已在 render 空間，沿用 write_quad → camera）。
+#[derive(Debug, Clone, Copy)]
+struct DessertQuad {
+    center: Vector2<f32>,
+    size: Vector2<f32>,
+    color: [u8; 4],
+    rotation: f32,
+}
+
+/// 一顆甜點子彈的畫面：主體必畫，`accent` 選畫（需要額外 slot 的少數甜點）。
+#[derive(Debug, Clone, Copy)]
+struct DessertRender {
+    body: DessertQuad,
+    accent: Option<DessertQuad>,
+}
+
+/// 依甜點種類產生要畫的 quad。沿用既有拖尾幾何（spawn_pos→pos），
+/// 只調 color/size/rotation 或改成「以彈頭為中心隨時間旋轉」。純便宜運算，
+/// 無字串配置、無堆配置，適合 stress 場景每 tick 上千顆呼叫。
+fn dessert_bullet_render(
+    kind: DessertBullet,
+    eid: u32,
+    tick: u32,
+    spawn_pos: Vector2<f32>,
+    pos: Vector2<f32>,
+    trail_dir: Vector2<f32>,
+) -> DessertRender {
+    let (_mid, len, trail_rot) = projectile_trail_quad(spawn_pos, pos, trail_dir);
+    let dir = safe_projectile_trail_dir(trail_dir);
+    // 旋轉相位：tick 取模避免 f32 精度流失；每顆用 eid 錯開，避免同批同步旋轉。
+    let phase = (tick % 100_000) as f32;
+    let eid_offset = (eid as f32) * 0.6;
+
+    // 拖尾型主體：沿飛行方向、緊貼彈頭；len 依甜點上限裁切。
+    let make_trail = |color: [u8; 4], thickness: f32, len_cap: f32| -> DessertQuad {
+        let l = len.min(len_cap).max(0.05);
+        DessertQuad {
+            center: pos - dir * (l * 0.5),
+            size: Vector2::new(l, thickness),
+            color,
+            rotation: trail_rot,
+        }
+    };
+    // 旋轉型主體：以彈頭為中心、隨時間自轉（刀片／回力鏢／星形／吉拿棒）。
+    let make_spin = |color: [u8; 4], w: f32, h: f32, speed: f32| -> DessertQuad {
+        DessertQuad {
+            center: pos,
+            size: Vector2::new(w, h),
+            color,
+            rotation: phase * speed + eid_offset,
+        }
+    };
+
+    // 2026-07-10 放大加粗：子彈又小又快時各型別糊成一團，Doris 回報「看不出差別」。
+    // 全面放大尺寸、拉高色彩飽和與 alpha、誇張形狀輪廓（圓更圓、針更長、旋轉更大更明顯），
+    // 讓七種一眼可辨。核心手法：round 型 thickness≈len（讀成圓球）、needle 型細而長、
+    // spin 型大塊 + 明顯自轉；再給關鍵型別加亮色 accent 核心增加辨識度。
+    match kind {
+        DessertBullet::CandyBall => {
+            // 圓糖球：紅／粉／橘依 eid 輪替，大而圓、亮，尾端加白色高光核心。
+            let color = match eid % 3 {
+                0 => [255, 60, 80, 255],   // 紅糖
+                1 => [255, 130, 200, 255], // 粉糖
+                _ => [255, 165, 45, 255],  // 橘糖
+            };
+            DessertRender {
+                body: make_trail(color, 0.24, 0.26),
+                accent: Some(DessertQuad {
+                    center: pos,
+                    size: Vector2::new(0.1, 0.1),
+                    color: [255, 255, 245, 235],
+                    rotation: 0.0,
+                }),
+            }
+        }
+        DessertBullet::Toothpick => DessertRender {
+            // 細長牙籤糖針：奶白、又細又長的明顯長條、沿飛行方向。
+            body: make_trail([255, 245, 210, 255], 0.08, 0.78),
+            accent: None,
+        },
+        DessertBullet::TackBlade => DessertRender {
+            // 旋轉銀色刀片：大方形銀白、快速自轉。
+            body: make_spin([225, 230, 240, 255], 0.26, 0.26, 0.20),
+            accent: None,
+        },
+        DessertBullet::Macaron => DessertRender {
+            // 圓馬卡龍：飽和粉、又大又圓；尾端一顆明顯亮黃引信火花。
+            body: make_trail([255, 120, 180, 255], 0.34, 0.36),
+            accent: Some(DessertQuad {
+                center: pos - dir * 0.26,
+                size: Vector2::new(0.14, 0.14),
+                color: [255, 235, 90, 255],
+                rotation: 0.0,
+            }),
+        },
+        DessertBullet::BombFrag => DessertRender {
+            // 焦糖小碎餅：比糖球暗、方塊感。
+            body: make_trail([205, 130, 55, 250], 0.16, 0.18),
+            accent: None,
+        },
+        DessertBullet::Snowflake => {
+            // 冰晶：藍色「旋轉十字雪花」——兩片交叉 quad 組成結晶星、慢轉。刻意跟馬卡龍的
+            // 圓粉餅在形狀（十字 vs 圓）＋顏色（藍 vs 粉）＋是否旋轉三方面全部拉開。
+            let rot = phase * 0.10 + eid_offset;
+            DessertRender {
+                body: DessertQuad {
+                    center: pos,
+                    size: Vector2::new(0.34, 0.1),
+                    color: [120, 205, 255, 255],
+                    rotation: rot,
+                },
+                accent: Some(DessertQuad {
+                    // 交叉的另一片（+90°）＋更亮的冰白，組成十字冰晶。
+                    center: pos,
+                    size: Vector2::new(0.34, 0.1),
+                    color: [225, 245, 255, 255],
+                    rotation: rot + std::f32::consts::FRAC_PI_2,
+                }),
+            }
+        }
+        DessertBullet::Icicle => DessertRender {
+            // 尖長冰刺：藍白、極細極長、沿方向（跟雪花的圓形成強對比）。
+            body: make_trail([190, 235, 255, 255], 0.09, 0.9),
+            accent: None,
+        },
+        DessertBullet::Churro => DessertRender {
+            // 金黃吉拿棒砲彈：體積最大、粗長、慢飛明顯旋轉。
+            body: make_spin([245, 170, 45, 255], 0.4, 0.2, 0.07),
+            accent: None,
+        },
+        DessertBullet::Banana => DessertRender {
+            // 香蕉黃彎月：大、邊飛邊旋轉 + 淡殘影（相位略落後）。
+            body: make_spin([255, 220, 40, 255], 0.4, 0.15, 0.14),
+            accent: Some(DessertQuad {
+                center: pos - dir * 0.12,
+                size: Vector2::new(0.34, 0.12),
+                color: [255, 220, 40, 110],
+                rotation: phase * 0.14 + eid_offset - 0.6,
+            }),
+        },
+        DessertBullet::Shuriken => DessertRender {
+            // 旋轉銀灰星形：大方塊近似、極快自轉（比刀片更快、更冷灰）。
+            body: make_spin([170, 180, 195, 255], 0.24, 0.24, 0.30),
+            accent: None,
+        },
+        DessertBullet::HeroPellet => DessertRender {
+            // 白熱槍口鉛彈：亮白、短快、帶亮尾。
+            body: make_trail([255, 253, 235, 255], 0.13, 0.32),
+            accent: None,
+        },
+        DessertBullet::Fallback => DessertRender {
+            // 未知：沿用原本的暖色橘黃拖尾（tracer round）。
+            body: make_trail([255, 180, 60, 235], 0.1, 0.6),
+            accent: None,
+        },
+    }
+}
+
+/// 命中濺射外觀：依甜點種類回傳 (顏色, 半徑 render 單位, 形狀風格)。
+/// 半徑校準參考：Bomb 爆炸圈 = splash_radius(200) × WORLD_SCALE(0.01) = 2.0 render 單位（畫面明顯可見）。
+/// 先前設 0.3~0.5 比爆炸圈小 4~6 倍、在 ~28 單位高的畫面裡小到看不出形狀，故放大到 1.0~2.2。
+/// splash 系（馬卡龍/吉拿棒/冰晶）較大，單體系較小。形狀由 HitStyle 決定，讓各塔一眼可辨。
+fn dessert_hit_spec(kind: DessertBullet) -> ([u8; 4], f32, HitStyle) {
+    match kind {
+        DessertBullet::CandyBall => ([255, 150, 190, 255], 1.1, HitStyle::Sparkle), // 糖球=星芒
+        DessertBullet::Toothpick => ([250, 240, 210, 255], 1.0, HitStyle::Sparkle), // 糖針=星芒
+        DessertBullet::TackBlade => ([220, 225, 235, 255], 1.3, HitStyle::Slash),   // 刀片=斬擊
+        DessertBullet::Macaron => ([255, 110, 180, 255], 2.2, HitStyle::CreamSplat), // 馬卡龍=奶油圈
+        DessertBullet::BombFrag => ([205, 130, 55, 255], 1.4, HitStyle::Crumbs),    // 碎片=碎屑
+        DessertBullet::Snowflake => ([150, 220, 255, 255], 2.0, HitStyle::Frost),   // 冰晶=結晶爆刺
+        DessertBullet::Icicle => ([200, 240, 255, 255], 2.0, HitStyle::Frost),      // 冰刺=結晶爆刺
+        DessertBullet::Churro => ([245, 175, 50, 255], 2.2, HitStyle::Crumbs),      // 吉拿棒=金碎屑
+        DessertBullet::Banana => ([255, 220, 50, 255], 1.4, HitStyle::CreamSplat),  // 香蕉=黃奶油圈
+        DessertBullet::Shuriken => ([185, 195, 210, 255], 1.3, HitStyle::Slash),    // 手裡劍=斬擊
+        DessertBullet::HeroPellet => ([255, 250, 235, 255], 1.1, HitStyle::Sparkle), // 英雄=白星芒
+        DessertBullet::Fallback => ([255, 190, 90, 255], 1.1, HitStyle::Burst),     // fallback=環
+    }
+}
+
 fn build_tower_rect_node(
     scene: &mut Scene,
     material: Option<MaterialResource>,
@@ -2399,6 +2653,47 @@ struct ActiveExplosion {
     max_radius: f32,   // render 單位
     duration: f32,
     elapsed: f32,
+}
+
+/// Creep 死亡特效：敵方 creep 被打死時，在其位置爆散出「餅乾屑 + 糖果碎粒」，貼合糖果餅乾主題
+/// 與餅乾碎裂音效（`SfxKind::CookieCrunch`）。刻意跟橘色 Bomb 爆炸圈（`ActiveExplosion`）區隔。
+/// 視覺：一圈餅乾屑（棕/焦糖色短線）向外飛散、混幾顆糖果亮色碎粒（粉/薄荷/檸檬黃），約 0.45s 淡出。
+/// 每隻 creep 用 `seed`（= entity_id）擾動角度/速度/長度，讓每次爆散略有不同、不呆板。
+/// 與 `ActiveExplosion` 同樣走 `scene.drawing_context.add_line(...)` 批次線段（single draw call），
+/// 不 per-frame 增刪 scene graph node。座標慣例一致：`pos` 存未翻轉的 render 座標，畫線時 x 取負。
+#[derive(Debug)]
+struct ActiveDeathFx {
+    pos: Vector2<f32>, // render 座標（未翻轉，後端 × WORLD_SCALE）
+    max_radius: f32,   // render 單位（碎屑飛散的最大距離）
+    duration: f32,
+    elapsed: f32,
+    seed: u32, // 每隻 creep 的爆散擾動種子（= entity_id）
+}
+
+/// 子彈命中濺射：子彈打到目標（被移除）時，在命中點炸開該塔主題色的濺射（擴張環 + 放射線），
+/// 停留 ~0.25s。快速子彈本身看不清、一閃而過，但命中濺射停在命中點（怪身上，玩家正在看的地方）、
+/// 看得清也最有打擊感——這是塔防區分各塔的正解。同走 `drawing_context.add_line` 批次線段，
+/// `pos` 存未翻轉 render 座標（畫線時 x 取負）。
+/// 命中濺射的形狀風格——靠不同輪廓（不只顏色）讓各塔一眼可辨。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HitStyle {
+    Frost,      // 冰晶：尖銳結晶爆刺（很多細長冰刺，無環）
+    CreamSplat, // 馬卡龍：柔軟雙層奶油圈（圓潤疊圈 + 短鈍刺）
+    Crumbs,     // 吉拿棒/碎片：四散不規則塊狀碎屑
+    Sparkle,    // 糖球/英雄：閃亮十字星芒（小巧）
+    Slash,      // 手裡劍/刀片：鋒利 X 斬擊
+    Burst,      // fallback：環 + 均勻放射線
+}
+
+#[derive(Debug)]
+struct ActiveHitFx {
+    pos: Vector2<f32>,
+    color: [u8; 4],
+    max_radius: f32,
+    duration: f32,
+    elapsed: f32,
+    style: HitStyle,
+    seed: u32,
 }
 
 /// 客戶端射彈模擬。
@@ -3086,6 +3381,17 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     active_explosions: Vec<ActiveExplosion>,
+    /// 進行中的 creep 死亡特效（敵方 creep 被打死時 spawn）
+    #[visit(skip)]
+    #[reflect(hidden)]
+    active_death_fx: Vec<ActiveDeathFx>,
+    /// Creep 死亡特效用的每幀快取：entity_id → 最後 render 座標（未翻轉，= world_to_render(e)）。
+    /// `removed_entity_ids` 只給 id 不給位置，所以在 `update_sim_batches` 的 sprite 迴圈裡每幀快取
+    /// 每隻 creep 的位置；該 id 出現在 removed_entity_ids（死亡）時才拿得到座標 spawn 特效。
+    /// 刻意跟死亡音效放在同一個 sprite 迴圈/移除迴圈，讓特效與音效由結構保證一起觸發。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    creep_death_cache: std::collections::HashMap<u32, Vector2<f32>>,
     /// 階段 4.2：我們擁有「snapshot.explosions」的最高 sim 刻度
     /// 已排入「active_explosions」。渲染幀可以讀取
     /// 在SIM卡發布之前多次使用相同的快照
@@ -3227,6 +3533,21 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     projectile_trail_dir: HashMap<u32, Vector2<f32>>,
+
+    /// 子彈甜點分類：第一次看到 projectile 時依發射者（塔／英雄）鎖定，之後每 tick
+    /// 沿用，省去逐顆逐 tick 字串比對（stress 場景可能上千顆）。removed 時一起清除。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    projectile_dessert: HashMap<u32, DessertBullet>,
+    /// 每幀快取子彈的最後 render 座標（未翻轉，供命中濺射取用——子彈被移除時已不在 entities，
+    /// 只能靠上一幀快取的位置在命中點炸開濺射）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    projectile_last_pos: HashMap<u32, Vector2<f32>>,
+    /// 進行中的子彈命中濺射特效。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    active_hit_fx: Vec<ActiveHitFx>,
 
     /// 第一幀的掛鐘時間戳；所使用的
     /// `OMFX_AUTO_START_AFTER_SEC` / `OMFX_AUTO_EXIT_AFTER_SEC` 煙霧循環
@@ -6776,6 +7097,218 @@ impl Plugin for Game {
             }
         }
 
+        // Creep 死亡特效：餅乾屑 + 糖果碎粒爆散（貼合糖果餅乾主題與餅乾碎裂音效）。
+        // 一圈碎屑沿放射方向向外飛散、隨時間 ease-out 減速停住並淡出；每隻用 seed 擾動角度/速度/長度，
+        // 讓每次爆散略有不同。同樣用 SceneDrawingContext 批次線段（single draw call），x 取負與爆炸圈一致。
+        {
+            use fyrox::scene::debug::Line;
+            let dt_f = context.dt;
+            const CRUMBS: usize = 12;
+            let mut finished_idx: Vec<usize> = Vec::new();
+            for (i, fx) in self.active_death_fx.iter_mut().enumerate() {
+                fx.elapsed += dt_f;
+                if fx.elapsed >= fx.duration {
+                    finished_idx.push(i);
+                    continue;
+                }
+                let t = (fx.elapsed / fx.duration).clamp(0.0, 1.0);
+                // ease-out：碎屑一開始飛快、之後減速停住
+                let ease = 1.0 - (1.0 - t) * (1.0 - t);
+                let fade = ((230.0 * (1.0 - t)) as u8).max(35);
+                let z = Z_REGION - 0.0004;
+                let seed = fx.seed;
+                // 由 seed 產生穩定的 per-crumb 偽隨機 [0,1)（同一隻怪每幀一致，不會抖動）
+                let rnd = |n: u32| -> f32 {
+                    let mut h = seed
+                        .wrapping_mul(0x9E3779B9)
+                        .wrapping_add(n.wrapping_mul(0x85EBCA6B));
+                    h ^= h >> 16;
+                    h = h.wrapping_mul(0x7FEB352D);
+                    h ^= h >> 15;
+                    (h & 0xFFFF) as f32 / 65535.0
+                };
+                for k in 0..CRUMBS {
+                    let kk = k as u32;
+                    let base = (k as f32) * std::f32::consts::TAU / (CRUMBS as f32);
+                    let ang = base + (rnd(kk * 3) - 0.5) * 0.6;
+                    let speed = 0.55 + rnd(kk * 3 + 1) * 0.75;
+                    let dist = fx.max_radius * ease * speed;
+                    let (s, c) = ang.sin_cos();
+                    let cx = fx.pos.x + dist * c;
+                    let cy = fx.pos.y + dist * s;
+                    // 碎屑是一小段沿飛行方向的短棒，長度也隨 seed 變化
+                    let seg = 0.045 + rnd(kk * 3 + 2) * 0.07;
+                    let bx = cx - seg * c;
+                    let by = cy - seg * s;
+                    let ex_ = cx + seg * c;
+                    let ey = cy + seg * s;
+                    // 多數餅乾棕 / 焦糖屑，少數糖果亮色碎粒點綴
+                    let color = match k % 5 {
+                        0 => Color::from_rgba(255, 120, 185, fade), // 糖果粉
+                        1 => Color::from_rgba(110, 220, 190, fade), // 薄荷綠
+                        2 => Color::from_rgba(205, 150, 95, fade),  // 焦糖屑
+                        3 => Color::from_rgba(255, 210, 80, fade),  // 檸檬黃糖粒
+                        _ => Color::from_rgba(150, 95, 55, fade),   // 餅乾棕
+                    };
+                    scene.drawing_context.add_line(Line {
+                        begin: Vector3::new(-bx, by, z),
+                        end: Vector3::new(-ex_, ey, z),
+                        color,
+                    });
+                }
+            }
+            // 反向刪除以保持 index 有效
+            for i in finished_idx.into_iter().rev() {
+                self.active_death_fx.remove(i);
+            }
+        }
+
+        // 子彈命中濺射：命中點炸開該塔主題色的擴張環 + 放射線，~0.25s ease-out 淡出。
+        // 快速子彈本身看不清，這個停在命中點（怪身上）看得清楚、有打擊感。x 取負同爆炸圈慣例。
+        {
+            use fyrox::scene::debug::Line;
+            let dt_f = context.dt;
+            const RING: usize = 16;
+            let mut finished_idx: Vec<usize> = Vec::new();
+            for (i, fx) in self.active_hit_fx.iter_mut().enumerate() {
+                fx.elapsed += dt_f;
+                if fx.elapsed >= fx.duration {
+                    finished_idx.push(i);
+                    continue;
+                }
+                let t = (fx.elapsed / fx.duration).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - t) * (1.0 - t);
+                let cur_r = fx.max_radius * ease;
+                let a = (((fx.color[3] as f32) * (1.0 - t)) as u8).max(30);
+                let color = Color::from_rgba(fx.color[0], fx.color[1], fx.color[2], a);
+                let z = Z_REGION - 0.0005;
+                if cur_r > 0.02 {
+                    let px = fx.pos.x;
+                    let py = fx.pos.y;
+                    let off = (fx.seed as f32) * 0.3;
+                    let seed = fx.seed;
+                    // seed 偽隨機（crumbs 抖動用）
+                    let rnd = |n: u32| -> f32 {
+                        let mut h = seed
+                            .wrapping_mul(0x9E3779B9)
+                            .wrapping_add(n.wrapping_mul(0x85EBCA6B));
+                        h ^= h >> 16;
+                        h = h.wrapping_mul(0x7FEB352D);
+                        h ^= h >> 15;
+                        (h & 0xFFFF) as f32 / 65535.0
+                    };
+                    let tau = std::f32::consts::TAU;
+                    match fx.style {
+                        HitStyle::Frost => {
+                            // 尖銳結晶爆刺：12 條細長冰刺（無環），長短交錯像雪花碎裂。
+                            for k in 0..12u32 {
+                                let ang = off + (k as f32) * tau / 12.0;
+                                let (s, c) = ang.sin_cos();
+                                let outer = cur_r * if k % 2 == 0 { 1.35 } else { 0.75 };
+                                let inner = cur_r * 0.08;
+                                scene.drawing_context.add_line(Line {
+                                    begin: Vector3::new(-(px + inner * c), py + inner * s, z),
+                                    end: Vector3::new(-(px + outer * c), py + outer * s, z),
+                                    color,
+                                });
+                            }
+                        }
+                        HitStyle::CreamSplat => {
+                            // 柔軟雙層奶油圈：兩圈（cur_r、0.62cur_r）+ 6 條短鈍刺，圓潤。
+                            for rr in [cur_r, cur_r * 0.62] {
+                                let mut prev = Vector3::new(-(px + rr), py, z);
+                                for k in 1..=18u32 {
+                                    let th = (k as f32) * tau / 18.0;
+                                    let (s, c) = th.sin_cos();
+                                    let next = Vector3::new(-(px + rr * c), py + rr * s, z);
+                                    scene.drawing_context
+                                        .add_line(Line { begin: prev, end: next, color });
+                                    prev = next;
+                                }
+                            }
+                            for k in 0..6u32 {
+                                let ang = off + (k as f32) * tau / 6.0;
+                                let (s, c) = ang.sin_cos();
+                                let (i_r, o_r) = (cur_r * 0.9, cur_r * 1.12);
+                                scene.drawing_context.add_line(Line {
+                                    begin: Vector3::new(-(px + i_r * c), py + i_r * s, z),
+                                    end: Vector3::new(-(px + o_r * c), py + o_r * s, z),
+                                    color,
+                                });
+                            }
+                        }
+                        HitStyle::Crumbs => {
+                            // 四散不規則碎屑：10 塊短棒，角度＋距離＋長度都用 seed 抖動，無環。
+                            for k in 0..10u32 {
+                                let ang = off + (k as f32) * tau / 10.0 + (rnd(k * 2) - 0.5) * 0.7;
+                                let (s, c) = ang.sin_cos();
+                                let d = cur_r * (0.5 + rnd(k * 2 + 1) * 0.55);
+                                let seg = 0.05 + rnd(k * 2 + 7) * 0.06;
+                                let cx = px + d * c;
+                                let cy = py + d * s;
+                                scene.drawing_context.add_line(Line {
+                                    begin: Vector3::new(-(cx - seg * c), cy - seg * s, z),
+                                    end: Vector3::new(-(cx + seg * c), cy + seg * s, z),
+                                    color,
+                                });
+                            }
+                        }
+                        HitStyle::Sparkle => {
+                            // 閃亮十字星芒：4 長芒（十字）+ 4 短芒（斜），小巧明亮、由中心放射。
+                            for k in 0..8u32 {
+                                let ang = off + (k as f32) * std::f32::consts::FRAC_PI_4;
+                                let (s, c) = ang.sin_cos();
+                                let o_r = if k % 2 == 0 { cur_r * 1.3 } else { cur_r * 0.6 };
+                                scene.drawing_context.add_line(Line {
+                                    begin: Vector3::new(-px, py, z),
+                                    end: Vector3::new(-(px + o_r * c), py + o_r * s, z),
+                                    color,
+                                });
+                            }
+                        }
+                        HitStyle::Slash => {
+                            // 鋒利斬擊：3 條穿過中心的長線（星芒狀 X），銳利。
+                            let r = cur_r * 1.3;
+                            for k in 0..3u32 {
+                                let ang = off + (k as f32) * (std::f32::consts::PI / 3.0);
+                                let (s, c) = ang.sin_cos();
+                                scene.drawing_context.add_line(Line {
+                                    begin: Vector3::new(-(px - r * c), py - r * s, z),
+                                    end: Vector3::new(-(px + r * c), py + r * s, z),
+                                    color,
+                                });
+                            }
+                        }
+                        HitStyle::Burst => {
+                            // fallback：環 + 8 均勻放射線。
+                            let inner = cur_r * 0.25;
+                            for k in 0..8u32 {
+                                let ang = off + (k as f32) * tau / 8.0;
+                                let (s, c) = ang.sin_cos();
+                                scene.drawing_context.add_line(Line {
+                                    begin: Vector3::new(-(px + inner * c), py + inner * s, z),
+                                    end: Vector3::new(-(px + cur_r * c), py + cur_r * s, z),
+                                    color,
+                                });
+                            }
+                            let mut prev = Vector3::new(-(px + cur_r), py, z);
+                            for k in 1..=RING {
+                                let th = (k as f32) * tau / (RING as f32);
+                                let (s, c) = th.sin_cos();
+                                let next = Vector3::new(-(px + cur_r * c), py + cur_r * s, z);
+                                scene.drawing_context
+                                    .add_line(Line { begin: prev, end: next, color });
+                                prev = next;
+                            }
+                        }
+                    }
+                }
+            }
+            for i in finished_idx.into_iter().rev() {
+                self.active_hit_fx.remove(i);
+            }
+        }
+
         // TD 已選中塔的射程圈：每 frame 以塔位置為中心重畫；若塔已消失則自動清選
         // 用 SceneDrawingContext（drawing_context 已在 update() 開頭被 clear_lines()），
         // 不再 per-frame 增刪 48 個 RectangleBuilder node。
@@ -7053,6 +7586,8 @@ impl Plugin for Game {
         // 透過“sim_entity_labels”同步。
         if let Some(ref sim) = self.sim_runner_handle {
             if let Ok(snapshot) = sim.state.try_lock() {
+                // 註：Creep 死亡特效的 spawn 已移到 `update_sim_batches`（音效同一個移除迴圈），
+                // 因為這裡的 `try_lock()` 在鎖被 sim 執行緒佔用時會失敗、整段跳過，導致特效有時不觸發。
                 const SIM_NAME_LABEL_HIDE_THRESHOLD: usize = 200;
                 let labels_hidden =
                     snapshot.entities.len() > SIM_NAME_LABEL_HIDE_THRESHOLD && !self.alt_held;
@@ -13988,6 +14523,15 @@ impl Game {
             self.entity_kind_cache.insert(e.entity_id, e.kind);
 
             let pos = render_bridge::world_to_render(e);
+            // 每幀快取 creep 的 render 座標，供死亡特效在下方移除迴圈取用（死亡時該 eid 已不在
+            // entities 裡，只能靠上一幀的快取拿到最後位置）。與死亡音效共用同一條可靠路徑。
+            // 注意座標慣例：`world_to_render` 已對 x 做 -1 翻轉（回傳 -pos_x*scale），但死亡特效
+            // 的渲染路徑（同爆炸圈）會再翻一次 x，所以這裡存「未翻轉」座標 `-pos.x` 抵銷，
+            // 否則特效會畫到鏡像位置（畫面外）而看不到。爆炸圈 ActiveExplosion 也是存未翻轉座標。
+            if matches!(e.kind, sim_runner::EntityKind::Creep) {
+                self.creep_death_cache
+                    .insert(e.entity_id, Vector2::new(-pos.x, pos.y));
+            }
             let (color, size, z) = render_bridge::style_for_entity(e);
             let tower_template = if matches!(e.kind, sim_runner::EntityKind::Tower) {
                 self.td_templates.get(&e.unit_id).cloned()
@@ -14045,11 +14589,12 @@ impl Game {
                     hp_bg_slot: None,
                     hp_fg_slot: None,
                     turret_slot: None,
+                    proj_accent_slot: None,
                 }
             });
 
             if matches!(e.kind, sim_runner::EntityKind::Projectile) {
-                // 子彈：從發射點到當前位置畫一條暖色拖尾矩形（不是中央小方塊）。
+                // 子彈：從發射點到當前位置畫一條甜點拖尾／旋轉甜點（不是中央小方塊）。
                 // 第一次看到該 eid 時鎖定 spawn_pos 與方向，避免飛行中旋轉。
                 let spawn_pos = *self
                     .projectile_spawn_pos
@@ -14062,20 +14607,75 @@ impl Game {
                         .or_insert_with(|| {
                             initial_projectile_trail_dir(spawn_pos, pos, projectile_initial.1)
                         });
-                let (mid, len, rotation) = projectile_trail_quad(spawn_pos, pos, trail_dir);
-                // 暖色拖尾：偏黃橙，視覺像 tracer round。
-                let trail_color: [u8; 4] = [255, 180, 60, 230];
+
+                // 甜點分類：第一次看到子彈時依「發射者塔／英雄」鎖定，之後每 tick 沿用，
+                // 避免每顆子彈每 tick 重做字串比對（本機 sim 的子彈自身 unit_id 為空，
+                // 可靠來源是發射者：tower_dart / tower_tack / ... / hero_saika_*）。
+                let dessert = *self
+                    .projectile_dessert
+                    .entry(e.entity_id)
+                    .or_insert_with(|| {
+                        let owner = e.projectile_owner_entity_id.and_then(|oid| {
+                            snapshot.entities.iter().find(|o| o.entity_id == oid)
+                        });
+                        classify_dessert_bullet(
+                            &e.unit_id,
+                            owner.map(|o| o.unit_id.as_str()),
+                            owner.map(|o| o.kind),
+                        )
+                    });
+
+                let render = dessert_bullet_render(
+                    dessert,
+                    e.entity_id,
+                    snapshot.tick,
+                    spawn_pos,
+                    pos,
+                    trail_dir,
+                );
+
+                // 快取子彈最後位置（未翻轉，供命中時炸開濺射）。pos = world_to_render 已翻 x，
+                // 命中濺射走 drawing_context 會再翻一次，故存 -pos.x 抵銷（同死亡特效慣例）。
+                self.projectile_last_pos
+                    .insert(e.entity_id, Vector2::new(-pos.x, pos.y));
+
+                // 惰性配置 accent slot（僅馬卡龍引信／冰霜點／香蕉殘影需要），且只有在
+                // body_batch 尚有容量時才配置，避免 stress 場景撐爆 batch 觸發 debug_assert。
+                if render.accent.is_some()
+                    && slots.proj_accent_slot.is_none()
+                    && self.body_batch.as_ref().map(|b| b.can_alloc()).unwrap_or(false)
+                {
+                    if let Some(batch) = self.body_batch.as_mut() {
+                        slots.proj_accent_slot = Some(batch.alloc());
+                    }
+                }
+
                 if let Some(batch) = self.body_batch.as_mut() {
+                    let body = render.body;
                     batch.write_quad(
                         slots.body_slot,
                         &sprite_resources::QuadParams {
-                            center: mid,
-                            size: Vector2::new(len, 0.08),
-                            color: trail_color,
-                            rotation,
+                            center: body.center,
+                            size: body.size,
+                            color: body.color,
+                            rotation: body.rotation,
                             z: z - 0.01,
                         },
                     );
+                    if let (Some(acc_slot), Some(acc)) =
+                        (slots.proj_accent_slot, render.accent)
+                    {
+                        batch.write_quad(
+                            acc_slot,
+                            &sprite_resources::QuadParams {
+                                center: acc.center,
+                                size: acc.size,
+                                color: acc.color,
+                                rotation: acc.rotation,
+                                z: z - 0.011,
+                            },
+                        );
+                    }
                 }
             } else if let Some(batch) = self.body_batch.as_mut() {
                 if uses_composite_tower || hero_model_active {
@@ -14231,14 +14831,22 @@ impl Game {
         // 遺留的線路端「entity.death」事件。下面的掃描保持為
         // 對早於第一個 prev_alive 集的早期幀 eids 的防禦。
         for &eid in &snapshot.removed_entity_ids {
-            // 每個 Creep 死亡各播一聲餅乾碎裂
-            if self
-                .entity_kind_cache
-                .get(&eid)
+            // 每個 Creep 死亡：播一聲餅乾碎裂 + 在其最後位置爆出死亡特效（白環+紅放射線）。
+            // 音效與特效共用同一個判斷/迴圈，保證一起觸發、不會有時有無。
+            if self.entity_kind_cache.get(&eid)
                 .map(|k| matches!(k, sim_runner::EntityKind::Creep))
                 .unwrap_or(false)
             {
                 self.play_sfx(scene, SfxKind::CookieCrunch);
+                if let Some(pos) = self.creep_death_cache.remove(&eid) {
+                    self.active_death_fx.push(ActiveDeathFx {
+                        pos,
+                        max_radius: 0.5, // render 單位：碎屑飛散最大距離
+                        duration: 0.45,
+                        elapsed: 0.0,
+                        seed: eid,
+                    });
+                }
             }
             self.entity_kind_cache.remove(&eid);
             self.remove_tower_composite(scene, eid);
@@ -14246,6 +14854,10 @@ impl Game {
             if let Some(slots) = self.sim_entity_slots.remove(&eid) {
                 if let Some(batch) = self.body_batch.as_mut() {
                     batch.free(slots.body_slot);
+                    // 子彈 accent quad 與 body 同屬 body_batch，一起回收。
+                    if let Some(acc) = slots.proj_accent_slot {
+                        batch.free(acc);
+                    }
                 }
                 if let Some(batch) = self.hp_batch.as_mut() {
                     if let Some(bg) = slots.hp_bg_slot {
@@ -14262,8 +14874,28 @@ impl Game {
                 }
             }
             // 子彈消失時清拖尾起點 cache（HashMap 不會自己縮）
+            // 命中濺射：子彈被移除（命中/超時）→ 在最後位置炸開該塔主題濺射（上限 256 防 stress 爆量）
+            if self.active_hit_fx.len() < 256 {
+                if let (Some(hit_pos), Some(kind)) = (
+                    self.projectile_last_pos.get(&eid).copied(),
+                    self.projectile_dessert.get(&eid).copied(),
+                ) {
+                    let (color, radius, style) = dessert_hit_spec(kind);
+                    self.active_hit_fx.push(ActiveHitFx {
+                        pos: hit_pos,
+                        color,
+                        max_radius: radius,
+                        duration: 0.35,
+                        elapsed: 0.0,
+                        style,
+                        seed: eid,
+                    });
+                }
+            }
             self.projectile_spawn_pos.remove(&eid);
             self.projectile_trail_dir.remove(&eid);
+            self.projectile_dessert.remove(&eid);
+            self.projectile_last_pos.remove(&eid);
         }
         let to_remove: Vec<u32> = self
             .sim_entity_slots
@@ -14272,14 +14904,21 @@ impl Game {
             .copied()
             .collect();
         for id in to_remove {
-            // 備用路徑的餅乾碎裂音效
-            if self
-                .entity_kind_cache
-                .get(&id)
+            // 備用路徑（entity 從 alive 集消失但沒進 removed_entity_ids）：同樣播音效 + 死亡特效
+            if self.entity_kind_cache.get(&id)
                 .map(|k| matches!(k, sim_runner::EntityKind::Creep))
                 .unwrap_or(false)
             {
                 self.play_sfx(scene, SfxKind::CookieCrunch);
+                if let Some(pos) = self.creep_death_cache.remove(&id) {
+                    self.active_death_fx.push(ActiveDeathFx {
+                        pos,
+                        max_radius: 0.5,
+                        duration: 0.45,
+                        elapsed: 0.0,
+                        seed: id,
+                    });
+                }
             }
             self.entity_kind_cache.remove(&id);
             self.remove_tower_composite(scene, id);
@@ -14287,6 +14926,9 @@ impl Game {
             if let Some(slots) = self.sim_entity_slots.remove(&id) {
                 if let Some(batch) = self.body_batch.as_mut() {
                     batch.free(slots.body_slot);
+                    if let Some(acc) = slots.proj_accent_slot {
+                        batch.free(acc);
+                    }
                 }
                 if let Some(batch) = self.hp_batch.as_mut() {
                     if let Some(bg) = slots.hp_bg_slot {
@@ -14302,8 +14944,28 @@ impl Game {
                     }
                 }
             }
+            // 命中濺射（備用移除路徑）：同上，在最後位置炸開該塔主題濺射
+            if self.active_hit_fx.len() < 256 {
+                if let (Some(hit_pos), Some(kind)) = (
+                    self.projectile_last_pos.get(&id).copied(),
+                    self.projectile_dessert.get(&id).copied(),
+                ) {
+                    let (color, radius, style) = dessert_hit_spec(kind);
+                    self.active_hit_fx.push(ActiveHitFx {
+                        pos: hit_pos,
+                        color,
+                        max_radius: radius,
+                        duration: 0.35,
+                        elapsed: 0.0,
+                        style,
+                        seed: id,
+                    });
+                }
+            }
             self.projectile_spawn_pos.remove(&id);
             self.projectile_trail_dir.remove(&id);
+            self.projectile_dessert.remove(&id);
+            self.projectile_last_pos.remove(&id);
         }
     }
 
