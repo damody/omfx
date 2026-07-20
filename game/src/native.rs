@@ -1026,51 +1026,20 @@ struct AbilityBarKey {
     ability_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AbilityBarIcon {
-    Asset(String),
-    Fallback {
-        tower_unit_id: String,
-        initial: char,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AbilityBarTextureKind {
-    AbilityAsset,
-    TowerBase,
-    None,
-}
-
-fn ability_bar_texture_kind(icon: &AbilityBarIcon) -> AbilityBarTextureKind {
-    match icon {
-        AbilityBarIcon::Asset(_) => AbilityBarTextureKind::AbilityAsset,
-        AbilityBarIcon::Fallback { .. } => AbilityBarTextureKind::TowerBase,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct AbilityBarItem {
     key: AbilityBarKey,
     tower_label: String,
     ability_name: String,
     description: String,
-    icon: AbilityBarIcon,
-    fallback_icon: AbilityBarIcon,
     cooldown_total: f32,
+    duration_total: f32,
     cooldown_remaining: f32,
     cooldown_text: String,
     active_remaining: f32,
     activation_serial: u32,
     shortcut: Option<u8>,
     visual_state: AbilityBarVisualState,
-}
-
-fn resolved_ability_bar_icon(item: &AbilityBarItem, authored_asset_loaded: bool) -> AbilityBarIcon {
-    match &item.icon {
-        AbilityBarIcon::Asset(_) if !authored_asset_loaded => item.fallback_icon.clone(),
-        icon => icon.clone(),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1242,10 +1211,76 @@ struct AbilityBarTooltipModel {
     description: String,
 }
 
-fn ability_bar_tooltip_model(item: Option<&AbilityBarItem>) -> Option<AbilityBarTooltipModel> {
-    item.map(|item| AbilityBarTooltipModel {
-        title: item.ability_name.clone(),
-        description: item.description.clone(),
+fn non_negative_finite_seconds(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn ability_bar_button_text(name: &str) -> String {
+    let name = name.trim();
+    let name = if name.is_empty() {
+        "未命名技能"
+    } else {
+        name
+    };
+    let chars = name.chars().collect::<Vec<_>>();
+    if chars.len() <= 6 {
+        return name.to_string();
+    }
+
+    let split = chars.len().div_ceil(2);
+    format!(
+        "{}\n{}",
+        chars[..split].iter().collect::<String>(),
+        chars[split..].iter().collect::<String>()
+    )
+}
+
+fn ability_bar_tooltip_model(
+    item: Option<&AbilityBarItem>,
+    rejection: Option<&AbilityBarRejection>,
+) -> Option<AbilityBarTooltipModel> {
+    item.map(|item| {
+        let authored_description = item.description.trim();
+        let authored_description = if authored_description.is_empty() {
+            "沒有可用的技能描述。"
+        } else {
+            authored_description
+        };
+        let duration = if item.duration_total > 0.0 {
+            format!("{:.1} 秒", item.duration_total)
+        } else {
+            "瞬發".to_string()
+        };
+        let status = match &item.visual_state {
+            AbilityBarVisualState::Ready => "準備完成".to_string(),
+            AbilityBarVisualState::Cooling { .. } => {
+                format!("冷卻中，剩餘 {:.1} 秒", item.cooldown_remaining)
+            }
+            AbilityBarVisualState::Active { .. } => {
+                format!("施放中，剩餘 {:.1} 秒", item.active_remaining)
+            }
+        };
+        let mut lines = vec![
+            format!("塔：{}", item.tower_label),
+            authored_description.to_string(),
+            format!("冷卻：{:.1} 秒", item.cooldown_total),
+            format!("持續：{duration}"),
+            format!("狀態：{status}"),
+        ];
+        if let Some(shortcut) = item.shortcut {
+            lines.push(format!("快捷鍵：{shortcut}"));
+        }
+        if let Some(rejection) = rejection.filter(|rejection| rejection.key == item.key) {
+            lines.push(format!("上次施放失敗：{}", rejection.reason));
+        }
+        AbilityBarTooltipModel {
+            title: item.ability_name.clone(),
+            description: lines.join("\n"),
+        }
     })
 }
 
@@ -1359,12 +1394,13 @@ fn ability_bar_items_with_names(
             } else {
                 tower_name
             };
+            let elapsed_since_snapshot = non_negative_finite_seconds(elapsed_since_snapshot);
+            let cooldown_total = non_negative_finite_seconds(ability.cooldown_total);
+            let duration_total = non_negative_finite_seconds(ability.duration_total);
             let cooldown_remaining =
-                (ability.cooldown_remaining - elapsed_since_snapshot.max(0.0)).max(0.0);
-            let fallback_icon = AbilityBarIcon::Fallback {
-                tower_unit_id: entity.unit_id.clone(),
-                initial: ability.display_name.chars().next().unwrap_or('?'),
-            };
+                non_negative_finite_seconds(ability.cooldown_remaining - elapsed_since_snapshot);
+            let active_remaining =
+                non_negative_finite_seconds(ability.active_remaining - elapsed_since_snapshot);
             AbilityBarItem {
                 key: AbilityBarKey {
                     tower_entity_id: entity.entity_id,
@@ -1373,27 +1409,21 @@ fn ability_bar_items_with_names(
                 tower_label,
                 ability_name: ability.display_name.clone(),
                 description: ability.description.clone(),
-                icon: if ability.icon.trim().is_empty() {
-                    fallback_icon.clone()
-                } else {
-                    AbilityBarIcon::Asset(ability.icon.clone())
-                },
-                fallback_icon,
-                cooldown_total: ability.cooldown_total,
+                cooldown_total,
+                duration_total,
                 cooldown_remaining,
                 cooldown_text: if cooldown_remaining > 0.0 {
                     format!("{cooldown_remaining:.1}")
                 } else {
                     "READY".into()
                 },
-                active_remaining: (ability.active_remaining - elapsed_since_snapshot.max(0.0))
-                    .max(0.0),
+                active_remaining,
                 activation_serial: ability.activation_serial,
                 shortcut: None,
                 visual_state: ability_bar_visual_state(
-                    ability.cooldown_total,
+                    cooldown_total,
                     cooldown_remaining,
-                    (ability.active_remaining - elapsed_since_snapshot.max(0.0)).max(0.0),
+                    active_remaining,
                 ),
             }
         })
@@ -3612,9 +3642,6 @@ pub struct Game {
     ui_tower_ability_bar_slots: Vec<Handle<Text>>,
     #[visit(skip)]
     #[reflect(hidden)]
-    ui_tower_ability_bar_icons: Vec<Handle<UiNode>>,
-    #[visit(skip)]
-    #[reflect(hidden)]
     ui_tower_ability_bar_backgrounds: Vec<Handle<UiNode>>,
     #[visit(skip)]
     #[reflect(hidden)]
@@ -3628,9 +3655,6 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     tower_ability_bar_cached_text: Vec<String>,
-    #[visit(skip)]
-    #[reflect(hidden)]
-    tower_ability_bar_cached_icon: Vec<String>,
     #[visit(skip)]
     #[reflect(hidden)]
     tower_ability_bar_cached_visual: Vec<Option<AbilityBarRenderedState>>,
@@ -4017,14 +4041,6 @@ impl Plugin for Game {
             .with_corner_radius(6.0.into())
             .build(&mut ui.build_ctx())
             .transmute();
-            let icon: Handle<UiNode> = ImageBuilder::new(
-                WidgetBuilder::new()
-                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                    .with_width(48.0)
-                    .with_height(48.0),
-            )
-            .build(&mut ui.build_ctx())
-            .transmute();
             let cooldown_overlay = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -4051,12 +4067,12 @@ impl Plugin for Game {
                     .with_foreground(Brush::Solid(Color::from_rgba(245, 245, 245, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(15.0.into())
+            .with_font_size(22.0.into())
+            .with_wrap(WrapMode::Word)
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
             self.ui_tower_ability_bar_backgrounds.push(background);
-            self.ui_tower_ability_bar_icons.push(icon);
             self.ui_tower_ability_bar_cooldown_overlays
                 .push(cooldown_overlay);
             self.ui_tower_ability_bar_active_overlays
@@ -4064,7 +4080,6 @@ impl Plugin for Game {
             self.ui_tower_ability_bar_slots.push(slot);
             self.tower_ability_bar_rects.push(UiRect::default());
             self.tower_ability_bar_cached_text.push(String::new());
-            self.tower_ability_bar_cached_icon.push(String::new());
             self.tower_ability_bar_cached_visual.push(None);
             self.tower_ability_bar_slot_bindings.push(None);
         }
@@ -4089,8 +4104,8 @@ impl Plugin for Game {
         self.ui_tower_ability_tooltip_bg = BorderBuilder::new(
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                .with_width(340.0)
-                .with_height(118.0)
+                .with_width(360.0)
+                .with_height(196.0)
                 .with_background(Brush::Solid(Color::from_rgba(20, 25, 36, 245)).into())
                 .with_foreground(Brush::Solid(Color::from_rgba(100, 140, 210, 255)).into()),
         )
@@ -4101,7 +4116,7 @@ impl Plugin for Game {
         self.ui_tower_ability_tooltip_title = TextBuilder::new(
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                .with_width(316.0)
+                .with_width(336.0)
                 .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 80, 255)).into()),
         )
         .with_text(String::new())
@@ -4111,8 +4126,8 @@ impl Plugin for Game {
         self.ui_tower_ability_tooltip_description = TextBuilder::new(
             WidgetBuilder::new()
                 .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
-                .with_width(316.0)
-                .with_height(72.0)
+                .with_width(336.0)
+                .with_height(150.0)
                 .with_foreground(Brush::Solid(Color::from_rgba(235, 235, 240, 255)).into()),
         )
         .with_text(String::new())
@@ -11083,31 +11098,7 @@ impl Game {
                 });
             let logical_index = logical_item.map(|(logical_index, _)| logical_index);
             let item = logical_item.map(|(_, item)| item.clone());
-            let (rect, text, icon_key, texture_kind) = if let Some(item) = item.as_ref() {
-                let authored_asset_loaded = match &item.icon {
-                    AbilityBarIcon::Asset(path) => self.ability_icon_texture(path).is_some(),
-                    AbilityBarIcon::Fallback { .. } => false,
-                };
-                let resolved_icon = resolved_ability_bar_icon(item, authored_asset_loaded);
-                let icon = match &resolved_icon {
-                    AbilityBarIcon::Asset(_) => String::new(),
-                    AbilityBarIcon::Fallback {
-                        tower_unit_id,
-                        initial,
-                    } => format!("{tower_unit_id} {initial}\n"),
-                };
-                let rejection = self
-                    .tower_ability_bar_rejection
-                    .visible
-                    .as_ref()
-                    .filter(|rejection| rejection.key == item.key)
-                    .map(|rejection| format!("\n{}", rejection.reason))
-                    .unwrap_or_default();
-                let state_text = match &item.visual_state {
-                    AbilityBarVisualState::Ready => "READY".to_string(),
-                    AbilityBarVisualState::Cooling { text, .. }
-                    | AbilityBarVisualState::Active { text, .. } => text.clone(),
-                };
+            let (rect, text) = if let Some(item) = item.as_ref() {
                 (
                     UiRect {
                         x: start_x + logical_index.unwrap_or(0) as f32 * (slot_w + gap),
@@ -11115,23 +11106,7 @@ impl Game {
                         w: slot_w,
                         h: slot_h,
                     },
-                    format!(
-                        "[{}] {icon}{}\n{}\n{}{}",
-                        item.shortcut.unwrap_or(0),
-                        item.tower_label,
-                        item.ability_name,
-                        state_text,
-                        rejection
-                    ),
-                    match &resolved_icon {
-                        AbilityBarIcon::Asset(path) => path.clone(),
-                        AbilityBarIcon::Fallback { tower_unit_id, .. } => self
-                            .td_templates
-                            .get(tower_unit_id)
-                            .map(|template| template.base_image.clone())
-                            .unwrap_or_default(),
-                    },
-                    ability_bar_texture_kind(&resolved_icon),
+                    ability_bar_button_text(&item.ability_name),
                 )
             } else {
                 (
@@ -11142,8 +11117,6 @@ impl Game {
                         h: slot_h,
                     },
                     String::new(),
-                    String::new(),
-                    AbilityBarTextureKind::None,
                 )
             };
             if self.tower_ability_bar_rects.get(index).copied() != Some(rect) {
@@ -11159,35 +11132,10 @@ impl Game {
                     ui.send(node, WidgetMessage::DesiredPosition(rect.pos()));
                     ui.send(node, WidgetMessage::Width(rect.w));
                 }
-                if let Some(&icon_handle) = self.ui_tower_ability_bar_icons.get(index) {
-                    ui.send(
-                        icon_handle,
-                        WidgetMessage::DesiredPosition(Vector2::new(rect.x + 4.0, rect.y + 12.0)),
-                    );
-                    ui.send(icon_handle, WidgetMessage::Width(48.0));
-                    ui.send(icon_handle, WidgetMessage::Height(48.0));
-                }
             }
             if self.tower_ability_bar_cached_text.get(index) != Some(&text) {
                 ui.send(handle, TextMessage::Text(text.clone()));
                 self.tower_ability_bar_cached_text[index] = text;
-            }
-            if self.tower_ability_bar_cached_icon.get(index) != Some(&icon_key) {
-                let texture = match texture_kind {
-                    AbilityBarTextureKind::AbilityAsset if !icon_key.is_empty() => {
-                        self.ability_icon_texture(&icon_key)
-                    }
-                    AbilityBarTextureKind::TowerBase if !icon_key.is_empty() => {
-                        self.tower_texture_for_key(&icon_key)
-                    }
-                    AbilityBarTextureKind::AbilityAsset
-                    | AbilityBarTextureKind::TowerBase
-                    | AbilityBarTextureKind::None => None,
-                };
-                if let Some(&icon_handle) = self.ui_tower_ability_bar_icons.get(index) {
-                    ui.send(icon_handle, ImageMessage::Texture(texture));
-                }
-                self.tower_ability_bar_cached_icon[index] = icon_key;
             }
             let rendered_state = item.as_ref().map(|item| AbilityBarRenderedState {
                 key: item.key.clone(),
@@ -11325,12 +11273,13 @@ impl Game {
                     .iter()
                     .find(|item| &item.key == key)
             });
-        let tooltip = ability_bar_tooltip_model(hovered);
+        let tooltip =
+            ability_bar_tooltip_model(hovered, self.tower_ability_bar_rejection.visible.as_ref());
         if self.tower_ability_bar_cached_tooltip != tooltip {
             let pos = if tooltip.is_some() {
                 Vector2::new(
-                    (self.mouse_screen_pos.x + 16.0).min((self.window_size.x - 350.0).max(0.0)),
-                    (y - 128.0).max(0.0),
+                    (self.mouse_screen_pos.x + 16.0).min((self.window_size.x - 370.0).max(0.0)),
+                    (y - 206.0).max(0.0),
                 )
             } else {
                 hidden
@@ -11830,7 +11779,6 @@ impl Game {
         self.tower_ability_bar_slot_bindings.fill(None);
         self.tower_ability_bar_cached_visual.fill(None);
         self.tower_ability_bar_cached_text.fill(String::new());
-        self.tower_ability_bar_cached_icon.fill(String::new());
         self.clear_lua_metadata_caches();
         self.auto_clock_start = None;
         self.auto_start_sent = false;
@@ -17389,6 +17337,7 @@ mod input_latency_tests {
                 description: "description".into(),
                 icon: icon.into(),
                 cooldown_total: 10.0,
+                duration_total: 5.0,
                 cooldown_remaining,
                 active_remaining: 0.0,
                 activation_serial: 0,
@@ -17459,48 +17408,6 @@ mod input_latency_tests {
     }
 
     #[test]
-    fn ability_bar_uses_tower_and_initial_fallback_when_icon_missing() {
-        let entities = vec![ability_entity(1, 0, "tower_arty", "Fire", "", 0.0)];
-
-        let items = ability_bar_items(&entities, 7, 0, 0.0);
-
-        assert_eq!(
-            items[0].icon,
-            AbilityBarIcon::Fallback {
-                tower_unit_id: "tower_arty".into(),
-                initial: 'F',
-            }
-        );
-        assert_eq!(items[0].cooldown_text, "READY");
-    }
-
-    #[test]
-    fn ability_bar_uses_tower_and_initial_fallback_when_nonempty_icon_fails_to_load() {
-        let entities = vec![ability_entity(
-            1,
-            0,
-            "tower_arty",
-            "Fire",
-            "assets/ui/abilities/missing.png",
-            0.0,
-        )];
-        let items = ability_bar_items(&entities, 7, 0, 0.0);
-
-        let resolved = resolved_ability_bar_icon(&items[0], false);
-        assert_eq!(
-            resolved,
-            AbilityBarIcon::Fallback {
-                tower_unit_id: "tower_arty".into(),
-                initial: 'F',
-            }
-        );
-        assert_eq!(
-            ability_bar_texture_kind(&resolved),
-            AbilityBarTextureKind::TowerBase
-        );
-    }
-
-    #[test]
     fn ability_bar_suffixes_duplicate_tower_names() {
         let entities = vec![
             ability_entity(1, 0, "tower_arty", "Fire", "icon.png", 0.0),
@@ -17514,25 +17421,6 @@ mod input_latency_tests {
         assert_eq!(items[1].tower_label, "Artillery #2");
         assert_eq!(items[0].ability_name, "Fire");
         assert_eq!(items[1].ability_name, "Fire");
-    }
-
-    #[test]
-    fn ability_bar_authored_icon_still_shows_tower_identity() {
-        let entities = vec![ability_entity(
-            1,
-            0,
-            "tower_boomerang",
-            "Turbo Charge",
-            "turbo.png",
-            0.0,
-        )];
-        let tower_names = HashMap::from([("tower_boomerang".to_string(), "Boomerang".to_string())]);
-
-        let items = ability_bar_items_with_names(&entities, &tower_names, 7, 0, 0.0);
-
-        assert_eq!(items[0].tower_label, "Boomerang");
-        assert_eq!(items[0].ability_name, "Turbo Charge");
-        assert_eq!(items[0].icon, AbilityBarIcon::Asset("turbo.png".into()));
     }
 
     #[test]
@@ -17607,26 +17495,117 @@ mod input_latency_tests {
     }
 
     #[test]
-    fn ability_bar_tooltip_is_dedicated_and_uses_ability_copy() {
+    fn ability_bar_button_contains_only_the_ability_name() {
+        assert_eq!(ability_bar_button_text("甜點狂歡"), "甜點狂歡");
+    }
+
+    #[test]
+    fn ability_bar_button_wraps_a_long_name_into_two_complete_lines() {
+        let text = ability_bar_button_text("超級猴子粉絲俱樂部");
+
+        assert_eq!(text.lines().count(), 2);
+        assert_eq!(text.replace('\n', ""), "超級猴子粉絲俱樂部");
+    }
+
+    #[test]
+    fn ability_bar_ready_tooltip_contains_authored_details_and_shortcut() {
         let entities = vec![ability_entity(
             1,
             0,
-            "tower_boomerang",
-            "Turbo Charge",
-            "turbo.png",
+            "tower_cake_splash",
+            "甜點狂歡",
+            "party.png",
             0.0,
         )];
-        let tower_names = HashMap::from([("tower_boomerang".to_string(), "Boomerang".to_string())]);
+        let tower_names =
+            HashMap::from([("tower_cake_splash".to_string(), "蛋糕濺射塔".to_string())]);
         let item = ability_bar_items_with_names(&entities, &tower_names, 7, 0, 0.0).remove(0);
+        let tooltip = ability_bar_tooltip_model(Some(&item), None).unwrap();
 
-        assert_eq!(
-            ability_bar_tooltip_model(Some(&item)),
-            Some(AbilityBarTooltipModel {
-                title: "Turbo Charge".into(),
-                description: "description".into(),
-            })
-        );
-        assert_eq!(ability_bar_tooltip_model(None), None);
+        assert_eq!(tooltip.title, "甜點狂歡");
+        assert!(tooltip.description.contains("蛋糕濺射塔"));
+        assert!(tooltip.description.contains("description"));
+        assert!(tooltip.description.contains("冷卻：10.0 秒"));
+        assert!(tooltip.description.contains("持續：5.0 秒"));
+        assert!(tooltip.description.contains("狀態：準備完成"));
+        assert!(tooltip.description.contains("快捷鍵：1"));
+    }
+
+    #[test]
+    fn ability_bar_tooltip_reports_active_and_cooling_remaining_time() {
+        let mut active = ability_entity(1, 0, "tower_arty", "火力全開", "", 8.0);
+        active
+            .tower_active_ability
+            .as_mut()
+            .unwrap()
+            .active_remaining = 2.5;
+        let active_item = ability_bar_items(&[active], 7, 0, 0.0).remove(0);
+        let active_tooltip = ability_bar_tooltip_model(Some(&active_item), None).unwrap();
+        assert!(active_tooltip
+            .description
+            .contains("狀態：施放中，剩餘 2.5 秒"));
+
+        let cooling = ability_entity(2, 0, "tower_bomb", "飛艇刺客", "", 7.5);
+        let cooling_item = ability_bar_items(&[cooling], 7, 0, 0.0).remove(0);
+        let cooling_tooltip = ability_bar_tooltip_model(Some(&cooling_item), None).unwrap();
+        assert!(cooling_tooltip
+            .description
+            .contains("狀態：冷卻中，剩餘 7.5 秒"));
+    }
+
+    #[test]
+    fn ability_bar_tooltip_sanitizes_missing_copy_and_invalid_timing() {
+        let mut entity = ability_entity(1, 0, "tower_ice", "絕對零度", "", -4.0);
+        let ability = entity.tower_active_ability.as_mut().unwrap();
+        ability.description.clear();
+        ability.cooldown_total = f32::NAN;
+        ability.duration_total = f32::INFINITY;
+        ability.active_remaining = -2.0;
+
+        let item = ability_bar_items(&[entity], 7, 0, 0.0).remove(0);
+        let tooltip = ability_bar_tooltip_model(Some(&item), None).unwrap();
+
+        assert_eq!(item.cooldown_total, 0.0);
+        assert_eq!(item.duration_total, 0.0);
+        assert_eq!(item.cooldown_remaining, 0.0);
+        assert_eq!(item.active_remaining, 0.0);
+        assert!(tooltip.description.contains("沒有可用的技能描述。"));
+        assert!(tooltip.description.contains("冷卻：0.0 秒"));
+        assert!(tooltip.description.contains("持續：瞬發"));
+    }
+
+    #[test]
+    fn ability_bar_tooltip_includes_only_matching_rejection() {
+        let item = ability_bar_items(
+            &[ability_entity(1, 0, "tower_tack", "鐵釘風暴", "", 0.0)],
+            7,
+            0,
+            0.0,
+        )
+        .remove(0);
+        let matching = AbilityBarRejection {
+            key: item.key.clone(),
+            reason: "cooldown".into(),
+            shown_at: Instant::now(),
+        };
+        let other = AbilityBarRejection {
+            key: AbilityBarKey {
+                tower_entity_id: 99,
+                ability_id: "other".into(),
+            },
+            reason: "wrong rejection".into(),
+            shown_at: Instant::now(),
+        };
+
+        assert!(ability_bar_tooltip_model(Some(&item), Some(&matching))
+            .unwrap()
+            .description
+            .contains("上次施放失敗：cooldown"));
+        assert!(!ability_bar_tooltip_model(Some(&item), Some(&other))
+            .unwrap()
+            .description
+            .contains("wrong rejection"));
+        assert_eq!(ability_bar_tooltip_model(None, Some(&matching)), None);
     }
 
     #[test]
@@ -18321,6 +18300,7 @@ mod input_latency_tests {
                 hp_bg_slot: Some(4),
                 hp_fg_slot: Some(5),
                 turret_slot: Some(6),
+                proj_accent_slot: None,
             },
         );
         game.entity_kind_cache
