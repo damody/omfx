@@ -1775,6 +1775,40 @@ struct TdTowerShopCard {
     price_text: Handle<Text>,
 }
 
+/// 將軍知識面板 UI（全螢幕覆蓋面板）。
+#[derive(Default, Debug)]
+struct GkPanelUi {
+    built: bool,
+    visible_applied: bool,
+    backdrop: Handle<UiNode>,
+    bg: Handle<UiNode>,
+    title: Handle<Text>,
+    kp_text: Handle<Text>,
+    close_bg: Handle<UiNode>,
+    close_text: Handle<Text>,
+    close_rect: UiRect,
+    /// 每個知識節點的卡片：(背景, 標題文字, KP 文字, 解鎖按鈕背景, 解鎖按鈕文字)
+    node_cards: Vec<(Handle<UiNode>, Handle<Text>, Handle<Text>, Handle<UiNode>, Handle<Text>)>,
+    /// 每個解鎖按鈕的 hit-test rect（與 node_cards 對齊）。
+    unlock_rects: Vec<UiRect>,
+    /// 每個卡片對應的節點 id。
+    node_ids: Vec<String>,
+    /// 每個卡片的 KP 費用（與 node_ids 對齊）。
+    node_kp_costs: Vec<u32>,
+    /// 每��卡片的 category（與 node_ids 對齊）。
+    node_categories: Vec<String>,
+    /// 各 category 的 section header 背景（與 cat_names 對齊）。
+    cat_header_bgs: Vec<Handle<UiNode>>,
+    /// 各 category 的 section header 文字（與 cat_names 對齊）。
+    cat_header_texts: Vec<Handle<Text>>,
+    /// 各 category 名稱（依 JSON 出現順序，去重）。
+    cat_names: Vec<String>,
+    /// 右側商店面板中的進入按鈕（預建置，懶建置）。
+    entry_bg: Handle<UiNode>,
+    entry_text_h: Handle<Text>,
+    entry_rect: UiRect,
+}
+
 #[derive(Default, Debug)]
 struct TdRightShopPanel {
     bg: Handle<UiNode>,
@@ -3458,6 +3492,24 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     fps_display: String,
+
+    // ---- 將軍知識（General Knowledge）面板 ----
+    /// 面板是否可見（點擊 GK 按鈕切換）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_panel_visible: bool,
+    /// GK 面板 UI 狀態。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_panel_ui: GkPanelUi,
+    /// 快取：從 player_profile.json 讀取的 KP 和已解鎖節點（僅 UI 顯示用）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_available_kp: u32,
+    /// 已解鎖節點 id 集合（HashSet 供 O(1) 查詢）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_unlocked_nodes: std::collections::HashSet<String>,
 }
 
 /// 技能詳細資訊（後端一次性廣播，用於 tooltip）
@@ -4859,6 +4911,39 @@ impl Plugin for Game {
             .with_font_size(22.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .build(&mut ui.build_ctx());
+
+            // 將軍知識入口按鈕（右側面板頂部）
+            self.gk_panel_ui.entry_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_foreground(Brush::Solid(Color::from_rgba(200, 170, 80, 255)).into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 44.0),
+                            stops: vec![
+                                GradientPoint { stop: 0.0, color: Color::from_rgba(180, 140, 60, 255) },
+                                GradientPoint { stop: 1.0, color: Color::from_rgba(120, 90, 30, 255) },
+                            ],
+                        }
+                        .into(),
+                    ),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.0).into())
+            .with_corner_radius(10.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+
+            self.gk_panel_ui.entry_text_h = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 240, 180, 255)).into()),
+            )
+            .with_text("將軍知識".to_string())
+            .with_font_size(22.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
         }
 
         // Start Round 按鈕（右下角）
@@ -5442,6 +5527,9 @@ impl Plugin for Game {
         self.hotkeys = hotkeys::HotkeyConfig::load();
         self.hotkey_panel_visible = false;
         self.hotkey_rebinding = None;
+
+        // 將軍知識：從 omb/player_profile.json 載入 KP 快取
+        self.load_gk_profile();
 
         Ok(())
     }
@@ -7228,6 +7316,25 @@ impl Plugin for Game {
                 );
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel.w));
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel.h));
+
+                // 將軍知識入口按鈕（右側面板頂部，y~68）
+                {
+                    let gk_r = td_ui_ref_rect(
+                        self.window_size,
+                        right_panel_x_ref + 25.0,
+                        68.0,
+                        right_panel_w_ref - 50.0,
+                        48.0,
+                    );
+                    self.gk_panel_ui.entry_rect = gk_r;
+                    ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::DesiredPosition(gk_r.pos()));
+                    ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::Width(gk_r.w));
+                    ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::Height(gk_r.h));
+                    ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::DesiredPosition(gk_r.pos()));
+                    ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::Width(gk_r.w));
+                    ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::Height(gk_r.h));
+                }
+
                 let title = td_ui_ref_rect(
                     self.window_size,
                     right_panel_x_ref + 24.0,
@@ -9244,6 +9351,8 @@ impl Plugin for Game {
 
             // 熱鍵設定面板（F1 開關）
             self.update_hotkey_panel(ui);
+            // 將軍知識面板
+            self.update_gk_panel(ui);
 
             let end_str = if self.game_ended {
                 "VICTORY!".to_string()
@@ -9676,6 +9785,27 @@ impl Plugin for Game {
                     self.handle_hotkey_panel_click(screen);
                     hit_ui = true;
                     play_button_sfx = true;
+                }
+
+                // 將軍知識面板：modal 點擊攔截（開啟時吃掉所有點擊）
+                if !hit_ui && self.gk_panel_visible {
+                    self.handle_gk_panel_click(screen);
+                    hit_ui = true;
+                    play_button_sfx = true;
+                }
+
+                // 將軍知識入口按鈕（右側面板頂部）
+                if !hit_ui {
+                    let gr = self.gk_panel_ui.entry_rect;
+                    if gr.w > 0.0 && gr.contains(screen) {
+                        self.gk_panel_visible = !self.gk_panel_visible;
+                        // 開啟面板時重新讀取 profile，確保顯示最新 KP（包含本局結算）
+                        if self.gk_panel_visible {
+                            self.load_gk_profile();
+                        }
+                        hit_ui = true;
+                        play_button_sfx = true;
+                    }
                 }
 
                 // 1. Start Round / speed toggle button — Phase 5.x lockstep send
@@ -14959,6 +15089,558 @@ impl Game {
         ui.send(dd.ok_text, WidgetMessage::Width(dd.ok_rect.w));
         ui.send(dd.ok_text, WidgetMessage::Height(dd.ok_rect.h));
         dd.visible_applied = true;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 將軍知識（General Knowledge）面板
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 從 `omb/player_profile.json` 讀取 KP 與已解鎖節點到前端快取。
+    fn load_gk_profile(&mut self) {
+        let path = PathBuf::from("omb").join("player_profile.json");
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(v) => {
+                    self.gk_available_kp = v
+                        .get("total_kp")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as u32;
+                    let spent = v
+                        .get("spent_kp")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as u32;
+                    self.gk_available_kp = self.gk_available_kp.saturating_sub(spent);
+                    self.gk_unlocked_nodes.clear();
+                    if let Some(arr) = v.get("unlocked_nodes").and_then(|x| x.as_array()) {
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                self.gk_unlocked_nodes.insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[gk] player_profile.json parse error: {}", e);
+                }
+            },
+            Err(_) => {
+                // 首次啟動，profile 不存在是正常情況
+            }
+        }
+    }
+
+    /// 嘗試從前端直接執行解鎖邏輯（寫回 omb/player_profile.json）。
+    fn try_unlock_gk_node(&mut self, node_id: &str) {
+        // 讀取 knowledge_tree.json 取得費用與前置節點
+        let tree_path = PathBuf::from("scripts/lua_data/knowledge_tree.json");
+        let tree_json = match std::fs::read_to_string(&tree_path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("[gk] cannot read knowledge_tree.json: {}", e);
+                return;
+            }
+        };
+        let tree: serde_json::Value = match serde_json::from_str(&tree_json) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[gk] knowledge_tree.json parse error: {}", e);
+                return;
+            }
+        };
+        let nodes = match tree.as_array() {
+            Some(a) => a,
+            None => return,
+        };
+        // 找到目標節點
+        let node = match nodes.iter().find(|n| {
+            n.get("id").and_then(|v| v.as_str()) == Some(node_id)
+        }) {
+            Some(n) => n,
+            None => {
+                log::warn!("[gk] node '{}' not found in tree", node_id);
+                return;
+            }
+        };
+        let kp_cost = node.get("kp_cost").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        // 驗證前置節點
+        if let Some(requires) = node.get("requires").and_then(|v| v.as_array()) {
+            for req in requires {
+                if let Some(req_id) = req.as_str() {
+                    if !self.gk_unlocked_nodes.contains(req_id) {
+                        log::info!("[gk] unlock '{}' blocked: requires '{}' first", node_id, req_id);
+                        return;
+                    }
+                }
+            }
+        }
+        // 驗證 KP
+        if self.gk_available_kp < kp_cost {
+            log::info!("[gk] unlock '{}' blocked: need {} KP, have {}", node_id, kp_cost, self.gk_available_kp);
+            return;
+        }
+        // 讀取現有 profile JSON
+        let profile_path = PathBuf::from("omb").join("player_profile.json");
+        let mut profile: serde_json::Value = std::fs::read_to_string(&profile_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({
+                "total_kp": 0, "spent_kp": 0, "unlocked_nodes": []
+            }));
+        // 更新 spent_kp 和 unlocked_nodes
+        let spent = profile.get("spent_kp").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        profile["spent_kp"] = serde_json::json!(spent + kp_cost);
+        if let Some(arr) = profile.get_mut("unlocked_nodes").and_then(|v| v.as_array_mut()) {
+            arr.push(serde_json::json!(node_id));
+        }
+        // 寫回
+        match serde_json::to_string_pretty(&profile) {
+            Ok(json_str) => {
+                if let Err(e) = std::fs::write(&profile_path, json_str) {
+                    log::warn!("[gk] failed to save profile: {}", e);
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!("[gk] failed to serialize profile: {}", e);
+                return;
+            }
+        }
+        // 更新前端快取
+        self.gk_unlocked_nodes.insert(node_id.to_string());
+        self.gk_available_kp = self.gk_available_kp.saturating_sub(kp_cost);
+        log::info!("[gk] unlocked '{}', remaining KP={}", node_id, self.gk_available_kp);
+    }
+
+    /// GK 面板點擊處理（面板可見時 modal 攔截所有點擊）。
+    fn handle_gk_panel_click(&mut self, screen: Vector2<f32>) {
+        let close_rect = self.gk_panel_ui.close_rect;
+        if close_rect.w > 0.0 && close_rect.contains(screen) {
+            self.gk_panel_visible = false;
+            return;
+        }
+        // 解鎖按鈕 hit-test
+        let rects: Vec<UiRect> = self.gk_panel_ui.unlock_rects.clone();
+        let ids: Vec<String> = self.gk_panel_ui.node_ids.clone();
+        for (i, rect) in rects.iter().enumerate() {
+            if rect.w > 0.0 && rect.contains(screen) {
+                if let Some(node_id) = ids.get(i) {
+                    if !self.gk_unlocked_nodes.contains(node_id) {
+                        let id = node_id.clone();
+                        self.try_unlock_gk_node(&id);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// 將軍知識面板：lazy 建立節點、每 frame 更新位置與狀態文字。
+    fn update_gk_panel(&mut self, ui: &mut UserInterface) {
+        fn gk_cat_display_name(cat: &str) -> &'static str {
+            match cat {
+                "tower_dart"      => "飛鏢塔",
+                "tower_bomb"      => "炸彈塔",
+                "tower_ice"       => "冰晶塔",
+                "tower_tack"      => "圖釘塔",
+                "tower_boomerang" => "迴旋鏢塔",
+                "tower_arty"      => "砲兵塔",
+                "hero"            => "英雄",
+                "global"          => "全域",
+                _                 => "其他",
+            }
+        }
+        let panel = &mut self.gk_panel_ui;
+        if !self.gk_panel_visible {
+            if panel.built && panel.visible_applied {
+                let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+                ui.send(panel.backdrop, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.title, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.kp_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.close_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.close_text, WidgetMessage::DesiredPosition(hidden));
+                for (card_bg, name_t, kp_t, btn_bg, btn_t) in &panel.node_cards {
+                    for h in [*card_bg, *btn_bg] {
+                        ui.send(h, WidgetMessage::DesiredPosition(hidden));
+                    }
+                    for h in [*name_t, *kp_t, *btn_t] {
+                        ui.send(h, WidgetMessage::DesiredPosition(hidden));
+                    }
+                }
+                for h in &panel.cat_header_bgs {
+                    ui.send(*h, WidgetMessage::DesiredPosition(hidden));
+                }
+                for h in &panel.cat_header_texts {
+                    ui.send(*h, WidgetMessage::DesiredPosition(hidden));
+                }
+                panel.unlock_rects.iter_mut().for_each(|r| *r = UiRect::default());
+                panel.close_rect = UiRect::default();
+                panel.visible_applied = false;
+            }
+            return;
+        }
+
+        // 讀取 knowledge_tree.json（只在面板剛打開且未建置時讀取一次）
+        // 節點 id 列表由 built 路徑收集，後續 frame 直接用 node_ids 列表。
+        if !panel.built {
+            // 載入節點清單
+            let tree_path = PathBuf::from("scripts/lua_data/knowledge_tree.json");
+            let nodes: Vec<(String, String, u32, Vec<String>)> = // (id, category, kp_cost, requires)
+                std::fs::read_to_string(&tree_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|n| {
+                        let id = n.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                        let cat = n.get("category").and_then(|v| v.as_str()).unwrap_or("global").to_string();
+                        let cost = n.get("kp_cost").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let reqs: Vec<String> = n.get("requires")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|r| r.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        (id, cat, cost, reqs)
+                    })
+                    .collect();
+
+            let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+
+            // 全螢幕深藍 backdrop
+            panel.backdrop = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_background(Brush::Solid(Color::from_rgba(16, 28, 58, 245)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+
+            // 中央容器（亮藍灰）
+            panel.bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_background(Brush::Solid(Color::from_rgba(150, 172, 212, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(0.0).into())
+            .with_corner_radius(18.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+
+            // 標題（棕色橫幅文字）
+            panel.title = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 150, 255)).into()),
+            )
+            .with_text("將軍知識".to_string())
+            .with_font_size(44.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+
+            // KP 顯示
+            panel.kp_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 80, 255)).into()),
+            )
+            .with_text(format!("KP: {}", self.gk_available_kp))
+            .with_font_size(28.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Right)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+
+            // 關閉按鈕
+            panel.close_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 58.0),
+                            stops: vec![
+                                GradientPoint { stop: 0.0, color: Color::from_rgba(220, 80, 60, 255) },
+                                GradientPoint { stop: 1.0, color: Color::from_rgba(160, 40, 30, 255) },
+                            ],
+                        }
+                        .into(),
+                    ),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.0).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+
+            panel.close_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text("✕".to_string())
+            .with_font_size(36.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+
+            // 為每個節點建立卡片
+            panel.node_ids.clear();
+            panel.node_kp_costs.clear();
+            panel.node_categories.clear();
+            panel.node_cards.clear();
+            panel.unlock_rects.clear();
+            panel.cat_header_bgs.clear();
+            panel.cat_header_texts.clear();
+            panel.cat_names.clear();
+
+            for (id, cat, cost, _reqs) in &nodes {
+                let card_bg = BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_background(Brush::Solid(Color::from_rgba(100, 120, 170, 230)).into())
+                        .with_foreground(Brush::Solid(Color::from_rgba(180, 200, 240, 255)).into()),
+                )
+                .with_stroke_thickness(Thickness::uniform(2.0).into())
+                .with_corner_radius(10.0_f32.into())
+                .build(&mut ui.build_ctx())
+                .transmute();
+
+                let name_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(240, 240, 255, 255)).into()),
+                )
+                .with_text(id.clone())
+                .with_font_size(18.0.into())
+                .with_wrap(WrapMode::Word)
+                .build(&mut ui.build_ctx());
+
+                let kp_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 60, 255)).into()),
+                )
+                .with_text(String::new())
+                .with_font_size(16.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Right)
+                .build(&mut ui.build_ctx());
+
+                let btn_bg = BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
+                        .with_background(
+                            Brush::LinearGradient {
+                                from: Vector2::new(0.0, 0.0),
+                                to: Vector2::new(0.0, 32.0),
+                                stops: vec![
+                                    GradientPoint { stop: 0.0, color: Color::from_rgba(95, 200, 250, 255) },
+                                    GradientPoint { stop: 1.0, color: Color::from_rgba(35, 130, 215, 255) },
+                                ],
+                            }
+                            .into(),
+                        ),
+                )
+                .with_stroke_thickness(Thickness::uniform(2.0).into())
+                .with_corner_radius(8.0_f32.into())
+                .build(&mut ui.build_ctx())
+                .transmute();
+
+                let btn_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+                )
+                .with_text("解鎖".to_string())
+                .with_font_size(16.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+
+                panel.node_cards.push((card_bg, name_text, kp_text, btn_bg, btn_text));
+                panel.node_ids.push(id.clone());
+                panel.node_kp_costs.push(*cost);
+                panel.node_categories.push(cat.clone());
+                panel.unlock_rects.push(UiRect::default());
+            }
+
+            // Category section headers（依 JSON 出現順序，去重）
+            for (_, cat, _, _) in &nodes {
+                if !panel.cat_names.contains(cat) {
+                    panel.cat_names.push(cat.clone());
+                }
+            }
+            for cat_name in &panel.cat_names.clone() {
+                let total_kp: u32 = nodes.iter()
+                    .filter(|(_, c, _, _)| c == cat_name)
+                    .map(|(_, _, kp, _)| *kp)
+                    .sum();
+                let display = gk_cat_display_name(cat_name);
+                let hdr_bg = BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_background(Brush::Solid(Color::from_rgba(30, 50, 110, 220)).into())
+                        .with_foreground(Brush::Solid(Color::from_rgba(80, 110, 180, 255)).into()),
+                )
+                .with_stroke_thickness(Thickness::uniform(2.0).into())
+                .with_corner_radius(8.0_f32.into())
+                .build(&mut ui.build_ctx())
+                .transmute();
+                let hdr_txt = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 80, 255)).into()),
+                )
+                .with_text(format!("{}  ── 解鎖全部需 {} KP", display, total_kp))
+                .with_font_size(22.0.into())
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                panel.cat_header_bgs.push(hdr_bg);
+                panel.cat_header_texts.push(hdr_txt);
+            }
+
+            panel.built = true;
+        }
+
+        // ──── 每 frame 佈局 ────
+        let ws = self.window_size;
+        let rr = |x: f32, y: f32, w: f32, h: f32| td_ui_ref_rect(ws, x, y, w, h);
+        let send_rect = |ui: &mut UserInterface, h: Handle<UiNode>, r: UiRect| {
+            ui.send(h, WidgetMessage::DesiredPosition(r.pos()));
+            ui.send(h, WidgetMessage::Width(r.w));
+            ui.send(h, WidgetMessage::Height(r.h));
+        };
+        let send_rect_text = |ui: &mut UserInterface, h: Handle<Text>, r: UiRect| {
+            ui.send(h, WidgetMessage::DesiredPosition(r.pos()));
+            ui.send(h, WidgetMessage::Width(r.w));
+            ui.send(h, WidgetMessage::Height(r.h));
+        };
+
+        // 全螢幕 backdrop + 中央容器
+        send_rect(ui, panel.backdrop, rr(0.0, 0.0, TD_UI_REF_W, TD_UI_REF_H));
+        send_rect(ui, panel.bg, rr(30.0, 148.0, 1860.0, 900.0));
+
+        // 標題橫幅
+        send_rect_text(ui, panel.title, rr(710.0, 10.0, 500.0, 80.0));
+
+        // KP 顯示（右上角）
+        let kp_str = format!("可用 KP: {}", self.gk_available_kp);
+        ui.send(panel.kp_text, TextMessage::Text(kp_str));
+        send_rect_text(ui, panel.kp_text, rr(1400.0, 16.0, 440.0, 60.0));
+
+        // 關閉按鈕（左上角）
+        let close_r = rr(44.0, 16.0, 70.0, 60.0);
+        panel.close_rect = close_r;
+        send_rect(ui, panel.close_bg, close_r);
+        send_rect_text(ui, panel.close_text, close_r);
+
+        // ── 2 欄 Category 版面 ──
+        // 左欄（cat idx 0..4）/ 右欄（cat idx 4+），每欄 2 張卡片並排
+        const CAT_COL_LEFT_X: f32 = 50.0;
+        const CAT_COL_RIGHT_X: f32 = 980.0;
+        const CAT_COL_W: f32 = 900.0;
+        const CARDS_PER_ROW: usize = 2;
+        const CARD_W: f32 = 420.0;
+        const CARD_COL_PITCH: f32 = 450.0;
+        const CARD_H: f32 = 88.0;
+        const CARD_ROW_PITCH: f32 = 100.0;
+        const HEADER_H: f32 = 32.0;
+        const HEADER_TO_CARD: f32 = 6.0;
+        const CAT_GAP: f32 = 12.0;
+        const CAT_START_Y: f32 = 108.0;
+
+        // Snapshot：避免後續 borrow 衝突
+        let node_ids_snap: Vec<String> = panel.node_ids.clone();
+        let node_kp_snap: Vec<u32> = panel.node_kp_costs.clone();
+        let node_cat_snap: Vec<String> = panel.node_categories.clone();
+        let cat_names_snap: Vec<String> = panel.cat_names.clone();
+        drop(panel);
+
+        // 計算各 category 在各欄的 Y 起始位置並佈局 header
+        let mut left_y = CAT_START_Y;
+        let mut right_y = CAT_START_Y;
+        let mut cat_col_x: Vec<f32> = Vec::new();
+        let mut cat_start_y_vec: Vec<f32> = Vec::new();
+
+        for (cat_idx, cat_name) in cat_names_snap.iter().enumerate() {
+            let is_right = cat_idx >= 4;
+            let col_x = if is_right { CAT_COL_RIGHT_X } else { CAT_COL_LEFT_X };
+            let y = if is_right { right_y } else { left_y };
+            cat_col_x.push(col_x);
+            cat_start_y_vec.push(y);
+
+            let hdr_r = rr(col_x, y, CAT_COL_W, HEADER_H);
+            send_rect(ui, self.gk_panel_ui.cat_header_bgs[cat_idx], hdr_r);
+            send_rect_text(ui, self.gk_panel_ui.cat_header_texts[cat_idx], hdr_r);
+
+            let n_in_cat = node_cat_snap.iter().filter(|c| c.as_str() == cat_name.as_str()).count();
+            let n_rows = (n_in_cat + CARDS_PER_ROW - 1) / CARDS_PER_ROW;
+            let cat_h = HEADER_H + HEADER_TO_CARD + n_rows as f32 * CARD_ROW_PITCH + CAT_GAP;
+            if is_right { right_y += cat_h; } else { left_y += cat_h; }
+        }
+
+        // 佈局每張節點卡片
+        let mut cat_card_count: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for (i, node_id) in node_ids_snap.iter().enumerate() {
+            let cat = &node_cat_snap[i];
+            let cost = node_kp_snap[i];
+            let card_in_cat = *cat_card_count.get(cat.as_str()).unwrap_or(&0);
+            cat_card_count.insert(cat.clone(), card_in_cat + 1);
+
+            let cat_idx = cat_names_snap.iter().position(|c| c == cat).unwrap_or(0);
+            let col_x_base = cat_col_x[cat_idx];
+            let cat_y = cat_start_y_vec[cat_idx];
+
+            let col_in_cat = card_in_cat % CARDS_PER_ROW;
+            let row_in_cat = card_in_cat / CARDS_PER_ROW;
+            let x = col_x_base + col_in_cat as f32 * CARD_COL_PITCH;
+            let y = cat_y + HEADER_H + HEADER_TO_CARD + row_in_cat as f32 * CARD_ROW_PITCH;
+
+            let card_r = rr(x, y, CARD_W, CARD_H);
+            let is_unlocked = self.gk_unlocked_nodes.contains(node_id.as_str());
+
+            let (card_bg, name_t, kp_t, btn_bg, btn_t) = self.gk_panel_ui.node_cards[i];
+            send_rect(ui, card_bg, card_r);
+            ui.send(
+                card_bg,
+                WidgetMessage::Background(
+                    if is_unlocked {
+                        Brush::Solid(Color::from_rgba(40, 110, 55, 220)).into()
+                    } else {
+                        Brush::Solid(Color::from_rgba(100, 120, 170, 230)).into()
+                    },
+                ),
+            );
+
+            // 節點名稱（左半部）
+            let name_r = rr(x + 8.0, y + 4.0, CARD_W * 0.55, CARD_H - 8.0);
+            send_rect_text(ui, name_t, name_r);
+            ui.send(name_t, TextMessage::Text(node_id.clone()));
+
+            // KP 費用標籤（右上）
+            let kp_info_r = rr(x + CARD_W * 0.57, y + 4.0, CARD_W * 0.4, 34.0);
+            send_rect_text(ui, kp_t, kp_info_r);
+
+            // 解鎖按鈕（右下）
+            let btn_r = rr(x + CARD_W * 0.57, y + CARD_H - 38.0, CARD_W * 0.4, 32.0);
+            if is_unlocked {
+                ui.send(btn_bg, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                ui.send(btn_t, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
+                ui.send(kp_t, TextMessage::Text("✓ 已解鎖".to_string()));
+                self.gk_panel_ui.unlock_rects[i] = UiRect::default();
+            } else {
+                send_rect(ui, btn_bg, btn_r);
+                send_rect_text(ui, btn_t, btn_r);
+                self.gk_panel_ui.unlock_rects[i] = btn_r;
+                ui.send(kp_t, TextMessage::Text(format!("需 {} KP", cost)));
+                ui.send(btn_t, TextMessage::Text(format!("解鎖 {}KP", cost)));
+            }
+        }
+
+        self.gk_panel_ui.visible_applied = true;
     }
 
     /// 熱鍵設定面板點擊處理（in-game 與 pregame 設定頁共用）。
