@@ -1696,7 +1696,25 @@ enum TowerPlacementBlockReason {
     MissingPlacementMetadata,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TowerRoadPlacementProbe {
+    path_index: usize,
+    segment_index: usize,
+    distance_backend: f32,
+    required_clearance_backend: f32,
+}
+
 impl TowerPlacementBlockReason {
+    fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::InsufficientGold { .. } => "insufficient_gold",
+            Self::TooCloseToRoad => "too_close_to_road",
+            Self::BlockedRegion => "blocked_region",
+            Self::TowerOverlap => "tower_overlap",
+            Self::MissingPlacementMetadata => "missing_placement_metadata",
+        }
+    }
+
     fn localized_text(&self) -> String {
         match self {
             Self::InsufficientGold { required, available } => {
@@ -6606,7 +6624,10 @@ impl Plugin for Game {
                             .map(|r| {
                                 r.points
                                     .iter()
-                                    .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
+                                    // Placement checks run in logical frontend world coordinates.
+                                    // Scene rendering mirrors X separately, while mouse picking has
+                                    // already flipped render X back to logical X.
+                                    .map(|(x, y)| Vector2::new(x * WORLD_SCALE, y * WORLD_SCALE))
                                     .collect()
                             })
                             .collect();
@@ -6622,7 +6643,9 @@ impl Plugin for Game {
                             .iter()
                             .map(|p| {
                                 p.iter()
-                                    .map(|(x, y)| Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE))
+                                    // Keep path collision data in the same logical coordinate space
+                                    // as mouse_world_pos and outbound backend positions.
+                                    .map(|(x, y)| Vector2::new(x * WORLD_SCALE, y * WORLD_SCALE))
                                     .collect()
                             })
                             .collect();
@@ -10608,10 +10631,50 @@ impl Plugin for Game {
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
-                        let block_reason = self
-                            .td_templates
-                            .get(&kind)
+                        let template = self.td_templates.get(&kind);
+                        let block_reason = template
                             .and_then(|tpl| self.tower_placement_block_reason(tpl, world_pos));
+                        if let Some(tpl) = template {
+                            let backend_x = world_pos.x / WORLD_SCALE;
+                            let backend_y = world_pos.y / WORLD_SCALE;
+                            let result = block_reason
+                                .as_ref()
+                                .map(TowerPlacementBlockReason::diagnostic_code)
+                                .unwrap_or("accepted");
+                            if let Some(probe) = self.nearest_tower_road_probe(tpl, world_pos) {
+                                log::info!(
+                                    "TowerPlace probe kind='{}' pos_render=({:.3},{:.3}) pos_backend=({:.1},{:.1}) path_index={} segment_index={} distance_backend={:.2} road_half_width_backend={:.2} footprint_backend={:.2} placement_radius_backend={:.2} required_clearance_backend={:.2} world_scale={:.4} result={}",
+                                    kind,
+                                    world_pos.x,
+                                    world_pos.y,
+                                    backend_x,
+                                    backend_y,
+                                    probe.path_index + 1,
+                                    probe.segment_index + 1,
+                                    probe.distance_backend,
+                                    TD_PATH_HALF_WIDTH_BACKEND,
+                                    tpl.footprint_backend,
+                                    tpl.placement_radius_backend,
+                                    probe.required_clearance_backend,
+                                    WORLD_SCALE,
+                                    result,
+                                );
+                            } else {
+                                log::info!(
+                                    "TowerPlace probe kind='{}' pos_render=({:.3},{:.3}) pos_backend=({:.1},{:.1}) path=none road_half_width_backend={:.2} footprint_backend={:.2} placement_radius_backend={:.2} world_scale={:.4} result={}",
+                                    kind,
+                                    world_pos.x,
+                                    world_pos.y,
+                                    backend_x,
+                                    backend_y,
+                                    TD_PATH_HALF_WIDTH_BACKEND,
+                                    tpl.footprint_backend,
+                                    tpl.placement_radius_backend,
+                                    WORLD_SCALE,
+                                    result,
+                                );
+                            }
+                        }
                         let has_template = self.td_templates.contains_key(&kind);
                         if has_template && block_reason.is_none() {
                             // 階段 2.1：TowerPlace 鎖步輸入。選定的塔類型
@@ -11528,6 +11591,37 @@ impl Game {
         }
 
         None
+    }
+
+    fn nearest_tower_road_probe(
+        &self,
+        tpl: &TdTemplate,
+        pos: Vector2<f32>,
+    ) -> Option<TowerRoadPlacementProbe> {
+        let required_clearance_backend =
+            tpl.placement_radius_backend + TD_PATH_HALF_WIDTH_BACKEND;
+        let mut nearest: Option<TowerRoadPlacementProbe> = None;
+        for (path_index, path) in self.td_paths_render.iter().enumerate() {
+            for segment_index in 0..path.len().saturating_sub(1) {
+                let distance_backend =
+                    point_segment_dist_sq(pos, path[segment_index], path[segment_index + 1])
+                        .sqrt()
+                        / WORLD_SCALE;
+                let candidate = TowerRoadPlacementProbe {
+                    path_index,
+                    segment_index,
+                    distance_backend,
+                    required_clearance_backend,
+                };
+                if nearest
+                    .map(|current| distance_backend < current.distance_backend)
+                    .unwrap_or(true)
+                {
+                    nearest = Some(candidate);
+                }
+            }
+        }
+        nearest
     }
 
     fn can_place_tower_at(&self, tpl: &TdTemplate, pos: Vector2<f32>) -> bool {
@@ -17869,29 +17963,29 @@ mod input_latency_tests {
         assert_eq!(template.base_image, "assets/towers/new_base.png");
     }
 
-    fn backend_to_render(x: f32, y: f32) -> Vector2<f32> {
-        Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE)
+    fn backend_to_frontend_world(x: f32, y: f32) -> Vector2<f32> {
+        Vector2::new(x * WORLD_SCALE, y * WORLD_SCALE)
     }
 
     fn twin_gate_render_paths() -> Vec<Vec<Vector2<f32>>> {
         vec![
             vec![
-                backend_to_render(-1400.0, 700.0),
-                backend_to_render(-350.0, 520.0),
-                backend_to_render(850.0, -200.0),
-                backend_to_render(1400.0, 100.0),
+                backend_to_frontend_world(-1400.0, 700.0),
+                backend_to_frontend_world(-350.0, 520.0),
+                backend_to_frontend_world(850.0, -200.0),
+                backend_to_frontend_world(1400.0, 100.0),
             ],
             vec![
-                backend_to_render(-1400.0, 100.0),
-                backend_to_render(-500.0, 100.0),
-                backend_to_render(850.0, -200.0),
-                backend_to_render(1400.0, 100.0),
+                backend_to_frontend_world(-1400.0, 100.0),
+                backend_to_frontend_world(-500.0, 100.0),
+                backend_to_frontend_world(850.0, -200.0),
+                backend_to_frontend_world(1400.0, 100.0),
             ],
             vec![
-                backend_to_render(-1400.0, -650.0),
-                backend_to_render(-500.0, -650.0),
-                backend_to_render(850.0, -200.0),
-                backend_to_render(1400.0, 100.0),
+                backend_to_frontend_world(-1400.0, -650.0),
+                backend_to_frontend_world(-500.0, -650.0),
+                backend_to_frontend_world(850.0, -200.0),
+                backend_to_frontend_world(1400.0, 100.0),
             ],
         ]
     }
@@ -17905,9 +17999,33 @@ mod input_latency_tests {
         game.td_paths_render = twin_gate_render_paths();
 
         let reason = game
-            .tower_placement_block_reason(&template, backend_to_render(-420.0, -250.0));
+            .tower_placement_block_reason(
+                &template,
+                backend_to_frontend_world(-420.0, -250.0),
+            );
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn twin_gate_frontend_matches_backend_for_reported_blocked_point() {
+        let template =
+            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let mut game = Game::default();
+        game.hero_state.gold = 1_000;
+        game.td_paths_render = twin_gate_render_paths();
+        let point = backend_to_frontend_world(270.7, -366.7);
+
+        let probe = game
+            .nearest_tower_road_probe(&template, point)
+            .expect("nearest Twin Gate road");
+        assert_eq!(probe.path_index, 2);
+        assert_eq!(probe.segment_index, 1);
+        assert!((probe.distance_backend - 25.07).abs() < 0.1);
+        assert_eq!(
+            game.tower_placement_block_reason(&template, point),
+            Some(TowerPlacementBlockReason::TooCloseToRoad)
+        );
     }
 
     #[test]
@@ -17920,18 +18038,93 @@ mod input_latency_tests {
         assert_eq!(
             game.tower_placement_block_reason(
                 &template,
-                backend_to_render(-1400.0, 100.0),
+                backend_to_frontend_world(-1400.0, 100.0),
             ),
             Some(TowerPlacementBlockReason::TooCloseToRoad)
         );
 
         game.hero_state.gold = 50;
         assert_eq!(
-            game.tower_placement_block_reason(&template, backend_to_render(-420.0, -250.0)),
+            game.tower_placement_block_reason(
+                &template,
+                backend_to_frontend_world(-420.0, -250.0),
+            ),
             Some(TowerPlacementBlockReason::InsufficientGold {
                 required: 200,
                 available: 50,
             })
+        );
+    }
+
+    #[test]
+    fn tower_road_clearance_uses_visual_placement_radius() {
+        let template =
+            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let mut game = Game::default();
+        game.hero_state.gold = 1_000;
+        game.td_paths_render = vec![vec![
+            backend_to_frontend_world(-500.0, 0.0),
+            backend_to_frontend_world(500.0, 0.0),
+        ]];
+
+        let probe = game
+            .nearest_tower_road_probe(
+                &template,
+                backend_to_frontend_world(
+                    0.0,
+                    TD_PATH_HALF_WIDTH_BACKEND + template.placement_radius_backend + 1.0,
+                ),
+            )
+            .expect("road probe");
+        assert!((probe.distance_backend - 155.0).abs() < 0.01);
+        assert!((probe.required_clearance_backend - 154.0).abs() < 0.01);
+
+        assert_eq!(
+            game.tower_placement_block_reason(
+                &template,
+                backend_to_frontend_world(
+                    0.0,
+                    TD_PATH_HALF_WIDTH_BACKEND + template.placement_radius_backend - 1.0,
+                ),
+            ),
+            Some(TowerPlacementBlockReason::TooCloseToRoad)
+        );
+        assert_eq!(
+            game.tower_placement_block_reason(
+                &template,
+                backend_to_frontend_world(
+                    0.0,
+                    TD_PATH_HALF_WIDTH_BACKEND + template.placement_radius_backend + 1.0,
+                ),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tower_overlap_still_uses_placement_radius() {
+        let snapshot = sample_tower_template(200, 350.0, "base.png");
+        let template = td_template_from_snapshot(&snapshot);
+        let mut game = Game::default();
+        game.hero_state.gold = 1_000;
+        game.td_templates
+            .insert(snapshot.unit_id.clone(), template.clone());
+        game.network_entities.insert(
+            1,
+            NetworkEntity {
+                entity_type: "tower".to_string(),
+                tower_kind: Some(snapshot.unit_id),
+                position: backend_to_frontend_world(0.0, 0.0),
+                ..NetworkEntity::default()
+            },
+        );
+
+        assert_eq!(
+            game.tower_placement_block_reason(
+                &template,
+                backend_to_frontend_world(template.placement_radius_backend * 1.5, 0.0),
+            ),
+            Some(TowerPlacementBlockReason::TowerOverlap)
         );
     }
 
