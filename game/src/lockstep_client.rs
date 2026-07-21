@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use omoba_core::kcp::client::LockstepInbound;
 use omoba_core::kcp::game_proto::{PlayerInput, ServerEvent};
@@ -434,7 +434,7 @@ async fn run_client(
                     last_stall_log = now;
                     last_tickbatch_time = now;
                     if now.duration_since(last_hb_log).as_secs() >= 5 {
-                        info!(
+                        debug!(
                             "[lockstep-client] healthy: {} TickBatch frames in last 5s (latest tick={})",
                             tick_batches_since_log, b.tick,
                         );

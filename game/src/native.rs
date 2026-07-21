@@ -2912,7 +2912,7 @@ impl FrameProfile {
         let pure_render_avg = self.pure_render_ms_total / w;
         let capped_render_avg = self.capped_render_ms_total / w;
         let cap_or_present_wait_avg = (capped_render_avg - pure_render_avg).max(0.0);
-        log::info!(
+        log::debug!(
             "omfx_frame window={} avg(ms) lockstep={:.2} snapshot={:.2} render_bridge={:.2} interp={:.2} visual={:.2} proj={:.2} cam={:.2} ui={:.2} total={:.2} (max_fps={}, events_per_frame={:.0}, creeps={:.0}, projectiles={:.0})",
             Self::WINDOW,
             self.lockstep_ns as f64 / w / 1_000_000.0,
@@ -2929,7 +2929,7 @@ impl FrameProfile {
             self.creeps_seen as f64 / w,
             self.projectiles_seen as f64 / w,
         );
-        log::info!(
+        log::debug!(
             "omfx_frame_slo window={} target_fps={} avg_fps={:.2} one_pct_low_fps={:.2} frame_ms p50={:.2} p95={:.2} p99={:.2} max={:.2} plugin_avg={:.2} pure_avg={:.2} capped_avg={:.2} cap_or_present_wait_avg={:.2} sim_tps={:.2} latest_sim_tick={} sim_queue_avg={:.2} sim_queue_max={} sim_waits={} sim_blocking_receives={} sim_backlog_receives={}",
             Self::WINDOW,
             self.render_target_tps.max(1),
@@ -2959,7 +2959,7 @@ impl FrameProfile {
             self.sim_blocking_receives,
             self.sim_backlog_receives,
         );
-        log::info!(
+        log::debug!(
             "omfx_render window={} target_fps={} target_ms={:.2} avg(ms) pure={:.2} capped={:.2} fps={} paced_frames={} stale_snapshot_frames={} draw_calls={:.0} triangles={:.0}",
             Self::WINDOW,
             self.render_target_tps.max(1),
