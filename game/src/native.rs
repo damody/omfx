@@ -1687,6 +1687,29 @@ struct TdTemplate {
     attack_backswing: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TowerPlacementBlockReason {
+    InsufficientGold { required: i32, available: i32 },
+    TooCloseToRoad,
+    BlockedRegion,
+    TowerOverlap,
+    MissingPlacementMetadata,
+}
+
+impl TowerPlacementBlockReason {
+    fn localized_text(&self) -> String {
+        match self {
+            Self::InsufficientGold { required, available } => {
+                format!("金幣不足（需要 {required}，目前 {available}）")
+            }
+            Self::TooCloseToRoad => "離道路太近".into(),
+            Self::BlockedRegion => "此區域禁止建塔".into(),
+            Self::TowerOverlap => "會與既有塔重疊".into(),
+            Self::MissingPlacementMetadata => "塔的放置資料不完整".into(),
+        }
+    }
+}
+
 fn td_template_from_snapshot(t: &sim_runner::TowerTemplateSnapshot) -> TdTemplate {
     TdTemplate {
         label: t.label.clone(),
@@ -7808,7 +7831,7 @@ impl Plugin for Game {
             "draws: {} | tris: {}",
             self.frame_profile.last_draw_calls, self.frame_profile.last_triangles,
         );
-        let status_str = if self.fps_display.is_empty() {
+        let mut status_str = if self.fps_display.is_empty() {
             format!("{} | {}", render_stats_part, connection_part)
         } else {
             format!(
@@ -7816,6 +7839,17 @@ impl Plugin for Game {
                 self.fps_display, render_stats_part, connection_part
             )
         };
+        if let Some(reason) = self
+            .selected_tower_kind
+            .as_ref()
+            .and_then(|kind| self.td_templates.get(kind))
+            .and_then(|template| {
+                self.tower_placement_block_reason(template, self.mouse_world_pos)
+            })
+        {
+            status_str.push_str(" | 建塔：");
+            status_str.push_str(&reason.localized_text());
+        }
         ui.send(self.ui_status_text, TextMessage::Text(status_str));
 
         // LoL MVP HUD: 本地 CD 平滑遞減 + 組 HUD 文字
@@ -10574,12 +10608,12 @@ impl Plugin for Game {
                 if !hit_ui {
                     if let Some(kind) = self.selected_tower_kind.clone() {
                         let world_pos = self.mouse_world_pos;
-                        let can_place = self
+                        let block_reason = self
                             .td_templates
                             .get(&kind)
-                            .map(|tpl| self.can_place_tower_at(tpl, world_pos))
-                            .unwrap_or(false);
-                        if can_place {
+                            .and_then(|tpl| self.tower_placement_block_reason(tpl, world_pos));
+                        let has_template = self.td_templates.contains_key(&kind);
+                        if has_template && block_reason.is_none() {
                             // 階段 2.1：TowerPlace 鎖步輸入。選定的塔類型
                             // 是unit_id字串（例如“tower_dart”）－轉換為
                             // 原型 u32 kind_id 通過 omoba_template_ids::tower_by_name。
@@ -10619,8 +10653,11 @@ impl Plugin for Game {
                             }
                         } else {
                             log::info!(
-                                "Tower place skipped by local placement validation: kind='{}'",
-                                kind
+                                "Tower place skipped by local placement validation: kind='{}' reason='{}'",
+                                kind,
+                                block_reason
+                                    .map(|reason| reason.localized_text())
+                                    .unwrap_or_else(|| "找不到塔資料".into())
                             );
                         }
                         hit_ui = true;
@@ -11441,9 +11478,16 @@ impl Game {
         self.td_shop_scroll_offset = offset.clamp(0.0, self.td_shop_max_scroll.max(0.0));
     }
 
-    fn can_place_tower_at(&self, tpl: &TdTemplate, pos: Vector2<f32>) -> bool {
+    fn tower_placement_block_reason(
+        &self,
+        tpl: &TdTemplate,
+        pos: Vector2<f32>,
+    ) -> Option<TowerPlacementBlockReason> {
         if self.hero_state.gold < tpl.cost {
-            return false;
+            return Some(TowerPlacementBlockReason::InsufficientGold {
+                required: tpl.cost,
+                available: self.hero_state.gold,
+            });
         }
 
         let placement_radius_render = tower_placement_radius_render(tpl);
@@ -11454,14 +11498,14 @@ impl Game {
         for path in &self.td_paths_render {
             for i in 0..path.len().saturating_sub(1) {
                 if point_segment_dist_sq(pos, path[i], path[i + 1]) < clear_sq {
-                    return false;
+                    return Some(TowerPlacementBlockReason::TooCloseToRoad);
                 }
             }
         }
 
         for poly in &self.td_regions_render {
             if circle_hits_polygon(pos, placement_radius_render, poly) {
-                return false;
+                return Some(TowerPlacementBlockReason::BlockedRegion);
             }
         }
 
@@ -11475,15 +11519,19 @@ impl Game {
                 .and_then(|kind| self.td_templates.get(kind))
                 .map(tower_placement_radius_render)
             else {
-                return false;
+                return Some(TowerPlacementBlockReason::MissingPlacementMetadata);
             };
             let min_d = existing_radius + placement_radius_render;
             if (ent.position - pos).norm_squared() < min_d * min_d {
-                return false;
+                return Some(TowerPlacementBlockReason::TowerOverlap);
             }
         }
 
-        true
+        None
+    }
+
+    fn can_place_tower_at(&self, tpl: &TdTemplate, pos: Vector2<f32>) -> bool {
+        self.tower_placement_block_reason(tpl, pos).is_none()
     }
 
     fn selected_tower_screen_x(&self) -> Option<f32> {
@@ -17819,6 +17867,72 @@ mod input_latency_tests {
         assert_eq!(template.cost, 275);
         assert_eq!(template.range_backend, 420.0);
         assert_eq!(template.base_image, "assets/towers/new_base.png");
+    }
+
+    fn backend_to_render(x: f32, y: f32) -> Vector2<f32> {
+        Vector2::new(-x * WORLD_SCALE, y * WORLD_SCALE)
+    }
+
+    fn twin_gate_render_paths() -> Vec<Vec<Vector2<f32>>> {
+        vec![
+            vec![
+                backend_to_render(-1400.0, 700.0),
+                backend_to_render(-350.0, 520.0),
+                backend_to_render(850.0, -200.0),
+                backend_to_render(1400.0, 100.0),
+            ],
+            vec![
+                backend_to_render(-1400.0, 100.0),
+                backend_to_render(-500.0, 100.0),
+                backend_to_render(850.0, -200.0),
+                backend_to_render(1400.0, 100.0),
+            ],
+            vec![
+                backend_to_render(-1400.0, -650.0),
+                backend_to_render(-500.0, -650.0),
+                backend_to_render(850.0, -200.0),
+                backend_to_render(1400.0, 100.0),
+            ],
+        ]
+    }
+
+    #[test]
+    fn twin_gate_reported_green_gap_accepts_tower_placement() {
+        let template =
+            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let mut game = Game::default();
+        game.hero_state.gold = 1_000;
+        game.td_paths_render = twin_gate_render_paths();
+
+        let reason = game
+            .tower_placement_block_reason(&template, backend_to_render(-420.0, -250.0));
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn tower_placement_reports_road_and_gold_rejections() {
+        let template =
+            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let mut game = Game::default();
+        game.hero_state.gold = 1_000;
+        game.td_paths_render = twin_gate_render_paths();
+        assert_eq!(
+            game.tower_placement_block_reason(
+                &template,
+                backend_to_render(-1400.0, 100.0),
+            ),
+            Some(TowerPlacementBlockReason::TooCloseToRoad)
+        );
+
+        game.hero_state.gold = 50;
+        assert_eq!(
+            game.tower_placement_block_reason(&template, backend_to_render(-420.0, -250.0)),
+            Some(TowerPlacementBlockReason::InsufficientGold {
+                required: 200,
+                available: 50,
+            })
+        );
     }
 
     #[test]
