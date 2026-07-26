@@ -919,6 +919,107 @@ struct SettingsPlaceholderBtn {
     sublabel: Handle<Text>,
 }
 
+// ── 個人統計數據頁（Profile）placeholder 資料 ────────────────────────────
+// Phase 1：僅前端版面骨架，數字全為假資料。之後接上真實統計時，
+// 只需替換這些常數／改為從別處讀取即可，UI 版面程式碼不用動。
+const PROFILE_PLAYER_NAME: &str = "User";
+const PROFILE_LEVEL: u32 = 0;
+const PROFILE_XP_PCT: f32 = 0.0;
+const PROFILE_FOLLOWERS: u32 = 128;
+const PROFILE_SHARE_COUNT: (u32, u32) = (3, 7);
+
+/// (label, count)
+const PROFILE_MEDALS: [(&str, u32); 8] = [
+    ("新手上路", 1),
+    ("常勝軍", 5),
+    ("完美防守", 3),
+    ("速通王", 2),
+    ("塔防大師", 1),
+    ("收藏家", 12),
+    ("連勝紀錄", 7),
+    ("探索者", 4),
+];
+
+/// (label, usage_count)
+/// 名稱＝遊戲真實單位（英雄取自 templates/heroes.lua，塔取自 templates/towers.lua）；
+/// usage_count 仍為佔位假資料——遊戲尚未追蹤使用次數（第二階段戰績系統才會有真值）。
+/// 遊戲目前只有 2 位英雄，故此處只放 2 位。
+const PROFILE_TOP_HEROES: [(&str, u32); 2] = [("雜賀孫市", 42), ("伊達政宗", 35)];
+const PROFILE_TOP_MONKEYS: [(&str, u32); 3] =
+    [("糖球砲手", 58), ("刺蝟射手", 33), ("馬卡龍砲車", 19)];
+
+/// (label, value)
+const PROFILE_STAT_ROWS: [(&str, &str); 8] = [
+    ("玩過的遊戲", "272"),
+    ("獲勝的遊戲", "93"),
+    ("最高回合(全部時間)", "180"),
+    ("最高回合(當前版本)", "89"),
+    ("最高回合 CHIMPS", "100"),
+    ("最高回合放氣", "0"),
+    ("使用過的塔數", "1,204"),
+    ("擊殺的怪物數", "58,340"),
+];
+
+#[derive(Debug, Default)]
+struct ProfileMedalUi {
+    bg: Handle<UiNode>,
+    count_text: Handle<Text>,
+}
+
+#[derive(Debug, Default)]
+struct ProfilePortraitUi {
+    bg: Handle<UiNode>,
+    name_text: Handle<Text>,
+    count_text: Handle<Text>,
+}
+
+#[derive(Debug, Default)]
+struct ProfileStatRowUi {
+    label_text: Handle<Text>,
+    value_text: Handle<Text>,
+    checkbox_bg: Handle<UiNode>,
+}
+
+#[derive(Debug, Default)]
+struct ProfilePanel {
+    bg: Handle<UiNode>,
+    back_btn: Handle<UiNode>,
+    back_btn_text: Handle<Text>,
+    back_btn_rect: UiRect,
+    // 標頭列
+    header_bg: Handle<UiNode>,
+    avatar_bg: Handle<UiNode>,
+    avatar_text: Handle<Text>,
+    name_text: Handle<Text>,
+    level_badge_bg: Handle<UiNode>,
+    level_text: Handle<Text>,
+    xp_track: Handle<UiNode>,
+    xp_fill: Handle<UiNode>,
+    followers_text: Handle<Text>,
+    visibility_toggle_bg: Handle<UiNode>,
+    visibility_text: Handle<Text>,
+    publish_btn_bg: Handle<UiNode>,
+    publish_btn_text: Handle<Text>,
+    settings_gear_bg: Handle<UiNode>,
+    settings_gear_text: Handle<Text>,
+    // 獎牌牆
+    medals_title_text: Handle<Text>,
+    medals: Vec<ProfileMedalUi>,
+    // 左欄：頂級英雄 / 頂級砲塔
+    heroes_banner_bg: Handle<UiNode>,
+    heroes_banner_text: Handle<Text>,
+    heroes: Vec<ProfilePortraitUi>,
+    monkeys_banner_bg: Handle<UiNode>,
+    monkeys_banner_text: Handle<Text>,
+    monkeys: Vec<ProfilePortraitUi>,
+    // 右欄：整體統計數據
+    stats_header_bg: Handle<UiNode>,
+    stats_header_text: Handle<Text>,
+    stats_collapse_text: Handle<Text>,
+    stats_share_count_text: Handle<Text>,
+    stats_rows: Vec<ProfileStatRowUi>,
+}
+
 #[derive(Debug, Default)]
 struct SettingsPanel {
     bg: Handle<UiNode>,
@@ -3105,6 +3206,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ui_settings: SettingsPanel,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_profile: ProfilePanel,
     #[visit(skip)]
     #[reflect(hidden)]
     settings_sfx_volume: f32,
@@ -5861,6 +5965,148 @@ impl Plugin for Game {
                     label,
                     sublabel,
                 });
+        }
+
+        // 個人統計數據頁（Profile）初始化 — 版面骨架，資料為 placeholder。
+        {
+            fn new_border(
+                ui: &mut UserInterface,
+                bg_rgba: (u8, u8, u8, u8),
+                corner: f32,
+            ) -> Handle<UiNode> {
+                BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(1.0)
+                        .with_height(1.0)
+                        .with_background(
+                            Brush::Solid(Color::from_rgba(
+                                bg_rgba.0, bg_rgba.1, bg_rgba.2, bg_rgba.3,
+                            ))
+                            .into(),
+                        ),
+                )
+                .with_stroke_thickness(Thickness::uniform(0.0).into())
+                .with_corner_radius(corner.into())
+                .build(&mut ui.build_ctx())
+                .transmute()
+            }
+            fn new_text(
+                ui: &mut UserInterface,
+                fg_rgba: (u8, u8, u8, u8),
+                font_size: f32,
+                h_align: HorizontalAlignment,
+            ) -> Handle<Text> {
+                TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                        .with_width(1.0)
+                        .with_height(1.0)
+                        .with_foreground(
+                            Brush::Solid(Color::from_rgba(
+                                fg_rgba.0, fg_rgba.1, fg_rgba.2, fg_rgba.3,
+                            ))
+                            .into(),
+                        ),
+                )
+                .with_text(String::new())
+                .with_font_size(font_size.into())
+                .with_horizontal_text_alignment(h_align)
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx())
+            }
+
+            const WHITE: (u8, u8, u8, u8) = (255, 255, 255, 255);
+            const DARK_TEXT: (u8, u8, u8, u8) = (55, 32, 12, 255);
+
+            self.ui_profile.bg = new_border(ui, (22, 42, 30, 255), 0.0);
+            self.ui_profile.back_btn = new_border(ui, (65, 158, 218, 255), 12.0);
+            self.ui_profile.back_btn_text =
+                new_text(ui, WHITE, 22.0, HorizontalAlignment::Center);
+
+            self.ui_profile.header_bg = new_border(ui, (58, 46, 28, 255), 14.0);
+            self.ui_profile.avatar_bg = new_border(ui, (60, 130, 200, 255), 999.0);
+            self.ui_profile.avatar_text = new_text(ui, WHITE, 34.0, HorizontalAlignment::Center);
+            self.ui_profile.name_text = new_text(ui, WHITE, 26.0, HorizontalAlignment::Left);
+            self.ui_profile.level_badge_bg = new_border(ui, (245, 195, 40, 255), 8.0);
+            self.ui_profile.level_text =
+                new_text(ui, DARK_TEXT, 16.0, HorizontalAlignment::Center);
+            self.ui_profile.xp_track = new_border(ui, (42, 32, 18, 255), 999.0);
+            self.ui_profile.xp_fill = new_border(ui, (80, 190, 70, 255), 999.0);
+            self.ui_profile.followers_text =
+                new_text(ui, (220, 225, 230, 255), 18.0, HorizontalAlignment::Left);
+            self.ui_profile.visibility_toggle_bg = new_border(ui, (60, 180, 80, 255), 8.0);
+            self.ui_profile.visibility_text =
+                new_text(ui, WHITE, 18.0, HorizontalAlignment::Center);
+            self.ui_profile.publish_btn_bg = new_border(ui, (55, 130, 210, 255), 10.0);
+            self.ui_profile.publish_btn_text =
+                new_text(ui, WHITE, 18.0, HorizontalAlignment::Center);
+            self.ui_profile.settings_gear_bg = new_border(ui, (110, 72, 30, 255), 12.0);
+            self.ui_profile.settings_gear_text =
+                new_text(ui, WHITE, 26.0, HorizontalAlignment::Center);
+
+            self.ui_profile.medals_title_text =
+                new_text(ui, WHITE, 24.0, HorizontalAlignment::Left);
+            self.ui_profile.medals.clear();
+            for _ in 0..PROFILE_MEDALS.len() {
+                let bg = new_border(ui, (195, 150, 80, 255), 10.0);
+                let count_text = new_text(ui, WHITE, 15.0, HorizontalAlignment::Center);
+                self.ui_profile
+                    .medals
+                    .push(ProfileMedalUi { bg, count_text });
+            }
+
+            self.ui_profile.heroes_banner_bg = new_border(ui, (200, 55, 45, 255), 6.0);
+            self.ui_profile.heroes_banner_text =
+                new_text(ui, WHITE, 20.0, HorizontalAlignment::Center);
+            self.ui_profile.heroes.clear();
+            for _ in 0..PROFILE_TOP_HEROES.len() {
+                let bg = new_border(ui, (125, 105, 82, 230), 10.0);
+                let name_text = new_text(ui, WHITE, 16.0, HorizontalAlignment::Center);
+                let count_text =
+                    new_text(ui, (220, 225, 230, 255), 14.0, HorizontalAlignment::Center);
+                self.ui_profile.heroes.push(ProfilePortraitUi {
+                    bg,
+                    name_text,
+                    count_text,
+                });
+            }
+
+            self.ui_profile.monkeys_banner_bg = new_border(ui, (200, 55, 45, 255), 6.0);
+            self.ui_profile.monkeys_banner_text =
+                new_text(ui, WHITE, 20.0, HorizontalAlignment::Center);
+            self.ui_profile.monkeys.clear();
+            for _ in 0..PROFILE_TOP_MONKEYS.len() {
+                let bg = new_border(ui, (125, 105, 82, 230), 10.0);
+                let name_text = new_text(ui, WHITE, 16.0, HorizontalAlignment::Center);
+                let count_text =
+                    new_text(ui, (220, 225, 230, 255), 14.0, HorizontalAlignment::Center);
+                self.ui_profile.monkeys.push(ProfilePortraitUi {
+                    bg,
+                    name_text,
+                    count_text,
+                });
+            }
+
+            self.ui_profile.stats_header_bg = new_border(ui, (110, 72, 30, 255), 10.0);
+            self.ui_profile.stats_header_text =
+                new_text(ui, WHITE, 20.0, HorizontalAlignment::Left);
+            self.ui_profile.stats_collapse_text =
+                new_text(ui, WHITE, 20.0, HorizontalAlignment::Center);
+            self.ui_profile.stats_share_count_text =
+                new_text(ui, (240, 230, 200, 255), 16.0, HorizontalAlignment::Right);
+            self.ui_profile.stats_rows.clear();
+            for _ in 0..PROFILE_STAT_ROWS.len() {
+                let label_text =
+                    new_text(ui, (220, 215, 200, 255), 17.0, HorizontalAlignment::Left);
+                let value_text = new_text(ui, WHITE, 17.0, HorizontalAlignment::Right);
+                let checkbox_bg = new_border(ui, (70, 150, 220, 200), 4.0);
+                self.ui_profile.stats_rows.push(ProfileStatRowUi {
+                    label_text,
+                    value_text,
+                    checkbox_bg,
+                });
+            }
         }
 
         apply_frontend_runtime_env_from_config();
@@ -12081,6 +12327,7 @@ impl Game {
             )],
             pregame::PregameState::InGame => Vec::new(),
             pregame::PregameState::Settings => Vec::new(),
+            pregame::PregameState::Profile => Vec::new(),
         }
     }
 
@@ -12309,6 +12556,21 @@ impl Game {
     }
 
     fn layout_pregame_home(&mut self, ui: &mut UserInterface, node_index: &mut usize) {
+        // 頭像入口 block（畫面頂端左側）— 點擊進入個人統計數據頁。
+        self.place_pregame_node(
+            ui,
+            node_index,
+            pregame_ref_rect(self.window_size, 30.0, 20.0, 260.0, 92.0),
+            format!("{}\nLv.{}", PROFILE_PLAYER_NAME, PROFILE_LEVEL),
+            true,
+            pregame::PregameAction::Navigate {
+                target: "profile".to_string(),
+            },
+            PregameVisualRole::Button,
+            Color::from_rgba(60, 130, 200, 255),
+            Color::from_rgba(255, 255, 255, 255),
+        );
+
         let deco = [
             (
                 pregame_ref_rect(self.window_size, 250.0, 245.0, 190.0, 170.0),
@@ -12581,10 +12843,21 @@ impl Game {
         let is_settings = self.pregame_runtime.state == pregame::PregameState::Settings;
         if is_settings {
             self.hide_pregame_ui(ui);
+            self.hide_profile_elements(ui);
+            self.pregame_button_rects.clear();
             self.update_settings_panel(ui);
             return;
         }
+        let is_profile = self.pregame_runtime.state == pregame::PregameState::Profile;
+        if is_profile {
+            self.hide_pregame_ui(ui);
+            self.hide_settings_elements(ui);
+            self.pregame_button_rects.clear();
+            self.update_profile_panel(ui);
+            return;
+        }
         self.hide_settings_elements(ui);
+        self.hide_profile_elements(ui);
 
         let screen_id = self.pregame_runtime.active_screen_id();
         let title = self
@@ -12722,6 +12995,7 @@ impl Game {
             }
             pregame::PregameState::InGame => {}
             pregame::PregameState::Settings => {}
+            pregame::PregameState::Profile => {}
         }
         self.hide_unused_pregame_nodes(ui, node_index);
     }
@@ -13253,6 +13527,677 @@ impl Game {
         // 設定頁也要驅動解析度下拉選單與熱鍵面板
         self.update_resolution_dropdown(ui);
         self.update_hotkey_panel(ui);
+    }
+
+    fn hide_profile_elements(&mut self, ui: &mut UserInterface) {
+        let h = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        for handle in [
+            self.ui_profile.bg,
+            self.ui_profile.back_btn,
+            self.ui_profile.header_bg,
+            self.ui_profile.avatar_bg,
+            self.ui_profile.level_badge_bg,
+            self.ui_profile.xp_track,
+            self.ui_profile.xp_fill,
+            self.ui_profile.visibility_toggle_bg,
+            self.ui_profile.publish_btn_bg,
+            self.ui_profile.settings_gear_bg,
+            self.ui_profile.heroes_banner_bg,
+            self.ui_profile.monkeys_banner_bg,
+            self.ui_profile.stats_header_bg,
+        ] {
+            ui.send(handle, WidgetMessage::DesiredPosition(h));
+        }
+        for handle in [
+            self.ui_profile.back_btn_text,
+            self.ui_profile.avatar_text,
+            self.ui_profile.name_text,
+            self.ui_profile.level_text,
+            self.ui_profile.followers_text,
+            self.ui_profile.visibility_text,
+            self.ui_profile.publish_btn_text,
+            self.ui_profile.settings_gear_text,
+            self.ui_profile.medals_title_text,
+            self.ui_profile.heroes_banner_text,
+            self.ui_profile.monkeys_banner_text,
+            self.ui_profile.stats_header_text,
+            self.ui_profile.stats_collapse_text,
+            self.ui_profile.stats_share_count_text,
+        ] {
+            ui.send(handle, WidgetMessage::DesiredPosition(h));
+        }
+        for medal in &self.ui_profile.medals {
+            ui.send(medal.bg, WidgetMessage::DesiredPosition(h));
+            ui.send(medal.count_text, WidgetMessage::DesiredPosition(h));
+        }
+        for portrait in self.ui_profile.heroes.iter().chain(self.ui_profile.monkeys.iter()) {
+            ui.send(portrait.bg, WidgetMessage::DesiredPosition(h));
+            ui.send(portrait.name_text, WidgetMessage::DesiredPosition(h));
+            ui.send(portrait.count_text, WidgetMessage::DesiredPosition(h));
+        }
+        for row in &self.ui_profile.stats_rows {
+            ui.send(row.label_text, WidgetMessage::DesiredPosition(h));
+            ui.send(row.value_text, WidgetMessage::DesiredPosition(h));
+            ui.send(row.checkbox_bg, WidgetMessage::DesiredPosition(h));
+        }
+    }
+
+    /// 個人統計數據頁（Profile，Phase 1 版面骨架）。座標全用 2048x1152 參考空間
+    /// 透過 `pregame_ref_rect` 換算，隨視窗尺寸等比縮放，與其餘 pregame UI 一致。
+    /// 三大區塊：標頭列（頭像/名稱/等級/XP/追蹤者/公開切換/設定齒輪）、
+    /// 獎牌牆、下方雙欄（左＝頂級英雄/頂級砲塔、右＝整體統計數據列表）。
+    fn update_profile_panel(&mut self, ui: &mut UserInterface) {
+        let ws = self.window_size;
+        let full = UiRect {
+            x: 0.0,
+            y: 0.0,
+            w: ws.x.max(1.0),
+            h: ws.y.max(1.0),
+        };
+
+        ui.send(
+            self.ui_profile.bg,
+            WidgetMessage::DesiredPosition(full.pos()),
+        );
+        ui.send(self.ui_profile.bg, WidgetMessage::Width(full.w));
+        ui.send(self.ui_profile.bg, WidgetMessage::Height(full.h));
+
+        // ── 返回按鈕（左上角）──────────────────────────────────────
+        let back = pregame_ref_rect(ws, 20.0, 15.0, 160.0, 80.0);
+        ui.send(
+            self.ui_profile.back_btn,
+            WidgetMessage::DesiredPosition(back.pos()),
+        );
+        ui.send(self.ui_profile.back_btn, WidgetMessage::Width(back.w));
+        ui.send(self.ui_profile.back_btn, WidgetMessage::Height(back.h));
+        ui.send(
+            self.ui_profile.back_btn_text,
+            WidgetMessage::DesiredPosition(back.pos()),
+        );
+        ui.send(
+            self.ui_profile.back_btn_text,
+            WidgetMessage::Width(back.w),
+        );
+        ui.send(
+            self.ui_profile.back_btn_text,
+            WidgetMessage::Height(back.h),
+        );
+        ui.send(
+            self.ui_profile.back_btn_text,
+            TextMessage::Text("< 返回".to_string()),
+        );
+        self.ui_profile.back_btn_rect = back;
+        self.pregame_button_rects
+            .push((back, pregame::PregameAction::Back));
+
+        // ── 標頭列 ────────────────────────────────────────────────
+        let header = pregame_ref_rect(ws, 20.0, 110.0, 2008.0, 140.0);
+        ui.send(
+            self.ui_profile.header_bg,
+            WidgetMessage::DesiredPosition(header.pos()),
+        );
+        ui.send(self.ui_profile.header_bg, WidgetMessage::Width(header.w));
+        ui.send(self.ui_profile.header_bg, WidgetMessage::Height(header.h));
+
+        let avatar = pregame_ref_rect(ws, 40.0, 125.0, 110.0, 110.0);
+        ui.send(
+            self.ui_profile.avatar_bg,
+            WidgetMessage::DesiredPosition(avatar.pos()),
+        );
+        ui.send(self.ui_profile.avatar_bg, WidgetMessage::Width(avatar.w));
+        ui.send(self.ui_profile.avatar_bg, WidgetMessage::Height(avatar.h));
+        ui.send(
+            self.ui_profile.avatar_text,
+            WidgetMessage::DesiredPosition(avatar.pos()),
+        );
+        ui.send(self.ui_profile.avatar_text, WidgetMessage::Width(avatar.w));
+        ui.send(
+            self.ui_profile.avatar_text,
+            WidgetMessage::Height(avatar.h),
+        );
+        ui.send(
+            self.ui_profile.avatar_text,
+            TextMessage::Text(
+                PROFILE_PLAYER_NAME
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+        );
+
+        let name = pregame_ref_rect(ws, 170.0, 128.0, 300.0, 38.0);
+        ui.send(
+            self.ui_profile.name_text,
+            WidgetMessage::DesiredPosition(name.pos()),
+        );
+        ui.send(self.ui_profile.name_text, WidgetMessage::Width(name.w));
+        ui.send(self.ui_profile.name_text, WidgetMessage::Height(name.h));
+        ui.send(
+            self.ui_profile.name_text,
+            TextMessage::Text(PROFILE_PLAYER_NAME.to_string()),
+        );
+
+        let level_badge = pregame_ref_rect(ws, 170.0, 170.0, 74.0, 34.0);
+        ui.send(
+            self.ui_profile.level_badge_bg,
+            WidgetMessage::DesiredPosition(level_badge.pos()),
+        );
+        ui.send(
+            self.ui_profile.level_badge_bg,
+            WidgetMessage::Width(level_badge.w),
+        );
+        ui.send(
+            self.ui_profile.level_badge_bg,
+            WidgetMessage::Height(level_badge.h),
+        );
+        ui.send(
+            self.ui_profile.level_text,
+            WidgetMessage::DesiredPosition(level_badge.pos()),
+        );
+        ui.send(
+            self.ui_profile.level_text,
+            WidgetMessage::Width(level_badge.w),
+        );
+        ui.send(
+            self.ui_profile.level_text,
+            WidgetMessage::Height(level_badge.h),
+        );
+        ui.send(
+            self.ui_profile.level_text,
+            TextMessage::Text(format!("★ Lv.{}", PROFILE_LEVEL)),
+        );
+
+        let xp_track = pregame_ref_rect(ws, 254.0, 178.0, 220.0, 18.0);
+        ui.send(
+            self.ui_profile.xp_track,
+            WidgetMessage::DesiredPosition(xp_track.pos()),
+        );
+        ui.send(
+            self.ui_profile.xp_track,
+            WidgetMessage::Width(xp_track.w),
+        );
+        ui.send(
+            self.ui_profile.xp_track,
+            WidgetMessage::Height(xp_track.h),
+        );
+        let xp_fill_w = (xp_track.w * PROFILE_XP_PCT.clamp(0.0, 1.0)).max(1.0);
+        ui.send(
+            self.ui_profile.xp_fill,
+            WidgetMessage::DesiredPosition(xp_track.pos()),
+        );
+        ui.send(self.ui_profile.xp_fill, WidgetMessage::Width(xp_fill_w));
+        ui.send(
+            self.ui_profile.xp_fill,
+            WidgetMessage::Height(xp_track.h),
+        );
+
+        let followers = pregame_ref_rect(ws, 500.0, 150.0, 200.0, 60.0);
+        ui.send(
+            self.ui_profile.followers_text,
+            WidgetMessage::DesiredPosition(followers.pos()),
+        );
+        ui.send(
+            self.ui_profile.followers_text,
+            WidgetMessage::Width(followers.w),
+        );
+        ui.send(
+            self.ui_profile.followers_text,
+            WidgetMessage::Height(followers.h),
+        );
+        ui.send(
+            self.ui_profile.followers_text,
+            TextMessage::Text(format!("追蹤者\n{}", PROFILE_FOLLOWERS)),
+        );
+
+        let visibility = pregame_ref_rect(ws, 740.0, 155.0, 130.0, 46.0);
+        ui.send(
+            self.ui_profile.visibility_toggle_bg,
+            WidgetMessage::DesiredPosition(visibility.pos()),
+        );
+        ui.send(
+            self.ui_profile.visibility_toggle_bg,
+            WidgetMessage::Width(visibility.w),
+        );
+        ui.send(
+            self.ui_profile.visibility_toggle_bg,
+            WidgetMessage::Height(visibility.h),
+        );
+        ui.send(
+            self.ui_profile.visibility_text,
+            WidgetMessage::DesiredPosition(visibility.pos()),
+        );
+        ui.send(
+            self.ui_profile.visibility_text,
+            WidgetMessage::Width(visibility.w),
+        );
+        ui.send(
+            self.ui_profile.visibility_text,
+            WidgetMessage::Height(visibility.h),
+        );
+        ui.send(
+            self.ui_profile.visibility_text,
+            TextMessage::Text("公開".to_string()),
+        );
+
+        let publish = pregame_ref_rect(ws, 890.0, 150.0, 260.0, 56.0);
+        ui.send(
+            self.ui_profile.publish_btn_bg,
+            WidgetMessage::DesiredPosition(publish.pos()),
+        );
+        ui.send(
+            self.ui_profile.publish_btn_bg,
+            WidgetMessage::Width(publish.w),
+        );
+        ui.send(
+            self.ui_profile.publish_btn_bg,
+            WidgetMessage::Height(publish.h),
+        );
+        ui.send(
+            self.ui_profile.publish_btn_text,
+            WidgetMessage::DesiredPosition(publish.pos()),
+        );
+        ui.send(
+            self.ui_profile.publish_btn_text,
+            WidgetMessage::Width(publish.w),
+        );
+        ui.send(
+            self.ui_profile.publish_btn_text,
+            WidgetMessage::Height(publish.h),
+        );
+        ui.send(
+            self.ui_profile.publish_btn_text,
+            TextMessage::Text("公開統計數據".to_string()),
+        );
+
+        let gear = pregame_ref_rect(ws, 1908.0, 140.0, 80.0, 80.0);
+        ui.send(
+            self.ui_profile.settings_gear_bg,
+            WidgetMessage::DesiredPosition(gear.pos()),
+        );
+        ui.send(
+            self.ui_profile.settings_gear_bg,
+            WidgetMessage::Width(gear.w),
+        );
+        ui.send(
+            self.ui_profile.settings_gear_bg,
+            WidgetMessage::Height(gear.h),
+        );
+        ui.send(
+            self.ui_profile.settings_gear_text,
+            WidgetMessage::DesiredPosition(gear.pos()),
+        );
+        ui.send(
+            self.ui_profile.settings_gear_text,
+            WidgetMessage::Width(gear.w),
+        );
+        ui.send(
+            self.ui_profile.settings_gear_text,
+            WidgetMessage::Height(gear.h),
+        );
+        ui.send(
+            self.ui_profile.settings_gear_text,
+            TextMessage::Text("⚙".to_string()),
+        );
+        // 齒輪按鈕點回「設定」頁（Phase 1：沿用既有設定頁，不重複造輪子）
+        self.pregame_button_rects.push((
+            gear,
+            pregame::PregameAction::Navigate {
+                target: "settings".to_string(),
+            },
+        ));
+
+        // ── 獎牌牆 ────────────────────────────────────────────────
+        let medals_title = pregame_ref_rect(ws, 40.0, 270.0, 300.0, 36.0);
+        ui.send(
+            self.ui_profile.medals_title_text,
+            WidgetMessage::DesiredPosition(medals_title.pos()),
+        );
+        ui.send(
+            self.ui_profile.medals_title_text,
+            WidgetMessage::Width(medals_title.w),
+        );
+        ui.send(
+            self.ui_profile.medals_title_text,
+            WidgetMessage::Height(medals_title.h),
+        );
+        ui.send(
+            self.ui_profile.medals_title_text,
+            TextMessage::Text("獎牌".to_string()),
+        );
+
+        let medal_size = 96.0;
+        let medal_gap = 18.0;
+        for (i, ((label, count), medal_ui)) in PROFILE_MEDALS
+            .iter()
+            .zip(self.ui_profile.medals.iter())
+            .enumerate()
+        {
+            let _ = label;
+            let mx = 40.0 + i as f32 * (medal_size + medal_gap);
+            let rect = pregame_ref_rect(ws, mx, 320.0, medal_size, medal_size);
+            ui.send(medal_ui.bg, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(medal_ui.bg, WidgetMessage::Width(rect.w));
+            ui.send(medal_ui.bg, WidgetMessage::Height(rect.h));
+            let badge = UiRect {
+                x: rect.right() - rect.w * 0.34,
+                y: rect.bottom() - rect.h * 0.34,
+                w: rect.w * 0.34,
+                h: rect.h * 0.34,
+            };
+            ui.send(
+                medal_ui.count_text,
+                WidgetMessage::DesiredPosition(badge.pos()),
+            );
+            ui.send(medal_ui.count_text, WidgetMessage::Width(badge.w));
+            ui.send(medal_ui.count_text, WidgetMessage::Height(badge.h));
+            ui.send(
+                medal_ui.count_text,
+                TextMessage::Text(format!("x{}", count)),
+            );
+        }
+
+        // ── 下方雙欄 ──────────────────────────────────────────────
+        let lower_y = 480.0;
+        let left_col_x = 40.0;
+        let left_col_w = 960.0;
+
+        let heroes_banner = pregame_ref_rect(ws, left_col_x, lower_y, left_col_w, 44.0);
+        ui.send(
+            self.ui_profile.heroes_banner_bg,
+            WidgetMessage::DesiredPosition(heroes_banner.pos()),
+        );
+        ui.send(
+            self.ui_profile.heroes_banner_bg,
+            WidgetMessage::Width(heroes_banner.w),
+        );
+        ui.send(
+            self.ui_profile.heroes_banner_bg,
+            WidgetMessage::Height(heroes_banner.h),
+        );
+        ui.send(
+            self.ui_profile.heroes_banner_text,
+            WidgetMessage::DesiredPosition(heroes_banner.pos()),
+        );
+        ui.send(
+            self.ui_profile.heroes_banner_text,
+            WidgetMessage::Width(heroes_banner.w),
+        );
+        ui.send(
+            self.ui_profile.heroes_banner_text,
+            WidgetMessage::Height(heroes_banner.h),
+        );
+        ui.send(
+            self.ui_profile.heroes_banner_text,
+            TextMessage::Text("頂級英雄".to_string()),
+        );
+
+        let portrait_w = 300.0;
+        let portrait_h = 190.0;
+        let portrait_gap = 30.0;
+        for (i, ((label, count), portrait)) in PROFILE_TOP_HEROES
+            .iter()
+            .zip(self.ui_profile.heroes.iter())
+            .enumerate()
+        {
+            let px = left_col_x + i as f32 * (portrait_w + portrait_gap);
+            let rect = pregame_ref_rect(ws, px, lower_y + 60.0, portrait_w, portrait_h);
+            ui.send(portrait.bg, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(portrait.bg, WidgetMessage::Width(rect.w));
+            ui.send(portrait.bg, WidgetMessage::Height(rect.h));
+            let name_rect = UiRect {
+                x: rect.x,
+                y: rect.bottom() - rect.h * 0.30,
+                w: rect.w,
+                h: rect.h * 0.18,
+            };
+            ui.send(
+                portrait.name_text,
+                WidgetMessage::DesiredPosition(name_rect.pos()),
+            );
+            ui.send(portrait.name_text, WidgetMessage::Width(name_rect.w));
+            ui.send(portrait.name_text, WidgetMessage::Height(name_rect.h));
+            ui.send(
+                portrait.name_text,
+                TextMessage::Text(label.to_string()),
+            );
+            let count_rect = UiRect {
+                x: rect.x,
+                y: rect.bottom() - rect.h * 0.12,
+                w: rect.w,
+                h: rect.h * 0.12,
+            };
+            ui.send(
+                portrait.count_text,
+                WidgetMessage::DesiredPosition(count_rect.pos()),
+            );
+            ui.send(portrait.count_text, WidgetMessage::Width(count_rect.w));
+            ui.send(portrait.count_text, WidgetMessage::Height(count_rect.h));
+            ui.send(
+                portrait.count_text,
+                TextMessage::Text(format!("使用 {} 次", count)),
+            );
+        }
+
+        let monkeys_y = lower_y + 60.0 + portrait_h + 40.0;
+        let monkeys_banner = pregame_ref_rect(ws, left_col_x, monkeys_y, left_col_w, 44.0);
+        ui.send(
+            self.ui_profile.monkeys_banner_bg,
+            WidgetMessage::DesiredPosition(monkeys_banner.pos()),
+        );
+        ui.send(
+            self.ui_profile.monkeys_banner_bg,
+            WidgetMessage::Width(monkeys_banner.w),
+        );
+        ui.send(
+            self.ui_profile.monkeys_banner_bg,
+            WidgetMessage::Height(monkeys_banner.h),
+        );
+        ui.send(
+            self.ui_profile.monkeys_banner_text,
+            WidgetMessage::DesiredPosition(monkeys_banner.pos()),
+        );
+        ui.send(
+            self.ui_profile.monkeys_banner_text,
+            WidgetMessage::Width(monkeys_banner.w),
+        );
+        ui.send(
+            self.ui_profile.monkeys_banner_text,
+            WidgetMessage::Height(monkeys_banner.h),
+        );
+        ui.send(
+            self.ui_profile.monkeys_banner_text,
+            TextMessage::Text("頂級砲塔".to_string()),
+        );
+
+        for (i, ((label, count), portrait)) in PROFILE_TOP_MONKEYS
+            .iter()
+            .zip(self.ui_profile.monkeys.iter())
+            .enumerate()
+        {
+            let px = left_col_x + i as f32 * (portrait_w + portrait_gap);
+            let rect = pregame_ref_rect(ws, px, monkeys_y + 60.0, portrait_w, portrait_h);
+            ui.send(portrait.bg, WidgetMessage::DesiredPosition(rect.pos()));
+            ui.send(portrait.bg, WidgetMessage::Width(rect.w));
+            ui.send(portrait.bg, WidgetMessage::Height(rect.h));
+            let name_rect = UiRect {
+                x: rect.x,
+                y: rect.bottom() - rect.h * 0.30,
+                w: rect.w,
+                h: rect.h * 0.18,
+            };
+            ui.send(
+                portrait.name_text,
+                WidgetMessage::DesiredPosition(name_rect.pos()),
+            );
+            ui.send(portrait.name_text, WidgetMessage::Width(name_rect.w));
+            ui.send(portrait.name_text, WidgetMessage::Height(name_rect.h));
+            ui.send(
+                portrait.name_text,
+                TextMessage::Text(label.to_string()),
+            );
+            let count_rect = UiRect {
+                x: rect.x,
+                y: rect.bottom() - rect.h * 0.12,
+                w: rect.w,
+                h: rect.h * 0.12,
+            };
+            ui.send(
+                portrait.count_text,
+                WidgetMessage::DesiredPosition(count_rect.pos()),
+            );
+            ui.send(portrait.count_text, WidgetMessage::Width(count_rect.w));
+            ui.send(portrait.count_text, WidgetMessage::Height(count_rect.h));
+            ui.send(
+                portrait.count_text,
+                TextMessage::Text(format!("使用 {} 次", count)),
+            );
+        }
+
+        // ── 右欄：整體統計數據 ────────────────────────────────────
+        let right_col_x = left_col_x + left_col_w + 30.0;
+        let right_col_w = 2008.0 - left_col_w - 30.0;
+
+        let stats_header = pregame_ref_rect(ws, right_col_x, lower_y, right_col_w, 50.0);
+        ui.send(
+            self.ui_profile.stats_header_bg,
+            WidgetMessage::DesiredPosition(stats_header.pos()),
+        );
+        ui.send(
+            self.ui_profile.stats_header_bg,
+            WidgetMessage::Width(stats_header.w),
+        );
+        ui.send(
+            self.ui_profile.stats_header_bg,
+            WidgetMessage::Height(stats_header.h),
+        );
+        let header_label_rect = UiRect {
+            x: stats_header.x + 16.0,
+            y: stats_header.y,
+            w: stats_header.w * 0.6,
+            h: stats_header.h,
+        };
+        ui.send(
+            self.ui_profile.stats_header_text,
+            WidgetMessage::DesiredPosition(header_label_rect.pos()),
+        );
+        ui.send(
+            self.ui_profile.stats_header_text,
+            WidgetMessage::Width(header_label_rect.w),
+        );
+        ui.send(
+            self.ui_profile.stats_header_text,
+            WidgetMessage::Height(header_label_rect.h),
+        );
+        ui.send(
+            self.ui_profile.stats_header_text,
+            TextMessage::Text("整體統計數據".to_string()),
+        );
+        let collapse_rect = UiRect {
+            x: stats_header.right() - stats_header.h,
+            y: stats_header.y,
+            w: stats_header.h,
+            h: stats_header.h,
+        };
+        ui.send(
+            self.ui_profile.stats_collapse_text,
+            WidgetMessage::DesiredPosition(collapse_rect.pos()),
+        );
+        ui.send(
+            self.ui_profile.stats_collapse_text,
+            WidgetMessage::Width(collapse_rect.w),
+        );
+        ui.send(
+            self.ui_profile.stats_collapse_text,
+            WidgetMessage::Height(collapse_rect.h),
+        );
+        ui.send(
+            self.ui_profile.stats_collapse_text,
+            TextMessage::Text("▾".to_string()),
+        );
+        let share_rect = UiRect {
+            x: collapse_rect.x - 140.0,
+            y: stats_header.y,
+            w: 130.0,
+            h: stats_header.h,
+        };
+        ui.send(
+            self.ui_profile.stats_share_count_text,
+            WidgetMessage::DesiredPosition(share_rect.pos()),
+        );
+        ui.send(
+            self.ui_profile.stats_share_count_text,
+            WidgetMessage::Width(share_rect.w),
+        );
+        ui.send(
+            self.ui_profile.stats_share_count_text,
+            WidgetMessage::Height(share_rect.h),
+        );
+        ui.send(
+            self.ui_profile.stats_share_count_text,
+            TextMessage::Text(format!(
+                "分享 {}/{}",
+                PROFILE_SHARE_COUNT.0, PROFILE_SHARE_COUNT.1
+            )),
+        );
+
+        let row_h = 48.0;
+        let row_gap = 4.0;
+        // rows_y 必須用 ref-space（跟 lower_y 一致）；先前誤用 stats_header.bottom()
+        // 那是 screen-space，再丟進 pregame_ref_rect 會被二次縮放、把清單推歪。
+        let rows_y = lower_y + 50.0 + 12.0;
+        for (i, ((label, value), row_ui)) in PROFILE_STAT_ROWS
+            .iter()
+            .zip(self.ui_profile.stats_rows.iter())
+            .enumerate()
+        {
+            let ry = rows_y + i as f32 * (row_h + row_gap);
+            let row_rect = pregame_ref_rect(ws, right_col_x, ry, right_col_w, row_h);
+            // 勾選框移到每列最右邊（對齊原圖 BTD6：標籤左、數值中右、勾選框最右）。
+            let cb_size = row_rect.h * 0.5;
+            let checkbox = UiRect {
+                x: row_rect.right() - cb_size - 8.0,
+                y: row_rect.y + row_rect.h * 0.25,
+                w: cb_size,
+                h: cb_size,
+            };
+            ui.send(
+                row_ui.checkbox_bg,
+                WidgetMessage::DesiredPosition(checkbox.pos()),
+            );
+            ui.send(row_ui.checkbox_bg, WidgetMessage::Width(checkbox.w));
+            ui.send(row_ui.checkbox_bg, WidgetMessage::Height(checkbox.h));
+
+            let label_rect = UiRect {
+                x: row_rect.x + 14.0,
+                y: row_rect.y,
+                w: row_rect.w * 0.55,
+                h: row_rect.h,
+            };
+            ui.send(
+                row_ui.label_text,
+                WidgetMessage::DesiredPosition(label_rect.pos()),
+            );
+            ui.send(row_ui.label_text, WidgetMessage::Width(label_rect.w));
+            ui.send(row_ui.label_text, WidgetMessage::Height(label_rect.h));
+            ui.send(row_ui.label_text, TextMessage::Text(label.to_string()));
+
+            // 數值靠右對齊，落在勾選框左側（value_text 已設 HorizontalAlignment::Right）。
+            let value_w = row_rect.w * 0.2;
+            let value_rect = UiRect {
+                x: checkbox.x - value_w - 12.0,
+                y: row_rect.y,
+                w: value_w,
+                h: row_rect.h,
+            };
+            ui.send(
+                row_ui.value_text,
+                WidgetMessage::DesiredPosition(value_rect.pos()),
+            );
+            ui.send(row_ui.value_text, WidgetMessage::Width(value_rect.w));
+            ui.send(row_ui.value_text, WidgetMessage::Height(value_rect.h));
+            ui.send(row_ui.value_text, TextMessage::Text(value.to_string()));
+        }
     }
 
     fn clear_td_tower_shop_cards(&mut self, ui: &mut UserInterface) {

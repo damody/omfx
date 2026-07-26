@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub enum PregameState {
     MainMenu,
     Settings,
+    Profile,
     MapSelect,
     DifficultySelect,
     StartingSession,
@@ -44,6 +45,7 @@ impl PregameRuntime {
         match self.state {
             PregameState::MainMenu => "main_menu",
             PregameState::Settings => "settings",
+            PregameState::Profile => "profile",
             PregameState::MapSelect => "map_select",
             PregameState::DifficultySelect => "difficulty_select",
             PregameState::StartingSession => "starting_session",
@@ -80,9 +82,16 @@ impl PregameRuntime {
                 self.state = PregameState::Settings;
                 None
             }
+            PregameAction::Navigate { target } if target == "profile" => {
+                self.state = PregameState::Profile;
+                None
+            }
             PregameAction::Back => {
                 match self.state {
                     PregameState::Settings => {
+                        self.state = PregameState::MainMenu;
+                    }
+                    PregameState::Profile => {
                         self.state = PregameState::MainMenu;
                     }
                     PregameState::MapSelect => {
