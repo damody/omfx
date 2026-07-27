@@ -1983,6 +1983,12 @@ struct GkPanelUi {
     entry_bg: Handle<UiNode>,
     entry_text_h: Handle<Text>,
     entry_rect: UiRect,
+    /// 面板底部的操作訊息（解鎖成功 / 失敗原因）。
+    status_text: Handle<Text>,
+    /// 啟用/停用加成的切換按鈕。
+    toggle_bg: Handle<UiNode>,
+    toggle_text: Handle<Text>,
+    toggle_rect: UiRect,
 }
 
 #[derive(Default, Debug)]
@@ -4004,6 +4010,14 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     gk_unlocked_nodes: std::collections::HashSet<String>,
+    /// 英雄知識加成是否啟用（切換後存入 profile，下局生效）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_knowledge_enabled: bool,
+    /// 面板狀態訊息（解鎖結果 / 前置節點提示）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_panel_status: String,
 }
 
 /// 技能詳細資訊（後端一次性廣播，用於 tooltip）
@@ -16850,6 +16864,11 @@ impl Game {
                             }
                         }
                     }
+                    // enabled 欄位不存在時預設 true
+                    self.gk_knowledge_enabled = v
+                        .get("enabled")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(true);
                 }
                 Err(e) => {
                     log::warn!("[gk] player_profile.json parse error: {}", e);
@@ -16900,6 +16919,7 @@ impl Game {
                 if let Some(req_id) = req.as_str() {
                     if !self.gk_unlocked_nodes.contains(req_id) {
                         log::info!("[gk] unlock '{}' blocked: requires '{}' first", node_id, req_id);
+                        self.gk_panel_status = format!("需先解鎖前置節點：{}", req_id);
                         return;
                     }
                 }
@@ -16908,6 +16928,7 @@ impl Game {
         // 驗證 KP
         if self.gk_available_kp < kp_cost {
             log::info!("[gk] unlock '{}' blocked: need {} KP, have {}", node_id, kp_cost, self.gk_available_kp);
+            self.gk_panel_status = format!("KP 不足（需要 {}，剩餘 {}）", kp_cost, self.gk_available_kp);
             return;
         }
         // 讀取現有 profile JSON
@@ -16918,12 +16939,13 @@ impl Game {
             .unwrap_or_else(|| serde_json::json!({
                 "total_kp": 20, "spent_kp": 0, "unlocked_nodes": []
             }));
-        // 更新 spent_kp 和 unlocked_nodes
+        // 更新 spent_kp、unlocked_nodes、enabled
         let spent = profile.get("spent_kp").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         profile["spent_kp"] = serde_json::json!(spent + kp_cost);
         if let Some(arr) = profile.get_mut("unlocked_nodes").and_then(|v| v.as_array_mut()) {
             arr.push(serde_json::json!(node_id));
         }
+        profile["enabled"] = serde_json::json!(self.gk_knowledge_enabled);
         // 寫回
         match serde_json::to_string_pretty(&profile) {
             Ok(json_str) => {
@@ -16940,7 +16962,27 @@ impl Game {
         // 更新前端快取
         self.gk_unlocked_nodes.insert(node_id.to_string());
         self.gk_available_kp = self.gk_available_kp.saturating_sub(kp_cost);
+        self.gk_panel_status = format!("已解鎖！剩餘 KP：{}", self.gk_available_kp.saturating_sub(kp_cost));
         log::info!("[gk] unlocked '{}', remaining KP={}", node_id, self.gk_available_kp);
+    }
+
+    /// 切換英雄知識加成啟用狀態，並寫回 player_profile.json。
+    fn toggle_gk_knowledge_enabled(&mut self) {
+        self.gk_knowledge_enabled = !self.gk_knowledge_enabled;
+        let profile_path = PathBuf::from("omb").join("player_profile.json");
+        let mut profile: serde_json::Value = std::fs::read_to_string(&profile_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({
+                "total_kp": 20, "spent_kp": 0, "unlocked_nodes": [], "enabled": true
+            }));
+        profile["enabled"] = serde_json::json!(self.gk_knowledge_enabled);
+        if let Ok(json_str) = serde_json::to_string_pretty(&profile) {
+            let _ = std::fs::write(&profile_path, json_str);
+        }
+        let state = if self.gk_knowledge_enabled { "啟用" } else { "停用" };
+        self.gk_panel_status = format!("英雄知識加成已{}（下局生效）", state);
+        log::info!("[gk] knowledge_enabled={}", self.gk_knowledge_enabled);
     }
 
     /// GK 面板點擊處理（面板可見時 modal 攔截所有點擊）。
@@ -16948,6 +16990,12 @@ impl Game {
         let close_rect = self.gk_panel_ui.close_rect;
         if close_rect.w > 0.0 && close_rect.contains(screen) {
             self.gk_panel_visible = false;
+            return;
+        }
+        // 啟用/停用切換按鈕
+        let toggle_r = self.gk_panel_ui.toggle_rect;
+        if toggle_r.w > 0.0 && toggle_r.contains(screen) {
+            self.toggle_gk_knowledge_enabled();
             return;
         }
         // 解鎖按鈕 hit-test
@@ -16959,6 +17007,8 @@ impl Game {
                     if !self.gk_unlocked_nodes.contains(node_id) {
                         let id = node_id.clone();
                         self.try_unlock_gk_node(&id);
+                    } else {
+                        self.gk_panel_status = "節點已解鎖".to_string();
                     }
                 }
                 return;
@@ -17012,6 +17062,10 @@ impl Game {
                 }
                 panel.unlock_rects.iter_mut().for_each(|r| *r = UiRect::default());
                 panel.close_rect = UiRect::default();
+                panel.toggle_rect = UiRect::default();
+                ui.send(panel.toggle_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.toggle_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.status_text, WidgetMessage::DesiredPosition(hidden));
                 panel.visible_applied = false;
             }
             return;
@@ -17119,6 +17173,40 @@ impl Game {
             )
             .with_text("✕".to_string())
             .with_font_size(36.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+
+            // 啟用/停用切換按鈕
+            panel.toggle_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_background(Brush::Solid(Color::from_rgba(40, 160, 80, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(2.0).into())
+            .with_corner_radius(10.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+
+            panel.toggle_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(22.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+
+            // 狀態訊息（解鎖結果 / 錯誤提示）
+            panel.status_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 80, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(22.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
@@ -17287,6 +17375,24 @@ impl Game {
         panel.close_rect = close_r;
         send_rect(ui, panel.close_bg, close_r);
         send_rect_text(ui, panel.close_text, close_r);
+
+        // 啟用/停用切換按鈕（KP 顯示左側）
+        let toggle_r = rr(130.0, 16.0, 220.0, 60.0);
+        panel.toggle_rect = toggle_r;
+        let (toggle_label, toggle_bg_color) = if self.gk_knowledge_enabled {
+            ("加成：啟用 ✓", Color::from_rgba(40, 160, 80, 255))
+        } else {
+            ("加成：停用 ✗", Color::from_rgba(160, 60, 40, 255))
+        };
+        ui.send(panel.toggle_bg, WidgetMessage::Background(Brush::Solid(toggle_bg_color).into()));
+        send_rect(ui, panel.toggle_bg, toggle_r);
+        send_rect_text(ui, panel.toggle_text, toggle_r);
+        ui.send(panel.toggle_text, TextMessage::Text(toggle_label.to_string()));
+
+        // 狀態訊息（面板底部中央）
+        let status_r = rr(360.0, 16.0, 1000.0, 60.0);
+        send_rect_text(ui, panel.status_text, status_r);
+        ui.send(panel.status_text, TextMessage::Text(self.gk_panel_status.clone()));
 
         // ── 2 欄 Category 版面 ──
         // 左欄（cat idx 0..4）/ 右欄（cat idx 4+），每欄 2 張卡片並排
