@@ -12185,6 +12185,8 @@ impl Game {
         self.auto_noop_next_at_s = None;
         self.game_ended = false;
         self.session_render_reset_pending = true;
+        // 回到選單時確保英雄知識面板關閉，避免 pregame 點擊被面板攔截
+        self.gk_panel_visible = false;
     }
 
     fn reset_session_render_state(&mut self, scene: &mut Scene) {
@@ -16916,7 +16918,7 @@ impl Game {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({
-                "total_kp": 0, "spent_kp": 0, "unlocked_nodes": []
+                "total_kp": 20, "spent_kp": 0, "unlocked_nodes": []
             }));
         // 更新 spent_kp 和 unlocked_nodes
         let spent = profile.get("spent_kp").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
