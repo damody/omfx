@@ -1775,7 +1775,7 @@ struct TdTowerShopCard {
     price_text: Handle<Text>,
 }
 
-/// 將軍知識面板 UI（全螢幕覆蓋面板）。
+/// 英雄知識面板 UI（全螢幕覆蓋面板）。
 #[derive(Default, Debug)]
 struct GkPanelUi {
     built: bool,
@@ -3814,7 +3814,7 @@ pub struct Game {
     #[reflect(hidden)]
     fps_display: String,
 
-    // ---- 將軍知識（General Knowledge）面板 ----
+    // ---- 英雄知識（Hero Knowledge）面板 ----
     /// 面板是否可見（點擊 GK 按鈕切換）。
     #[visit(skip)]
     #[reflect(hidden)]
@@ -5233,7 +5233,7 @@ impl Plugin for Game {
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .build(&mut ui.build_ctx());
 
-            // 將軍知識入口按鈕（右側面板頂部）
+            // 英雄知識入口按鈕（右側面板頂部）
             self.gk_panel_ui.entry_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
@@ -5260,7 +5260,7 @@ impl Plugin for Game {
                     .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
                     .with_foreground(Brush::Solid(Color::from_rgba(255, 240, 180, 255)).into()),
             )
-            .with_text("將軍知識".to_string())
+            .with_text("英雄知識".to_string())
             .with_font_size(22.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
@@ -5849,7 +5849,7 @@ impl Plugin for Game {
         self.hotkey_panel_visible = false;
         self.hotkey_rebinding = None;
 
-        // 將軍知識：從 omb/player_profile.json 載入 KP 快取
+        // 英雄知識：從 omb/player_profile.json 載入 KP 快取
         self.load_gk_profile();
 
         Ok(())
@@ -7875,7 +7875,7 @@ impl Plugin for Game {
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel.w));
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel.h));
 
-                // 將軍知識入口按鈕（右側面板頂部，y~68）
+                // 英雄知識入口按鈕（右側面板頂部，y~68）
                 {
                     let gk_r = td_ui_ref_rect(
                         self.window_size,
@@ -9909,7 +9909,7 @@ impl Plugin for Game {
 
             // 熱鍵設定面板（F1 開關）
             self.update_hotkey_panel(ui);
-            // 將軍知識面板
+            // 英雄知識面板
             self.update_gk_panel(ui);
 
             let end_str = if self.game_ended {
@@ -10345,14 +10345,14 @@ impl Plugin for Game {
                     play_button_sfx = true;
                 }
 
-                // 將軍知識面板：modal 點擊攔截（開啟時吃掉所有點擊）
+                // 英雄知識面板：modal 點擊攔截（開啟時吃掉所有點擊）
                 if !hit_ui && self.gk_panel_visible {
                     self.handle_gk_panel_click(screen);
                     hit_ui = true;
                     play_button_sfx = true;
                 }
 
-                // 將軍知識入口按鈕（右側面板頂部）
+                // 英雄知識入口按鈕（右側面板頂部）
                 if !hit_ui {
                     let gr = self.gk_panel_ui.entry_rect;
                     if gr.w > 0.0 && gr.contains(screen) {
@@ -15777,7 +15777,7 @@ impl Game {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // 將軍知識（General Knowledge）面板
+    // 英雄知識（Hero Knowledge）面板
     // ──────────────────────────────────────────────────────────────────────
 
     /// 從 `omb/player_profile.json` 讀取 KP 與已解鎖節點到前端快取。
@@ -15919,7 +15919,7 @@ impl Game {
         }
     }
 
-    /// 將軍知識面板：lazy 建立節點、每 frame 更新位置與狀態文字。
+    /// 英雄知識面板：lazy 建立節點、每 frame 更新位置與狀態文字。
     fn update_gk_panel(&mut self, ui: &mut UserInterface) {
         fn gk_cat_display_name(cat: &str) -> &'static str {
             match cat {
@@ -16018,7 +16018,7 @@ impl Game {
                     .with_desired_position(hidden)
                     .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 150, 255)).into()),
             )
-            .with_text("將軍知識".to_string())
+            .with_text("英雄知識".to_string())
             .with_font_size(44.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
