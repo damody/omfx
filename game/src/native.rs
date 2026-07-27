@@ -8201,24 +8201,6 @@ impl Plugin for Game {
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Width(panel.w));
                 ui.send(self.ui_td_right_panel.bg, WidgetMessage::Height(panel.h));
 
-                // 英雄知識入口按鈕（右側面板頂部，y~68）
-                {
-                    let gk_r = td_ui_ref_rect(
-                        self.window_size,
-                        right_panel_x_ref + 25.0,
-                        68.0,
-                        right_panel_w_ref - 50.0,
-                        48.0,
-                    );
-                    self.gk_panel_ui.entry_rect = gk_r;
-                    ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::DesiredPosition(gk_r.pos()));
-                    ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::Width(gk_r.w));
-                    ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::Height(gk_r.h));
-                    ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::DesiredPosition(gk_r.pos()));
-                    ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::Width(gk_r.w));
-                    ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::Height(gk_r.h));
-                }
-
                 let title = td_ui_ref_rect(
                     self.window_size,
                     right_panel_x_ref + 24.0,
@@ -10671,27 +10653,6 @@ impl Plugin for Game {
                     play_button_sfx = true;
                 }
 
-                // 英雄知識面板：modal 點擊攔截（開啟時吃掉所有點擊）
-                if !hit_ui && self.gk_panel_visible {
-                    self.handle_gk_panel_click(screen);
-                    hit_ui = true;
-                    play_button_sfx = true;
-                }
-
-                // 英雄知識入口按鈕（右側面板頂部）
-                if !hit_ui {
-                    let gr = self.gk_panel_ui.entry_rect;
-                    if gr.w > 0.0 && gr.contains(screen) {
-                        self.gk_panel_visible = !self.gk_panel_visible;
-                        // 開啟面板時重新讀取 profile，確保顯示最新 KP（包含本局結算）
-                        if self.gk_panel_visible {
-                            self.load_gk_profile();
-                        }
-                        hit_ui = true;
-                        play_button_sfx = true;
-                    }
-                }
-
                 // 1. Start Round / speed toggle button — Phase 5.x lockstep send
                 if !hit_ui {
                     let (bx, by, bw, bh) = self.start_round_button_rect;
@@ -12411,6 +12372,19 @@ impl Game {
             self.resolution_dropdown_open = true;
             return true;
         }
+        // 英雄知識面板：modal 點擊攔截（開啟時吃掉所有點擊）
+        if self.gk_panel_visible {
+            self.handle_gk_panel_click(screen);
+            return true;
+        }
+        // 英雄知識入口按鈕（主選單「知識」nav 按鈕）
+        if self.gk_panel_ui.entry_rect.w > 0.0 && self.gk_panel_ui.entry_rect.contains(screen) {
+            self.gk_panel_visible = !self.gk_panel_visible;
+            if self.gk_panel_visible {
+                self.load_gk_profile();
+            }
+            return true;
+        }
         let action = self
             .pregame_button_rects
             .iter()
@@ -12706,7 +12680,11 @@ impl Game {
                 Color::from_rgba(250, 185, 30, 255),
             ),
         ];
-        for (label, rect, action, active, color) in nav {
+        for (i, (label, rect, action, active, color)) in nav.into_iter().enumerate() {
+            // nav[2] は「知識」ボタン → 英雄知識面板入口
+            if i == 2 {
+                self.gk_panel_ui.entry_rect = rect;
+            }
             self.place_pregame_node(
                 ui,
                 node_index,
@@ -14278,6 +14256,11 @@ impl Game {
         self.td_sell_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.td_target_priority_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
         self.td_upgrade_button_rects = [(UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0); 3];
+        // 英雄知識入口按鈕只在主選單顯示，局中隱藏
+        let h = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::DesiredPosition(h));
+        ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::DesiredPosition(h));
+        self.gk_panel_ui.entry_rect = UiRect::default();
     }
 
     fn update_in_game_return_button(&mut self, ui: &mut UserInterface) {
