@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use log::{error, info};
+use log::{debug, error, info};
 use omoba_core::lockstep_timing::LockstepTiming;
 
 use specs::{World, WorldExt};
@@ -776,7 +776,7 @@ fn run_sim_loop(
                 diagnostics.blocking_receives = profile_blocking_receives;
                 diagnostics.backlog_receives = profile_backlog_receives;
             }
-            info!(
+            debug!(
                 "sim_runner_profile window_ms={} target_tps={} processed_ticks={} extract_data_for_render={} latest_tick={} queue_len={} max_queue_len={} waits={} blocking_receives={} backlog_receives={} avg_ms wait_idle={:.3} receive_active={:.3} tick_active={:.3} dispatch={:.3} drains={:.3} script={:.3} extract={:.3} publish={:.3}",
                 profile_elapsed.as_millis(),
                 timing.step_fps(),
