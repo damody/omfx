@@ -11160,6 +11160,14 @@ impl Plugin for Game {
                     return Ok(());
                 }
 
+                // 英雄知識面板：Esc 關閉
+                if self.gk_panel_visible {
+                    if key == KeyCode::Escape {
+                        self.gk_panel_visible = false;
+                    }
+                    return Ok(());
+                }
+
                 // Esc 退出全螢幕（pregame 選單中；遊戲中的 Esc 保留原本取消功能）
                 if key == KeyCode::Escape
                     && !self.ctrl_held
@@ -16955,6 +16963,11 @@ impl Game {
                 }
                 return;
             }
+        }
+        // 點擊主內容框外的 backdrop 區域 → 關閉面板
+        let content_r = td_ui_ref_rect(self.window_size, 30.0, 148.0, 1860.0, 900.0);
+        if !content_r.contains(screen) {
+            self.gk_panel_visible = false;
         }
     }
 
