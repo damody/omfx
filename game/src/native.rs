@@ -1959,16 +1959,20 @@ struct GkPanelUi {
     close_bg: Handle<UiNode>,
     close_text: Handle<Text>,
     close_rect: UiRect,
-    /// 每個知識節點的卡片：(背景, 標題文字, KP 文字, 解鎖按鈕背景, 解鎖按鈕文字)
-    node_cards: Vec<(Handle<UiNode>, Handle<Text>, Handle<Text>, Handle<UiNode>, Handle<Text>)>,
+    /// 每個知識節點的卡片：(背景, 標題文字, KP 文字, 解鎖按鈕背景, 解鎖按鈕文字, 說明文字)
+    node_cards: Vec<(Handle<UiNode>, Handle<Text>, Handle<Text>, Handle<UiNode>, Handle<Text>, Handle<Text>)>,
     /// 每個解鎖按鈕的 hit-test rect（與 node_cards 對齊）。
     unlock_rects: Vec<UiRect>,
     /// 每個卡片對應的節點 id。
     node_ids: Vec<String>,
     /// 每個卡片的 KP 費用（與 node_ids 對齊）。
     node_kp_costs: Vec<u32>,
-    /// 每��卡片的 category（與 node_ids 對齊）。
+    /// 每個卡片的 category（與 node_ids 對齊）。
     node_categories: Vec<String>,
+    /// 每個卡片的中文短名稱（與 node_ids 對齊）。
+    node_labels: Vec<String>,
+    /// 每個卡片的效果說明（與 node_ids 對齊）。
+    node_descs: Vec<String>,
     /// 各 category 的 section header 背景（與 cat_names 對齊）。
     cat_header_bgs: Vec<Handle<UiNode>>,
     /// 各 category 的 section header 文字（與 cat_names 對齊）。
@@ -16979,11 +16983,11 @@ impl Game {
                 ui.send(panel.kp_text, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.close_bg, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.close_text, WidgetMessage::DesiredPosition(hidden));
-                for (card_bg, name_t, kp_t, btn_bg, btn_t) in &panel.node_cards {
+                for (card_bg, name_t, kp_t, btn_bg, btn_t, desc_t) in &panel.node_cards {
                     for h in [*card_bg, *btn_bg] {
                         ui.send(h, WidgetMessage::DesiredPosition(hidden));
                     }
-                    for h in [*name_t, *kp_t, *btn_t] {
+                    for h in [*name_t, *kp_t, *btn_t, *desc_t] {
                         ui.send(h, WidgetMessage::DesiredPosition(hidden));
                     }
                 }
@@ -17005,7 +17009,7 @@ impl Game {
         if !panel.built {
             // 載入節點清單
             let tree_path = PathBuf::from("scripts/lua_data/knowledge_tree.json");
-            let nodes: Vec<(String, String, u32, Vec<String>)> = // (id, category, kp_cost, requires)
+            let nodes: Vec<(String, String, u32, Vec<String>, String, String)> = // (id, category, kp_cost, requires, label, desc)
                 std::fs::read_to_string(&tree_path)
                     .ok()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -17020,7 +17024,9 @@ impl Game {
                             .and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|r| r.as_str().map(|s| s.to_string())).collect())
                             .unwrap_or_default();
-                        (id, cat, cost, reqs)
+                        let label = n.get("label").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+                        let desc = n.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        (id, cat, cost, reqs, label, desc)
                     })
                     .collect();
 
@@ -17108,13 +17114,15 @@ impl Game {
             panel.node_ids.clear();
             panel.node_kp_costs.clear();
             panel.node_categories.clear();
+            panel.node_labels.clear();
+            panel.node_descs.clear();
             panel.node_cards.clear();
             panel.unlock_rects.clear();
             panel.cat_header_bgs.clear();
             panel.cat_header_texts.clear();
             panel.cat_names.clear();
 
-            for (id, cat, cost, _reqs) in &nodes {
+            for (id, cat, cost, _reqs, label, desc) in &nodes {
                 let card_bg = BorderBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(hidden)
@@ -17131,8 +17139,8 @@ impl Game {
                         .with_desired_position(hidden)
                         .with_foreground(Brush::Solid(Color::from_rgba(240, 240, 255, 255)).into()),
                 )
-                .with_text(id.clone())
-                .with_font_size(18.0.into())
+                .with_text(label.clone())
+                .with_font_size(20.0.into())
                 .with_wrap(WrapMode::Word)
                 .build(&mut ui.build_ctx());
 
@@ -17144,6 +17152,16 @@ impl Game {
                 .with_text(String::new())
                 .with_font_size(16.0.into())
                 .with_horizontal_text_alignment(HorizontalAlignment::Right)
+                .build(&mut ui.build_ctx());
+
+                let desc_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(190, 210, 230, 220)).into()),
+                )
+                .with_text(desc.clone())
+                .with_font_size(14.0.into())
+                .with_wrap(WrapMode::Word)
                 .build(&mut ui.build_ctx());
 
                 let btn_bg = BorderBuilder::new(
@@ -17178,23 +17196,25 @@ impl Game {
                 .with_vertical_text_alignment(VerticalAlignment::Center)
                 .build(&mut ui.build_ctx());
 
-                panel.node_cards.push((card_bg, name_text, kp_text, btn_bg, btn_text));
+                panel.node_cards.push((card_bg, name_text, kp_text, btn_bg, btn_text, desc_text));
                 panel.node_ids.push(id.clone());
                 panel.node_kp_costs.push(*cost);
                 panel.node_categories.push(cat.clone());
+                panel.node_labels.push(label.clone());
+                panel.node_descs.push(desc.clone());
                 panel.unlock_rects.push(UiRect::default());
             }
 
             // Category section headers（依 JSON 出現順序，去重）
-            for (_, cat, _, _) in &nodes {
+            for (_, cat, _, _, _, _) in &nodes {
                 if !panel.cat_names.contains(cat) {
                     panel.cat_names.push(cat.clone());
                 }
             }
             for cat_name in &panel.cat_names.clone() {
                 let total_kp: u32 = nodes.iter()
-                    .filter(|(_, c, _, _)| c == cat_name)
-                    .map(|(_, _, kp, _)| *kp)
+                    .filter(|(_, c, _, _, _, _)| c == cat_name)
+                    .map(|(_, _, kp, _, _, _)| *kp)
                     .sum();
                 let display = gk_cat_display_name(cat_name);
                 let hdr_bg = BorderBuilder::new(
@@ -17263,8 +17283,8 @@ impl Game {
         const CARDS_PER_ROW: usize = 2;
         const CARD_W: f32 = 420.0;
         const CARD_COL_PITCH: f32 = 450.0;
-        const CARD_H: f32 = 88.0;
-        const CARD_ROW_PITCH: f32 = 100.0;
+        const CARD_H: f32 = 110.0;
+        const CARD_ROW_PITCH: f32 = 124.0;
         const HEADER_H: f32 = 32.0;
         const HEADER_TO_CARD: f32 = 6.0;
         const CAT_GAP: f32 = 12.0;
@@ -17274,6 +17294,8 @@ impl Game {
         let node_ids_snap: Vec<String> = panel.node_ids.clone();
         let node_kp_snap: Vec<u32> = panel.node_kp_costs.clone();
         let node_cat_snap: Vec<String> = panel.node_categories.clone();
+        let node_labels_snap: Vec<String> = panel.node_labels.clone();
+        let node_descs_snap: Vec<String> = panel.node_descs.clone();
         let cat_names_snap: Vec<String> = panel.cat_names.clone();
         drop(panel);
 
@@ -17322,7 +17344,7 @@ impl Game {
             let card_r = rr(x, y, CARD_W, CARD_H);
             let is_unlocked = self.gk_unlocked_nodes.contains(node_id.as_str());
 
-            let (card_bg, name_t, kp_t, btn_bg, btn_t) = self.gk_panel_ui.node_cards[i];
+            let (card_bg, name_t, kp_t, btn_bg, btn_t, desc_t) = self.gk_panel_ui.node_cards[i];
             send_rect(ui, card_bg, card_r);
             ui.send(
                 card_bg,
@@ -17335,10 +17357,17 @@ impl Game {
                 ),
             );
 
-            // 節點名稱（左半部）
-            let name_r = rr(x + 8.0, y + 4.0, CARD_W * 0.55, CARD_H - 8.0);
+            // label（左半部上方，較大字）
+            let label = node_labels_snap.get(i).map(|s| s.as_str()).unwrap_or(node_id.as_str());
+            let name_r = rr(x + 8.0, y + 4.0, CARD_W * 0.55, 40.0);
             send_rect_text(ui, name_t, name_r);
-            ui.send(name_t, TextMessage::Text(node_id.clone()));
+            ui.send(name_t, TextMessage::Text(label.to_string()));
+
+            // description（左半部下方，較小字）
+            let desc = node_descs_snap.get(i).map(|s| s.as_str()).unwrap_or("");
+            let desc_r = rr(x + 8.0, y + 48.0, CARD_W * 0.55, 28.0);
+            send_rect_text(ui, desc_t, desc_r);
+            ui.send(desc_t, TextMessage::Text(desc.to_string()));
 
             // KP 費用標籤（右上）
             let kp_info_r = rr(x + CARD_W * 0.57, y + 4.0, CARD_W * 0.4, 34.0);
