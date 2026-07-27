@@ -12680,11 +12680,7 @@ impl Game {
                 Color::from_rgba(250, 185, 30, 255),
             ),
         ];
-        for (i, (label, rect, action, active, color)) in nav.into_iter().enumerate() {
-            // nav[2] は「知識」ボタン → 英雄知識面板入口
-            if i == 2 {
-                self.gk_panel_ui.entry_rect = rect;
-            }
+        for (label, rect, action, active, color) in nav {
             self.place_pregame_node(
                 ui,
                 node_index,
@@ -12697,6 +12693,21 @@ impl Game {
                 Color::from_rgba(255, 255, 255, 255),
             );
         }
+
+        // 英雄知識入口按鈕（右上角，對稱頭像入口）
+        let gk_r = pregame_ref_rect(self.window_size, 1758.0, 20.0, 260.0, 92.0);
+        self.gk_panel_ui.entry_rect = gk_r;
+        self.place_pregame_node(
+            ui,
+            node_index,
+            gk_r,
+            "英雄知識".to_string(),
+            false, // 點擊由 handle_pregame_click 的 entry_rect 攔截，不加入 pregame_button_rects
+            pregame::PregameAction::NoOp,
+            PregameVisualRole::Button,
+            Color::from_rgba(180, 140, 60, 255),
+            Color::from_rgba(255, 240, 180, 255),
+        );
     }
 
     fn layout_pregame_difficulty(&mut self, ui: &mut UserInterface, node_index: &mut usize) {
