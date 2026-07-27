@@ -6244,6 +6244,10 @@ impl Plugin for Game {
         if self.pregame_runtime.is_pregame() {
             let ui = context.user_interfaces.first_mut();
             self.update_pregame_ui(ui);
+            // 遊戲結束返回選單時，需確保 GK 面板 widget 被收起（gk_panel_visible 已被
+            // reset_session_state 設為 false，但 update_gk_panel 只在 in-game 路徑執行；
+            // 在 pregame 路徑同樣呼叫一次，讓 hide 路徑能把 widget 移回隱藏位置）。
+            self.update_gk_panel(ui);
             drop(frame_span);
             return Ok(());
         }
