@@ -1947,6 +1947,16 @@ struct TdTowerShopCard {
     price_text: Handle<Text>,
 }
 
+#[derive(Default, Debug)]
+struct GkNodeUi {
+    halo: Handle<UiNode>,
+    ring: Handle<UiNode>,
+    face: Handle<UiNode>,
+    symbol_text: Handle<Text>,
+    label_text: Handle<Text>,
+    kp_text: Handle<Text>,
+}
+
 /// 英雄知識面板 UI（全螢幕覆蓋面板）。
 #[derive(Default, Debug)]
 struct GkPanelUi {
@@ -1954,24 +1964,29 @@ struct GkPanelUi {
     visible_applied: bool,
     backdrop: Handle<UiNode>,
     bg: Handle<UiNode>,
+    header_banner: Handle<UiNode>,
     title: Handle<Text>,
     kp_text: Handle<Text>,
     close_bg: Handle<UiNode>,
     close_text: Handle<Text>,
     close_rect: UiRect,
-    /// 每個知識節點的卡片：(背景, 標題文字, KP 文字, 解鎖按鈕背景, 解鎖按鈕文字, 說明文字)
-    node_cards: Vec<(Handle<UiNode>, Handle<Text>, Handle<Text>, Handle<UiNode>, Handle<Text>, Handle<Text>)>,
-    /// 每個解鎖按鈕的 hit-test rect（與 node_cards 對齊）。
-    unlock_rects: Vec<UiRect>,
-    /// 每個卡片對應的節點 id。
+    /// 每個知識節點的圓形徽章部件。
+    node_cards: Vec<GkNodeUi>,
+    /// 每個知識節點的 hit-test rect（與 node_cards 對齊）。
+    node_rects: Vec<UiRect>,
+    /// 每個節點對應的前置節點 id。
+    node_requires: Vec<Vec<String>>,
+    /// 樹狀連線段，每個 requires 以 3 段直角線表示。
+    connector_lines: Vec<Handle<UiNode>>,
+    /// 每個節點對應的節點 id。
     node_ids: Vec<String>,
-    /// 每個卡片的 KP 費用（與 node_ids 對齊）。
+    /// 每個節點的 KP 費用（與 node_ids 對齊）。
     node_kp_costs: Vec<u32>,
-    /// 每個卡片的 category（與 node_ids 對齊）。
+    /// 每個節點的 category（與 node_ids 對齊）。
     node_categories: Vec<String>,
-    /// 每個卡片的中文短名稱（與 node_ids 對齊）。
+    /// 每個節點的中文短名稱（與 node_ids 對齊）。
     node_labels: Vec<String>,
-    /// 每個卡片的效果說明（與 node_ids 對齊）。
+    /// 每個節點的效果說明（與 node_ids 對齊）。
     node_descs: Vec<String>,
     /// 各 category 的 section header 背景（與 cat_names 對齊）。
     cat_header_bgs: Vec<Handle<UiNode>>,
@@ -1985,6 +2000,16 @@ struct GkPanelUi {
     entry_rect: UiRect,
     /// 面板底部的操作訊息（解鎖成功 / 失敗原因）。
     status_text: Handle<Text>,
+    bottom_bg: Handle<UiNode>,
+    bottom_icon_ring: Handle<UiNode>,
+    bottom_icon_face: Handle<UiNode>,
+    bottom_icon_text: Handle<Text>,
+    bottom_title: Handle<Text>,
+    bottom_desc: Handle<Text>,
+    bottom_cost_text: Handle<Text>,
+    bottom_unlock_bg: Handle<UiNode>,
+    bottom_unlock_text: Handle<Text>,
+    bottom_unlock_rect: UiRect,
     /// 啟用/停用加成的切換按鈕。
     toggle_bg: Handle<UiNode>,
     toggle_text: Handle<Text>,
@@ -4018,6 +4043,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     gk_panel_status: String,
+    /// 目前在英雄知識樹中選中的節點索引。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_selected_node_index: Option<usize>,
 }
 
 /// 技能詳細資訊（後端一次性廣播，用於 tooltip）
@@ -16962,7 +16991,7 @@ impl Game {
         // 更新前端快取
         self.gk_unlocked_nodes.insert(node_id.to_string());
         self.gk_available_kp = self.gk_available_kp.saturating_sub(kp_cost);
-        self.gk_panel_status = format!("已解鎖！剩餘 KP：{}", self.gk_available_kp.saturating_sub(kp_cost));
+        self.gk_panel_status = format!("已解鎖！剩餘 KP：{}", self.gk_available_kp);
         log::info!("[gk] unlocked '{}', remaining KP={}", node_id, self.gk_available_kp);
     }
 
@@ -16998,24 +17027,43 @@ impl Game {
             self.toggle_gk_knowledge_enabled();
             return;
         }
-        // 解鎖按鈕 hit-test
-        let rects: Vec<UiRect> = self.gk_panel_ui.unlock_rects.clone();
-        let ids: Vec<String> = self.gk_panel_ui.node_ids.clone();
-        for (i, rect) in rects.iter().enumerate() {
-            if rect.w > 0.0 && rect.contains(screen) {
-                if let Some(node_id) = ids.get(i) {
-                    if !self.gk_unlocked_nodes.contains(node_id) {
-                        let id = node_id.clone();
-                        self.try_unlock_gk_node(&id);
+        // 底部解鎖按鈕 hit-test
+        let unlock_r = self.gk_panel_ui.bottom_unlock_rect;
+        if unlock_r.w > 0.0 && unlock_r.contains(screen) {
+            if let Some(i) = self.gk_selected_node_index {
+                if let Some(node_id) = self.gk_panel_ui.node_ids.get(i).cloned() {
+                    if !self.gk_unlocked_nodes.contains(&node_id) {
+                        self.try_unlock_gk_node(&node_id);
                     } else {
                         self.gk_panel_status = "節點已解鎖".to_string();
                     }
+                }
+            }
+            return;
+        }
+        // 節點 hit-test：先選取，再由底部牌匾顯示購買狀態。
+        let rects: Vec<UiRect> = self.gk_panel_ui.node_rects.clone();
+        for (i, rect) in rects.iter().enumerate() {
+            if rect.w > 0.0 && rect.contains(screen) {
+                self.gk_selected_node_index = Some(i);
+                if let Some(node_id) = self.gk_panel_ui.node_ids.get(i) {
+                    let label = self
+                        .gk_panel_ui
+                        .node_labels
+                        .get(i)
+                        .map(|s| s.as_str())
+                        .unwrap_or(node_id.as_str());
+                    self.gk_panel_status = if self.gk_unlocked_nodes.contains(node_id) {
+                        format!("{} 已解鎖", label)
+                    } else {
+                        format!("已選取：{}", label)
+                    };
                 }
                 return;
             }
         }
         // 點擊主內容框外的 backdrop 區域 → 關閉面板
-        let content_r = td_ui_ref_rect(self.window_size, 30.0, 148.0, 1860.0, 900.0);
+        let content_r = td_ui_ref_rect(self.window_size, 0.0, 92.0, 1920.0, 938.0);
         if !content_r.contains(screen) {
             self.gk_panel_visible = false;
         }
@@ -17025,15 +17073,33 @@ impl Game {
     fn update_gk_panel(&mut self, ui: &mut UserInterface) {
         fn gk_cat_display_name(cat: &str) -> &'static str {
             match cat {
-                "tower_dart"      => "飛鏢塔",
-                "tower_bomb"      => "炸彈塔",
-                "tower_ice"       => "冰晶塔",
-                "tower_tack"      => "圖釘塔",
-                "tower_boomerang" => "迴旋鏢塔",
-                "tower_arty"      => "砲兵塔",
-                "hero"            => "英雄",
-                "global"          => "全域",
-                _                 => "其他",
+                "tower_dart" => "飛鏢",
+                "tower_bomb" => "炸彈",
+                "tower_ice" => "冰晶",
+                "tower_tack" => "圖釘",
+                "tower_boomerang" => "迴旋鏢",
+                "tower_arty" => "砲兵",
+                "hero" => "英雄",
+                "global" => "全域",
+                _ => "其他",
+            }
+        }
+        fn gk_node_symbol(cat: &str, label: &str, desc: &str) -> &'static str {
+            let hay = format!("{} {}", label, desc);
+            if hay.contains("攻速") || hay.contains("間隔") {
+                "»"
+            } else if hay.contains("射程") || hay.contains("範圍") {
+                "◎"
+            } else if hay.contains("攻擊") || hay.contains("傷害") || hay.contains("爆炸") {
+                "✦"
+            } else {
+                match cat {
+                    "hero" => "★",
+                    "global" => "$",
+                    "tower_ice" => "❄",
+                    "tower_boomerang" => "↻",
+                    _ => "●",
+                }
             }
         }
         let panel = &mut self.gk_panel_ui;
@@ -17042,17 +17108,33 @@ impl Game {
                 let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
                 ui.send(panel.backdrop, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.header_banner, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.title, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.kp_text, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.close_bg, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.close_text, WidgetMessage::DesiredPosition(hidden));
-                for (card_bg, name_t, kp_t, btn_bg, btn_t, desc_t) in &panel.node_cards {
-                    for h in [*card_bg, *btn_bg] {
-                        ui.send(h, WidgetMessage::DesiredPosition(hidden));
-                    }
-                    for h in [*name_t, *kp_t, *btn_t, *desc_t] {
-                        ui.send(h, WidgetMessage::DesiredPosition(hidden));
-                    }
+                ui.send(panel.toggle_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.toggle_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.status_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_icon_ring, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_icon_face, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_icon_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_title, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_desc, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_cost_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_unlock_bg, WidgetMessage::DesiredPosition(hidden));
+                ui.send(panel.bottom_unlock_text, WidgetMessage::DesiredPosition(hidden));
+                for node in &panel.node_cards {
+                    ui.send(node.halo, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(node.ring, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(node.face, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(node.symbol_text, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(node.label_text, WidgetMessage::DesiredPosition(hidden));
+                    ui.send(node.kp_text, WidgetMessage::DesiredPosition(hidden));
+                }
+                for line in &panel.connector_lines {
+                    ui.send(*line, WidgetMessage::DesiredPosition(hidden));
                 }
                 for h in &panel.cat_header_bgs {
                     ui.send(*h, WidgetMessage::DesiredPosition(hidden));
@@ -17060,23 +17142,18 @@ impl Game {
                 for h in &panel.cat_header_texts {
                     ui.send(*h, WidgetMessage::DesiredPosition(hidden));
                 }
-                panel.unlock_rects.iter_mut().for_each(|r| *r = UiRect::default());
+                panel.node_rects.iter_mut().for_each(|r| *r = UiRect::default());
                 panel.close_rect = UiRect::default();
                 panel.toggle_rect = UiRect::default();
-                ui.send(panel.toggle_bg, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.toggle_text, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.status_text, WidgetMessage::DesiredPosition(hidden));
+                panel.bottom_unlock_rect = UiRect::default();
                 panel.visible_applied = false;
             }
             return;
         }
 
-        // 讀取 knowledge_tree.json（只在面板剛打開且未建置時讀取一次）
-        // 節點 id 列表由 built 路徑收集，後續 frame 直接用 node_ids 列表。
         if !panel.built {
-            // 載入節點清單
             let tree_path = PathBuf::from("scripts/lua_data/knowledge_tree.json");
-            let nodes: Vec<(String, String, u32, Vec<String>, String, String)> = // (id, category, kp_cost, requires, label, desc)
+            let nodes: Vec<(String, String, u32, Vec<String>, String, String)> =
                 std::fs::read_to_string(&tree_path)
                     .ok()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -17085,125 +17162,157 @@ impl Game {
                     .iter()
                     .map(|n| {
                         let id = n.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                        let cat = n.get("category").and_then(|v| v.as_str()).unwrap_or("global").to_string();
+                        let cat = n
+                            .get("category")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("global")
+                            .to_string();
                         let cost = n.get("kp_cost").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        let reqs: Vec<String> = n.get("requires")
+                        let reqs: Vec<String> = n
+                            .get("requires")
                             .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter().filter_map(|r| r.as_str().map(|s| s.to_string())).collect())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|r| r.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         let label = n.get("label").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-                        let desc = n.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let desc = n
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         (id, cat, cost, reqs, label, desc)
                     })
                     .collect();
 
+            fn make_gk_panel_border(
+                ui: &mut UserInterface,
+                hidden: Vector2<f32>,
+                color: Color,
+                stroke: Color,
+                radius: f32,
+            ) -> Handle<UiNode> {
+                BorderBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_background(Brush::Solid(color).into())
+                        .with_foreground(Brush::Solid(stroke).into()),
+                )
+                .with_stroke_thickness(Thickness::uniform(3.0).into())
+                .with_corner_radius(radius.into())
+                .build(&mut ui.build_ctx())
+                .transmute()
+            }
             let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
 
-            // 全螢幕深藍 backdrop
             panel.backdrop = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
-                    .with_background(Brush::Solid(Color::from_rgba(16, 28, 58, 245)).into()),
+                    .with_background(Brush::Solid(Color::from_rgba(82, 30, 92, 248)).into()),
             )
             .with_stroke_thickness(Thickness::uniform(0.0).into())
             .build(&mut ui.build_ctx())
             .transmute();
-
-            // 中央容器（亮藍灰）
-            panel.bg = BorderBuilder::new(
+            panel.bg = make_gk_panel_border(
+                ui,
+                hidden,
+                Color::from_rgba(145, 62, 154, 180),
+                Color::from_rgba(96, 38, 104, 220),
+                0.0,
+            );
+            panel.header_banner = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
-                    .with_background(Brush::Solid(Color::from_rgba(150, 172, 212, 255)).into()),
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 80.0),
+                            stops: vec![
+                                GradientPoint { stop: 0.0, color: Color::from_rgba(156, 94, 45, 255) },
+                                GradientPoint { stop: 1.0, color: Color::from_rgba(116, 68, 32, 255) },
+                            ],
+                        }
+                        .into(),
+                    )
+                    .with_foreground(Brush::Solid(Color::from_rgba(104, 61, 29, 255)).into()),
             )
-            .with_stroke_thickness(Thickness::uniform(0.0).into())
-            .with_corner_radius(18.0_f32.into())
+            .with_stroke_thickness(Thickness::uniform(5.0).into())
+            .with_corner_radius(14.0_f32.into())
             .build(&mut ui.build_ctx())
             .transmute();
-
-            // 標題（棕色橫幅文字）
             panel.title = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
-                    .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 150, 255)).into()),
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
             )
             .with_text("英雄知識".to_string())
-            .with_font_size(44.0.into())
+            .with_font_size(46.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
-
-            // KP 顯示
             panel.kp_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
-                    .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 80, 255)).into()),
+                    .with_foreground(Brush::Solid(Color::from_rgba(170, 255, 90, 255)).into()),
             )
-            .with_text(format!("KP: {}", self.gk_available_kp))
+            .with_text(String::new())
             .with_font_size(28.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Right)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
-
-            // 關閉按鈕
             panel.close_bg = BorderBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
-                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
                     .with_background(
                         Brush::LinearGradient {
                             from: Vector2::new(0.0, 0.0),
-                            to: Vector2::new(0.0, 58.0),
+                            to: Vector2::new(0.0, 60.0),
                             stops: vec![
-                                GradientPoint { stop: 0.0, color: Color::from_rgba(220, 80, 60, 255) },
-                                GradientPoint { stop: 1.0, color: Color::from_rgba(160, 40, 30, 255) },
+                                GradientPoint { stop: 0.0, color: Color::from_rgba(64, 215, 255, 255) },
+                                GradientPoint { stop: 1.0, color: Color::from_rgba(20, 135, 220, 255) },
                             ],
                         }
                         .into(),
-                    ),
+                    )
+                    .with_foreground(Brush::Solid(Color::from_rgba(235, 255, 255, 255)).into()),
             )
-            .with_stroke_thickness(Thickness::uniform(2.0).into())
-            .with_corner_radius(12.0_f32.into())
+            .with_stroke_thickness(Thickness::uniform(3.0).into())
+            .with_corner_radius(13.0_f32.into())
             .build(&mut ui.build_ctx())
             .transmute();
-
             panel.close_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
                     .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
             )
-            .with_text("✕".to_string())
-            .with_font_size(36.0.into())
+            .with_text("<".to_string())
+            .with_font_size(42.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
-
-            // 啟用/停用切換按鈕
-            panel.toggle_bg = BorderBuilder::new(
-                WidgetBuilder::new()
-                    .with_desired_position(hidden)
-                    .with_background(Brush::Solid(Color::from_rgba(40, 160, 80, 255)).into()),
-            )
-            .with_stroke_thickness(Thickness::uniform(2.0).into())
-            .with_corner_radius(10.0_f32.into())
-            .build(&mut ui.build_ctx())
-            .transmute();
-
+            panel.toggle_bg = make_gk_panel_border(
+                ui,
+                hidden,
+                Color::from_rgba(46, 166, 84, 255),
+                Color::from_rgba(232, 255, 210, 255),
+                12.0,
+            );
             panel.toggle_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
                     .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
             )
             .with_text(String::new())
-            .with_font_size(22.0.into())
+            .with_font_size(21.0.into())
             .with_horizontal_text_alignment(HorizontalAlignment::Center)
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
-
-            // 狀態訊息（解鎖結果 / 錯誤提示）
             panel.status_text = TextBuilder::new(
                 WidgetBuilder::new()
                     .with_desired_position(hidden)
-                    .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 80, 255)).into()),
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 230, 110, 255)).into()),
             )
             .with_text(String::new())
             .with_font_size(22.0.into())
@@ -17211,140 +17320,230 @@ impl Game {
             .with_vertical_text_alignment(VerticalAlignment::Center)
             .build(&mut ui.build_ctx());
 
-            // 為每個節點建立卡片
+            panel.bottom_bg = make_gk_panel_border(
+                ui,
+                hidden,
+                Color::from_rgba(190, 137, 76, 255),
+                Color::from_rgba(132, 77, 34, 255),
+                14.0,
+            );
+            panel.bottom_icon_ring = make_gk_panel_border(
+                ui,
+                hidden,
+                Color::from_rgba(222, 232, 228, 255),
+                Color::from_rgba(88, 75, 70, 255),
+                999.0,
+            );
+            panel.bottom_icon_face = make_gk_panel_border(
+                ui,
+                hidden,
+                Color::from_rgba(20, 118, 160, 255),
+                Color::from_rgba(5, 70, 105, 255),
+                999.0,
+            );
+            panel.bottom_icon_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(190, 245, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(48.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            panel.bottom_title = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(30.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            panel.bottom_desc = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(70, 34, 18, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(28.0.into())
+            .with_wrap(WrapMode::Word)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            panel.bottom_cost_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(80, 34, 16, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(22.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Right)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+            panel.bottom_unlock_bg = BorderBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_background(
+                        Brush::LinearGradient {
+                            from: Vector2::new(0.0, 0.0),
+                            to: Vector2::new(0.0, 54.0),
+                            stops: vec![
+                                GradientPoint { stop: 0.0, color: Color::from_rgba(126, 228, 70, 255) },
+                                GradientPoint { stop: 1.0, color: Color::from_rgba(50, 164, 34, 255) },
+                            ],
+                        }
+                        .into(),
+                    )
+                    .with_foreground(Brush::Solid(Color::from_rgba(235, 255, 210, 255)).into()),
+            )
+            .with_stroke_thickness(Thickness::uniform(3.0).into())
+            .with_corner_radius(12.0_f32.into())
+            .build(&mut ui.build_ctx())
+            .transmute();
+            panel.bottom_unlock_text = TextBuilder::new(
+                WidgetBuilder::new()
+                    .with_desired_position(hidden)
+                    .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
+            )
+            .with_text(String::new())
+            .with_font_size(24.0.into())
+            .with_horizontal_text_alignment(HorizontalAlignment::Center)
+            .with_vertical_text_alignment(VerticalAlignment::Center)
+            .build(&mut ui.build_ctx());
+
             panel.node_ids.clear();
             panel.node_kp_costs.clear();
             panel.node_categories.clear();
             panel.node_labels.clear();
             panel.node_descs.clear();
+            panel.node_requires.clear();
             panel.node_cards.clear();
-            panel.unlock_rects.clear();
+            panel.node_rects.clear();
+            panel.connector_lines.clear();
             panel.cat_header_bgs.clear();
             panel.cat_header_texts.clear();
             panel.cat_names.clear();
 
-            for (id, cat, cost, _reqs, label, desc) in &nodes {
-                let card_bg = BorderBuilder::new(
+            let connector_count: usize = nodes.iter().map(|(_, _, _, reqs, _, _)| reqs.len()).sum();
+            for _ in 0..connector_count * 3 {
+                let line = BorderBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(hidden)
-                        .with_background(Brush::Solid(Color::from_rgba(100, 120, 170, 230)).into())
-                        .with_foreground(Brush::Solid(Color::from_rgba(180, 200, 240, 255)).into()),
+                        .with_background(Brush::Solid(Color::from_rgba(29, 21, 42, 255)).into()),
                 )
-                .with_stroke_thickness(Thickness::uniform(2.0).into())
-                .with_corner_radius(10.0_f32.into())
+                .with_stroke_thickness(Thickness::uniform(0.0).into())
+                .with_corner_radius(5.0_f32.into())
                 .build(&mut ui.build_ctx())
                 .transmute();
+                panel.connector_lines.push(line);
+            }
 
-                let name_text = TextBuilder::new(
+            for (id, cat, cost, reqs, label, desc) in &nodes {
+                if !panel.cat_names.contains(cat) {
+                    panel.cat_names.push(cat.clone());
+                }
+                let halo = make_gk_panel_border(
+                    ui,
+                    hidden,
+                    Color::from_rgba(95, 255, 30, 0),
+                    Color::from_rgba(95, 255, 30, 0),
+                    999.0,
+                );
+                let ring = make_gk_panel_border(
+                    ui,
+                    hidden,
+                    Color::from_rgba(116, 133, 138, 255),
+                    Color::from_rgba(62, 70, 76, 255),
+                    999.0,
+                );
+                let face = make_gk_panel_border(
+                    ui,
+                    hidden,
+                    Color::from_rgba(54, 78, 86, 255),
+                    Color::from_rgba(30, 38, 44, 255),
+                    999.0,
+                );
+                let symbol_text = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(hidden)
-                        .with_foreground(Brush::Solid(Color::from_rgba(240, 240, 255, 255)).into()),
+                        .with_foreground(Brush::Solid(Color::from_rgba(190, 214, 216, 255)).into()),
                 )
-                .with_text(label.clone())
-                .with_font_size(20.0.into())
-                .with_wrap(WrapMode::Word)
-                .build(&mut ui.build_ctx());
-
-                let kp_text = TextBuilder::new(
-                    WidgetBuilder::new()
-                        .with_desired_position(hidden)
-                        .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 60, 255)).into()),
-                )
-                .with_text(String::new())
-                .with_font_size(16.0.into())
-                .with_horizontal_text_alignment(HorizontalAlignment::Right)
-                .build(&mut ui.build_ctx());
-
-                let desc_text = TextBuilder::new(
-                    WidgetBuilder::new()
-                        .with_desired_position(hidden)
-                        .with_foreground(Brush::Solid(Color::from_rgba(190, 210, 230, 220)).into()),
-                )
-                .with_text(desc.clone())
-                .with_font_size(14.0.into())
-                .with_wrap(WrapMode::Word)
-                .build(&mut ui.build_ctx());
-
-                let btn_bg = BorderBuilder::new(
-                    WidgetBuilder::new()
-                        .with_desired_position(hidden)
-                        .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into())
-                        .with_background(
-                            Brush::LinearGradient {
-                                from: Vector2::new(0.0, 0.0),
-                                to: Vector2::new(0.0, 32.0),
-                                stops: vec![
-                                    GradientPoint { stop: 0.0, color: Color::from_rgba(95, 200, 250, 255) },
-                                    GradientPoint { stop: 1.0, color: Color::from_rgba(35, 130, 215, 255) },
-                                ],
-                            }
-                            .into(),
-                        ),
-                )
-                .with_stroke_thickness(Thickness::uniform(2.0).into())
-                .with_corner_radius(8.0_f32.into())
-                .build(&mut ui.build_ctx())
-                .transmute();
-
-                let btn_text = TextBuilder::new(
-                    WidgetBuilder::new()
-                        .with_desired_position(hidden)
-                        .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
-                )
-                .with_text("解鎖".to_string())
-                .with_font_size(16.0.into())
+                .with_text(gk_node_symbol(cat, label, desc).to_string())
+                .with_font_size(42.0.into())
                 .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .with_vertical_text_alignment(VerticalAlignment::Center)
                 .build(&mut ui.build_ctx());
-
-                panel.node_cards.push((card_bg, name_text, kp_text, btn_bg, btn_text, desc_text));
+                let label_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(255, 244, 214, 255)).into()),
+                )
+                .with_text(label.clone())
+                .with_font_size(16.0.into())
+                .with_wrap(WrapMode::Word)
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                let kp_text = TextBuilder::new(
+                    WidgetBuilder::new()
+                        .with_desired_position(hidden)
+                        .with_foreground(Brush::Solid(Color::from_rgba(170, 255, 90, 255)).into()),
+                )
+                .with_text(String::new())
+                .with_font_size(14.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
+                .with_vertical_text_alignment(VerticalAlignment::Center)
+                .build(&mut ui.build_ctx());
+                panel.node_cards.push(GkNodeUi {
+                    halo,
+                    ring,
+                    face,
+                    symbol_text,
+                    label_text,
+                    kp_text,
+                });
                 panel.node_ids.push(id.clone());
                 panel.node_kp_costs.push(*cost);
                 panel.node_categories.push(cat.clone());
                 panel.node_labels.push(label.clone());
                 panel.node_descs.push(desc.clone());
-                panel.unlock_rects.push(UiRect::default());
+                panel.node_requires.push(reqs.clone());
+                panel.node_rects.push(UiRect::default());
             }
 
-            // Category section headers（依 JSON 出現順序，去重）
-            for (_, cat, _, _, _, _) in &nodes {
-                if !panel.cat_names.contains(cat) {
-                    panel.cat_names.push(cat.clone());
-                }
-            }
-            for cat_name in &panel.cat_names.clone() {
-                let total_kp: u32 = nodes.iter()
-                    .filter(|(_, c, _, _, _, _)| c == cat_name)
-                    .map(|(_, _, kp, _, _, _)| *kp)
-                    .sum();
-                let display = gk_cat_display_name(cat_name);
-                let hdr_bg = BorderBuilder::new(
-                    WidgetBuilder::new()
-                        .with_desired_position(hidden)
-                        .with_background(Brush::Solid(Color::from_rgba(30, 50, 110, 220)).into())
-                        .with_foreground(Brush::Solid(Color::from_rgba(80, 110, 180, 255)).into()),
-                )
-                .with_stroke_thickness(Thickness::uniform(2.0).into())
-                .with_corner_radius(8.0_f32.into())
-                .build(&mut ui.build_ctx())
-                .transmute();
+            for cat_name in panel.cat_names.clone() {
+                let hdr_bg = make_gk_panel_border(
+                    ui,
+                    hidden,
+                    Color::from_rgba(75, 38, 92, 205),
+                    Color::from_rgba(162, 102, 190, 230),
+                    8.0,
+                );
                 let hdr_txt = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(hidden)
-                        .with_foreground(Brush::Solid(Color::from_rgba(255, 220, 80, 255)).into()),
+                        .with_foreground(Brush::Solid(Color::from_rgba(248, 234, 255, 255)).into()),
                 )
-                .with_text(format!("{}  ── 解鎖全部需 {} KP", display, total_kp))
-                .with_font_size(22.0.into())
+                .with_text(gk_cat_display_name(&cat_name).to_string())
+                .with_font_size(19.0.into())
+                .with_horizontal_text_alignment(HorizontalAlignment::Center)
                 .with_vertical_text_alignment(VerticalAlignment::Center)
                 .build(&mut ui.build_ctx());
                 panel.cat_header_bgs.push(hdr_bg);
                 panel.cat_header_texts.push(hdr_txt);
             }
-
             panel.built = true;
         }
 
-        // ──── 每 frame 佈局 ────
+        if self.gk_selected_node_index.map_or(true, |i| i >= panel.node_ids.len()) {
+            let first_locked = panel
+                .node_ids
+                .iter()
+                .position(|id| !self.gk_unlocked_nodes.contains(id));
+            self.gk_selected_node_index = first_locked.or_else(|| (!panel.node_ids.is_empty()).then_some(0));
+        }
+
         let ws = self.window_size;
         let rr = |x: f32, y: f32, w: f32, h: f32| td_ui_ref_rect(ws, x, y, w, h);
         let send_rect = |ui: &mut UserInterface, h: Handle<UiNode>, r: UiRect| {
@@ -17357,156 +17556,279 @@ impl Game {
             ui.send(h, WidgetMessage::Width(r.w));
             ui.send(h, WidgetMessage::Height(r.h));
         };
+        let hidden_rect = UiRect {
+            x: UI_HIDDEN_POS,
+            y: UI_HIDDEN_POS,
+            w: 1.0,
+            h: 1.0,
+        };
 
-        // 全螢幕 backdrop + 中央容器
         send_rect(ui, panel.backdrop, rr(0.0, 0.0, TD_UI_REF_W, TD_UI_REF_H));
-        send_rect(ui, panel.bg, rr(30.0, 148.0, 1860.0, 900.0));
+        send_rect(ui, panel.bg, rr(0.0, 92.0, TD_UI_REF_W, 720.0));
+        send_rect(ui, panel.header_banner, rr(520.0, 0.0, 880.0, 86.0));
+        send_rect_text(ui, panel.title, rr(520.0, 0.0, 880.0, 86.0));
 
-        // 標題橫幅
-        send_rect_text(ui, panel.title, rr(710.0, 10.0, 500.0, 80.0));
+        panel.close_rect = rr(32.0, 16.0, 72.0, 62.0);
+        send_rect(ui, panel.close_bg, panel.close_rect);
+        send_rect_text(ui, panel.close_text, panel.close_rect);
 
-        // KP 顯示（右上角）
-        let kp_str = format!("可用 KP: {}", self.gk_available_kp);
-        ui.send(panel.kp_text, TextMessage::Text(kp_str));
-        send_rect_text(ui, panel.kp_text, rr(1400.0, 16.0, 440.0, 60.0));
-
-        // 關閉按鈕（左上角）
-        let close_r = rr(44.0, 16.0, 70.0, 60.0);
-        panel.close_rect = close_r;
-        send_rect(ui, panel.close_bg, close_r);
-        send_rect_text(ui, panel.close_text, close_r);
-
-        // 啟用/停用切換按鈕（KP 顯示左側）
-        let toggle_r = rr(130.0, 16.0, 220.0, 60.0);
-        panel.toggle_rect = toggle_r;
+        panel.toggle_rect = rr(118.0, 20.0, 210.0, 54.0);
         let (toggle_label, toggle_bg_color) = if self.gk_knowledge_enabled {
-            ("加成：啟用 ✓", Color::from_rgba(40, 160, 80, 255))
+            ("加成啟用", Color::from_rgba(56, 178, 86, 255))
         } else {
-            ("加成：停用 ✗", Color::from_rgba(160, 60, 40, 255))
+            ("加成停用", Color::from_rgba(176, 72, 52, 255))
         };
         ui.send(panel.toggle_bg, WidgetMessage::Background(Brush::Solid(toggle_bg_color).into()));
-        send_rect(ui, panel.toggle_bg, toggle_r);
-        send_rect_text(ui, panel.toggle_text, toggle_r);
+        send_rect(ui, panel.toggle_bg, panel.toggle_rect);
+        send_rect_text(ui, panel.toggle_text, panel.toggle_rect);
         ui.send(panel.toggle_text, TextMessage::Text(toggle_label.to_string()));
 
-        // 狀態訊息（面板底部中央）
-        let status_r = rr(360.0, 16.0, 1000.0, 60.0);
-        send_rect_text(ui, panel.status_text, status_r);
+        ui.send(panel.kp_text, TextMessage::Text(format!("KP {}", self.gk_available_kp)));
+        send_rect_text(ui, panel.kp_text, rr(1510.0, 18.0, 330.0, 56.0));
+        send_rect_text(ui, panel.status_text, rr(360.0, 736.0, 1200.0, 48.0));
         ui.send(panel.status_text, TextMessage::Text(self.gk_panel_status.clone()));
 
-        // ── 2 欄 Category 版面 ──
-        // 左欄（cat idx 0..4）/ 右欄（cat idx 4+），每欄 2 張卡片並排
-        const CAT_COL_LEFT_X: f32 = 50.0;
-        const CAT_COL_RIGHT_X: f32 = 980.0;
-        const CAT_COL_W: f32 = 900.0;
-        const CARDS_PER_ROW: usize = 2;
-        const CARD_W: f32 = 420.0;
-        const CARD_COL_PITCH: f32 = 450.0;
-        const CARD_H: f32 = 110.0;
-        const CARD_ROW_PITCH: f32 = 124.0;
-        const HEADER_H: f32 = 32.0;
-        const HEADER_TO_CARD: f32 = 6.0;
-        const CAT_GAP: f32 = 12.0;
-        const CAT_START_Y: f32 = 108.0;
+        let node_ids_snap = panel.node_ids.clone();
+        let node_kp_snap = panel.node_kp_costs.clone();
+        let node_cat_snap = panel.node_categories.clone();
+        let node_labels_snap = panel.node_labels.clone();
+        let node_descs_snap = panel.node_descs.clone();
+        let node_requires_snap = panel.node_requires.clone();
+        let cat_names_snap = panel.cat_names.clone();
 
-        // Snapshot：避免後續 borrow 衝突
-        let node_ids_snap: Vec<String> = panel.node_ids.clone();
-        let node_kp_snap: Vec<u32> = panel.node_kp_costs.clone();
-        let node_cat_snap: Vec<String> = panel.node_categories.clone();
-        let node_labels_snap: Vec<String> = panel.node_labels.clone();
-        let node_descs_snap: Vec<String> = panel.node_descs.clone();
-        let cat_names_snap: Vec<String> = panel.cat_names.clone();
-        drop(panel);
-
-        // 計算各 category 在各欄的 Y 起始位置並佈局 header
-        let mut left_y = CAT_START_Y;
-        let mut right_y = CAT_START_Y;
-        let mut cat_col_x: Vec<f32> = Vec::new();
-        let mut cat_start_y_vec: Vec<f32> = Vec::new();
-
-        for (cat_idx, cat_name) in cat_names_snap.iter().enumerate() {
-            let is_right = cat_idx >= 4;
-            let col_x = if is_right { CAT_COL_RIGHT_X } else { CAT_COL_LEFT_X };
-            let y = if is_right { right_y } else { left_y };
-            cat_col_x.push(col_x);
-            cat_start_y_vec.push(y);
-
-            let hdr_r = rr(col_x, y, CAT_COL_W, HEADER_H);
-            send_rect(ui, self.gk_panel_ui.cat_header_bgs[cat_idx], hdr_r);
-            send_rect_text(ui, self.gk_panel_ui.cat_header_texts[cat_idx], hdr_r);
-
-            let n_in_cat = node_cat_snap.iter().filter(|c| c.as_str() == cat_name.as_str()).count();
-            let n_rows = (n_in_cat + CARDS_PER_ROW - 1) / CARDS_PER_ROW;
-            let cat_h = HEADER_H + HEADER_TO_CARD + n_rows as f32 * CARD_ROW_PITCH + CAT_GAP;
-            if is_right { right_y += cat_h; } else { left_y += cat_h; }
+        let mut id_to_index = std::collections::HashMap::new();
+        for (i, id) in node_ids_snap.iter().enumerate() {
+            id_to_index.insert(id.as_str(), i);
         }
-
-        // 佈局每張節點卡片
-        let mut cat_card_count: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-
-        for (i, node_id) in node_ids_snap.iter().enumerate() {
-            let cat = &node_cat_snap[i];
-            let cost = node_kp_snap[i];
-            let card_in_cat = *cat_card_count.get(cat.as_str()).unwrap_or(&0);
-            cat_card_count.insert(cat.clone(), card_in_cat + 1);
-
-            let cat_idx = cat_names_snap.iter().position(|c| c == cat).unwrap_or(0);
-            let col_x_base = cat_col_x[cat_idx];
-            let cat_y = cat_start_y_vec[cat_idx];
-
-            let col_in_cat = card_in_cat % CARDS_PER_ROW;
-            let row_in_cat = card_in_cat / CARDS_PER_ROW;
-            let x = col_x_base + col_in_cat as f32 * CARD_COL_PITCH;
-            let y = cat_y + HEADER_H + HEADER_TO_CARD + row_in_cat as f32 * CARD_ROW_PITCH;
-
-            let card_r = rr(x, y, CARD_W, CARD_H);
-            let is_unlocked = self.gk_unlocked_nodes.contains(node_id.as_str());
-
-            let (card_bg, name_t, kp_t, btn_bg, btn_t, desc_t) = self.gk_panel_ui.node_cards[i];
-            send_rect(ui, card_bg, card_r);
-            ui.send(
-                card_bg,
-                WidgetMessage::Background(
-                    if is_unlocked {
-                        Brush::Solid(Color::from_rgba(40, 110, 55, 220)).into()
-                    } else {
-                        Brush::Solid(Color::from_rgba(100, 120, 170, 230)).into()
-                    },
-                ),
-            );
-
-            // label（左半部上方，較大字）
-            let label = node_labels_snap.get(i).map(|s| s.as_str()).unwrap_or(node_id.as_str());
-            let name_r = rr(x + 8.0, y + 4.0, CARD_W * 0.55, 40.0);
-            send_rect_text(ui, name_t, name_r);
-            ui.send(name_t, TextMessage::Text(label.to_string()));
-
-            // description（左半部下方，較小字）
-            let desc = node_descs_snap.get(i).map(|s| s.as_str()).unwrap_or("");
-            let desc_r = rr(x + 8.0, y + 48.0, CARD_W * 0.55, 28.0);
-            send_rect_text(ui, desc_t, desc_r);
-            ui.send(desc_t, TextMessage::Text(desc.to_string()));
-
-            // KP 費用標籤（右上）
-            let kp_info_r = rr(x + CARD_W * 0.57, y + 4.0, CARD_W * 0.4, 34.0);
-            send_rect_text(ui, kp_t, kp_info_r);
-
-            // 解鎖按鈕（右下）
-            let btn_r = rr(x + CARD_W * 0.57, y + CARD_H - 38.0, CARD_W * 0.4, 32.0);
-            if is_unlocked {
-                ui.send(btn_bg, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
-                ui.send(btn_t, WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)));
-                ui.send(kp_t, TextMessage::Text("✓ 已解鎖".to_string()));
-                self.gk_panel_ui.unlock_rects[i] = UiRect::default();
-            } else {
-                send_rect(ui, btn_bg, btn_r);
-                send_rect_text(ui, btn_t, btn_r);
-                self.gk_panel_ui.unlock_rects[i] = btn_r;
-                ui.send(kp_t, TextMessage::Text(format!("需 {} KP", cost)));
-                ui.send(btn_t, TextMessage::Text(format!("解鎖 {}KP", cost)));
+        let mut depths = vec![0usize; node_ids_snap.len()];
+        for _ in 0..node_ids_snap.len() {
+            for i in 0..node_ids_snap.len() {
+                let depth = node_requires_snap[i]
+                    .iter()
+                    .filter_map(|req| id_to_index.get(req.as_str()).copied())
+                    .map(|ri| depths[ri] + 1)
+                    .max()
+                    .unwrap_or(0);
+                depths[i] = depths[i].max(depth);
             }
         }
+        let cat_count = cat_names_snap.len().max(1);
+        let cat_step = if cat_count > 1 {
+            1580.0 / (cat_count as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let mut cat_depth_count: std::collections::HashMap<(String, usize), usize> =
+            std::collections::HashMap::new();
+        let mut centers = vec![Vector2::new(0.0, 0.0); node_ids_snap.len()];
+        const NODE_SIZE: f32 = 98.0;
+        const DEPTH_STEP: f32 = 150.0;
+        for (i, cat) in node_cat_snap.iter().enumerate() {
+            let cat_idx = cat_names_snap.iter().position(|c| c == cat).unwrap_or(0);
+            let depth = depths[i];
+            let count_key = (cat.clone(), depth);
+            let slot = *cat_depth_count.get(&count_key).unwrap_or(&0);
+            cat_depth_count.insert(count_key, slot + 1);
+            let lane_x = 170.0 + cat_idx as f32 * cat_step;
+            let offset_x = (slot as f32) * 118.0;
+            centers[i] = Vector2::new(lane_x + offset_x, 190.0 + depth as f32 * DEPTH_STEP);
+        }
+
+        for (cat_idx, cat_name) in cat_names_snap.iter().enumerate() {
+            let x = 98.0 + cat_idx as f32 * cat_step;
+            let hdr_r = rr(x, 118.0, 144.0, 38.0);
+            if let Some(h) = panel.cat_header_bgs.get(cat_idx).copied() {
+                send_rect(ui, h, hdr_r);
+            }
+            if let Some(h) = panel.cat_header_texts.get(cat_idx).copied() {
+                send_rect_text(ui, h, hdr_r);
+                ui.send(h, TextMessage::Text(gk_cat_display_name(cat_name).to_string()));
+            }
+        }
+
+        let mut line_idx = 0usize;
+        for (i, reqs) in node_requires_snap.iter().enumerate() {
+            for req in reqs {
+                let Some(req_i) = id_to_index.get(req.as_str()).copied() else {
+                    continue;
+                };
+                let from = centers[req_i];
+                let to = centers[i];
+                let unlocked_line = self.gk_unlocked_nodes.contains(&node_ids_snap[req_i])
+                    && self.gk_unlocked_nodes.contains(&node_ids_snap[i]);
+                let line_color = if unlocked_line {
+                    Color::from_rgba(100, 255, 30, 255)
+                } else {
+                    Color::from_rgba(30, 20, 42, 255)
+                };
+                let mid_y = (from.y + to.y) * 0.5;
+                let segments = [
+                    (from.x - 4.0, from.y + NODE_SIZE * 0.43, 8.0, (mid_y - from.y).abs()),
+                    (
+                        from.x.min(to.x) - 4.0,
+                        mid_y - 4.0,
+                        (to.x - from.x).abs() + 8.0,
+                        8.0,
+                    ),
+                    (to.x - 4.0, mid_y, 8.0, (to.y - mid_y - NODE_SIZE * 0.43).max(0.0)),
+                ];
+                for (x, y, w, h) in segments {
+                    if let Some(line) = panel.connector_lines.get(line_idx).copied() {
+                        send_rect(ui, line, rr(x, y, w.max(8.0), h.max(8.0)));
+                        ui.send(line, WidgetMessage::Background(Brush::Solid(line_color).into()));
+                    }
+                    line_idx += 1;
+                }
+            }
+        }
+        for line in panel.connector_lines.iter().skip(line_idx) {
+            send_rect(ui, *line, hidden_rect);
+        }
+
+        for (i, node_id) in node_ids_snap.iter().enumerate() {
+            let center = centers[i];
+            let node_r = rr(center.x - NODE_SIZE * 0.5, center.y - NODE_SIZE * 0.5, NODE_SIZE, NODE_SIZE);
+            panel.node_rects[i] = node_r;
+            let unlocked = self.gk_unlocked_nodes.contains(node_id);
+            let prereq_met = node_requires_snap[i]
+                .iter()
+                .all(|req| self.gk_unlocked_nodes.contains(req));
+            let affordable = self.gk_available_kp >= node_kp_snap[i];
+            let selected = self.gk_selected_node_index == Some(i);
+            let available = !unlocked && prereq_met && affordable;
+            let node = &panel.node_cards[i];
+
+            let halo_r = rr(center.x - 57.0, center.y - 57.0, 114.0, 114.0);
+            let ring_r = rr(center.x - 50.0, center.y - 50.0, 100.0, 100.0);
+            let face_r = rr(center.x - 40.0, center.y - 40.0, 80.0, 80.0);
+            let halo_color = if selected {
+                Color::from_rgba(100, 255, 30, 255)
+            } else if available {
+                Color::from_rgba(100, 255, 30, 180)
+            } else {
+                Color::from_rgba(100, 255, 30, 0)
+            };
+            let ring_color = if unlocked {
+                Color::from_rgba(165, 194, 200, 255)
+            } else if prereq_met {
+                Color::from_rgba(112, 132, 136, 255)
+            } else {
+                Color::from_rgba(62, 70, 76, 255)
+            };
+            let face_color = if unlocked {
+                Color::from_rgba(31, 116, 144, 255)
+            } else if prereq_met {
+                Color::from_rgba(54, 78, 86, 255)
+            } else {
+                Color::from_rgba(34, 45, 52, 255)
+            };
+            let glyph_color = if unlocked {
+                Color::from_rgba(170, 242, 255, 255)
+            } else if prereq_met {
+                Color::from_rgba(190, 214, 216, 255)
+            } else {
+                Color::from_rgba(92, 112, 120, 255)
+            };
+            send_rect(ui, node.halo, halo_r);
+            send_rect(ui, node.ring, ring_r);
+            send_rect(ui, node.face, face_r);
+            send_rect_text(ui, node.symbol_text, face_r);
+            ui.send(node.halo, WidgetMessage::Background(Brush::Solid(halo_color).into()));
+            ui.send(node.ring, WidgetMessage::Background(Brush::Solid(ring_color).into()));
+            ui.send(node.face, WidgetMessage::Background(Brush::Solid(face_color).into()));
+            ui.send(node.symbol_text, WidgetMessage::Foreground(Brush::Solid(glyph_color).into()));
+            ui.send(
+                node.symbol_text,
+                TextMessage::Text(gk_node_symbol(&node_cat_snap[i], &node_labels_snap[i], &node_descs_snap[i]).to_string()),
+            );
+
+            let label_r = rr(center.x - 70.0, center.y + 52.0, 140.0, 42.0);
+            send_rect_text(ui, node.label_text, label_r);
+            ui.send(node.label_text, TextMessage::Text(td_wrap_ui_text(&node_labels_snap[i], 8, 2)));
+            let kp_r = rr(center.x - 44.0, center.y - 76.0, 88.0, 22.0);
+            send_rect_text(ui, node.kp_text, kp_r);
+            let kp_label = if unlocked {
+                "已解鎖".to_string()
+            } else if prereq_met {
+                format!("{} KP", node_kp_snap[i])
+            } else {
+                "鎖定".to_string()
+            };
+            ui.send(node.kp_text, TextMessage::Text(kp_label));
+        }
+
+        let selected_i = self.gk_selected_node_index.unwrap_or(0);
+        let selected_id = node_ids_snap.get(selected_i).map(|s| s.as_str()).unwrap_or("");
+        let selected_label = node_labels_snap
+            .get(selected_i)
+            .map(|s| s.as_str())
+            .unwrap_or(selected_id);
+        let selected_desc = node_descs_snap.get(selected_i).map(|s| s.as_str()).unwrap_or("");
+        let selected_cat = node_cat_snap.get(selected_i).map(|s| s.as_str()).unwrap_or("global");
+        let selected_cost = node_kp_snap.get(selected_i).copied().unwrap_or(0);
+        let selected_reqs = node_requires_snap.get(selected_i).cloned().unwrap_or_default();
+        let selected_unlocked = self.gk_unlocked_nodes.contains(selected_id);
+        let selected_prereq_met = selected_reqs
+            .iter()
+            .all(|req| self.gk_unlocked_nodes.contains(req));
+        let selected_affordable = self.gk_available_kp >= selected_cost;
+
+        let bottom_r = rr(138.0, 806.0, 1644.0, 206.0);
+        send_rect(ui, panel.bottom_bg, bottom_r);
+        send_rect(ui, panel.bottom_icon_ring, rr(172.0, 836.0, 132.0, 132.0));
+        send_rect(ui, panel.bottom_icon_face, rr(188.0, 852.0, 100.0, 100.0));
+        send_rect_text(ui, panel.bottom_icon_text, rr(188.0, 852.0, 100.0, 100.0));
+        ui.send(
+            panel.bottom_icon_text,
+            TextMessage::Text(gk_node_symbol(selected_cat, selected_label, selected_desc).to_string()),
+        );
+        send_rect_text(ui, panel.bottom_title, rr(346.0, 816.0, 760.0, 52.0));
+        ui.send(panel.bottom_title, TextMessage::Text(selected_label.to_string()));
+        send_rect_text(ui, panel.bottom_desc, rr(346.0, 872.0, 980.0, 96.0));
+        ui.send(panel.bottom_desc, TextMessage::Text(selected_desc.to_string()));
+        let cost_text = if selected_unlocked {
+            "狀態：已解鎖".to_string()
+        } else if !selected_prereq_met {
+            let missing = selected_reqs
+                .iter()
+                .find(|req| !self.gk_unlocked_nodes.contains(*req))
+                .map(|s| s.as_str())
+                .unwrap_or("前置節點");
+            format!("需要：{}", missing)
+        } else {
+            format!("需要 {} KP", selected_cost)
+        };
+        send_rect_text(ui, panel.bottom_cost_text, rr(1240.0, 830.0, 330.0, 44.0));
+        ui.send(panel.bottom_cost_text, TextMessage::Text(cost_text));
+
+        let unlock_label;
+        let unlock_color;
+        if selected_unlocked {
+            unlock_label = "已解鎖";
+            unlock_color = Color::from_rgba(96, 128, 96, 255);
+            panel.bottom_unlock_rect = UiRect::default();
+        } else if !selected_prereq_met {
+            unlock_label = "尚未開放";
+            unlock_color = Color::from_rgba(96, 84, 88, 255);
+            panel.bottom_unlock_rect = UiRect::default();
+        } else if !selected_affordable {
+            unlock_label = "KP 不足";
+            unlock_color = Color::from_rgba(150, 88, 44, 255);
+            panel.bottom_unlock_rect = UiRect::default();
+        } else {
+            unlock_label = "解鎖";
+            unlock_color = Color::from_rgba(64, 176, 48, 255);
+            panel.bottom_unlock_rect = rr(1418.0, 900.0, 250.0, 58.0);
+        }
+        ui.send(panel.bottom_unlock_bg, WidgetMessage::Background(Brush::Solid(unlock_color).into()));
+        let unlock_r = if panel.bottom_unlock_rect.w > 0.0 {
+            panel.bottom_unlock_rect
+        } else {
+            rr(1418.0, 900.0, 250.0, 58.0)
+        };
+        send_rect(ui, panel.bottom_unlock_bg, unlock_r);
+        send_rect_text(ui, panel.bottom_unlock_text, unlock_r);
+        ui.send(panel.bottom_unlock_text, TextMessage::Text(unlock_label.to_string()));
 
         self.gk_panel_ui.visible_applied = true;
     }
