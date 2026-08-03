@@ -3968,6 +3968,14 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     ctrl_held: bool,
+    /// 沙箱模式（client-side UX 提示用，非安全邊界）：由 OMFX_SANDBOX=1
+    /// 環境變數開啟，在 `Plugin::init` 讀取一次。真正的安全檢查在後端
+    /// omoba-core 的 `SandboxMode` resource——即使這裡誤設為 true，
+    /// 沒有沙箱後端也不會真的生怪；這個欄位只是避免對正式對戰徒勞送出
+    /// 一定會被後端擋下的 DebugSpawnCreep 輸入。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sandbox_mode: bool,
     /// Alt 按住：強制顯示 name label（即使 entity 數超過 NAME_LABEL_HIDE_THRESHOLD）
     #[visit(skip)]
     #[reflect(hidden)]
@@ -4136,6 +4144,9 @@ impl Plugin for Game {
 
     fn init(&mut self, _scene_path: Option<&str>, mut context: PluginContext) -> GameResult {
         self.window_size = Vector2::new(800.0, 600.0);
+        // 安全性：沙箱模式僅供 UX 提示，讀一次環境變數即可（真正的准駁在
+        // 後端 SandboxMode resource，見 omoba-core initialization.rs）。
+        self.sandbox_mode = std::env::var("OMFX_SANDBOX").ok().as_deref() == Some("1");
 
         let mut scene = Scene::new();
 
@@ -10391,6 +10402,17 @@ impl Plugin for Game {
             } => {
                 self.window_size = Vector2::new(size.width as f32, size.height as f32);
             }
+            // 視窗失焦（例如 Alt+Tab 切走）時，修飾鍵「放開」的事件會送到別的視窗
+            // 而遺失，導致 ctrl/shift/alt held 永久卡在 true（卡 Ctrl→數字鍵變生怪、
+            // 卡 Shift→熱鍵全滅）。失焦時主動清除三個修飾鍵狀態，避免卡死。
+            Event::WindowEvent {
+                event: WindowEvent::Focused(false),
+                ..
+            } => {
+                self.ctrl_held = false;
+                self.shift_held = false;
+                self.alt_held = false;
+            }
             Event::WindowEvent {
                 event: WindowEvent::CursorMoved { position, .. },
                 ..
@@ -16638,6 +16660,13 @@ impl Game {
             return true;
         }
         if let Some(rest) = id.strip_prefix("spawn_creep_") {
+            // 安全性：DebugSpawnCreep 是沙箱限定的除錯工具，正式對戰不該送出
+            // 這個輸入（就算送了，權威後端的 SandboxMode 閘門也會擋下——這裡
+            // 只是避免徒勞浪費一次網路往返、並給玩家清楚的行為）。
+            if !self.sandbox_mode {
+                log::warn!("沙箱生怪熱鍵已忽略：非沙箱模式（設定 OMFX_SANDBOX=1 啟用）");
+                return false;
+            }
             let Ok(n) = rest.parse::<u32>() else {
                 return false;
             };
@@ -18055,12 +18084,22 @@ impl Game {
                 .with_corner_radius(6.0_f32.into())
                 .build(&mut ui.build_ctx())
                 .transmute();
+                // 沙箱分類的熱鍵在非沙箱 session 一定會被後端 SandboxMode 閘門
+                // 擋下（見 omoba-core player_input_tick.rs），面板上標註提醒，
+                // 避免玩家以為按了沒反應是 bug。
+                let label_text = if def.category == hotkeys::HotkeyCategory::Sandbox
+                    && !self.sandbox_mode
+                {
+                    format!("{}（需沙箱模式）", def.label)
+                } else {
+                    def.label.to_string()
+                };
                 let label = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(hidden)
                         .with_foreground(Brush::Solid(Color::from_rgba(255, 255, 255, 255)).into()),
                 )
-                .with_text(def.label.to_string())
+                .with_text(label_text)
                 .with_font_size(32.0.into())
                 .with_vertical_text_alignment(VerticalAlignment::Center)
                 .build(&mut ui.build_ctx());
