@@ -4047,6 +4047,23 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     gk_knowledge_enabled: bool,
+    /// Phase 2 累計戰績（從 player_profile.json 載入，供個人數據頁顯示）。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_games_played: u32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_wins: u32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_highest_wave: u32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    gk_total_kills: u32,
+    /// 追蹤個人數據頁是否為上一幀開啟狀態，用於「進頁時重讀存檔一次」的上升緣偵測。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    profile_was_open: bool,
     /// 面板狀態訊息（解鎖結果 / 前置節點提示）。
     #[visit(skip)]
     #[reflect(hidden)]
@@ -12921,6 +12938,12 @@ impl Game {
             return;
         }
         let is_profile = self.pregame_runtime.state == pregame::PregameState::Profile;
+        // 進入個人數據頁的當幀重讀 player_profile.json，讓剛打完那局的戰績即時反映
+        // （load_gk_profile 平時只在啟動與開知識面板時呼叫，不會自動追上檔案變動）。
+        if is_profile && !self.profile_was_open {
+            self.load_gk_profile();
+        }
+        self.profile_was_open = is_profile;
         if is_profile {
             self.hide_pregame_ui(ui);
             self.hide_settings_elements(ui);
@@ -14268,7 +14291,15 @@ impl Game {
             );
             ui.send(row_ui.value_text, WidgetMessage::Width(value_rect.w));
             ui.send(row_ui.value_text, WidgetMessage::Height(value_rect.h));
-            ui.send(row_ui.value_text, TextMessage::Text(value.to_string()));
+            // Phase 2：這 4 列填入 player_profile.json 的真實戰績，其餘維持佔位常數。
+            let display_value: String = match i {
+                0 => self.gk_games_played.to_string(), // 玩過的遊戲
+                1 => self.gk_wins.to_string(),         // 獲勝的遊戲
+                2 => self.gk_highest_wave.to_string(), // 最高回合(全部時間)
+                7 => self.gk_total_kills.to_string(),  // 擊殺的怪物數
+                _ => value.to_string(),                // 其餘（當前版本/CHIMPS/放氣/使用塔數）維持佔位
+            };
+            ui.send(row_ui.value_text, TextMessage::Text(display_value));
         }
     }
 
@@ -16927,6 +16958,14 @@ impl Game {
                         .get("enabled")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(true);
+                    // Phase 2 戰績（欄位不存在時預設 0，相容舊存檔）
+                    self.gk_games_played =
+                        v.get("games_played").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    self.gk_wins = v.get("wins").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    self.gk_highest_wave =
+                        v.get("highest_wave").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    self.gk_total_kills =
+                        v.get("total_kills").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                 }
                 Err(e) => {
                     log::warn!("[gk] player_profile.json parse error: {}", e);
