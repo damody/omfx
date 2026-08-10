@@ -121,7 +121,9 @@ fn read_hero_knowledge_profile() -> (bool, Vec<String>) {
     (enabled, unlocked_nodes)
 }
 
-fn build_hero_knowledge_bonus_map(unlocked_nodes: &[String]) -> HashMap<String, Vec<(String, String)>> {
+fn build_hero_knowledge_bonus_map(
+    unlocked_nodes: &[String],
+) -> HashMap<String, Vec<(String, String)>> {
     let unlocked: std::collections::HashSet<&str> =
         unlocked_nodes.iter().map(|id| id.as_str()).collect();
     let Ok(raw) = std::fs::read_to_string(HERO_KNOWLEDGE_TREE_PATH) else {
@@ -1133,10 +1135,15 @@ fn build_initial_render_seed(
         .read_resource::<Vec<omoba_core::runtime::CreepWave>>()
         .len() as u32;
     let lives = world.read_resource::<omoba_core::runtime::PlayerLives>().0;
+    let player_gold = world
+        .try_fetch::<omoba_core::runtime::PlayerEconomy>()
+        .map(|economy| economy.balances().clone())
+        .unwrap_or_default();
 
     SimWorldSnapshot {
         paths,
         blocked_regions,
+        player_gold,
         abilities: abilities_arc,
         tower_templates: tower_templates_arc,
         tower_upgrades: tower_upgrades_arc,

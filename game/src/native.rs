@@ -4115,6 +4115,18 @@ struct LocalHeroState {
     inventory: Vec<Option<(String, f32)>>,
 }
 
+fn apply_snapshot_player_gold(
+    hero_state: &mut LocalHeroState,
+    snapshot: &sim_runner::SimWorldSnapshot,
+    local_player_id: u32,
+) -> bool {
+    let Some(gold) = snapshot.player_gold.get(&local_player_id).copied() else {
+        return false;
+    };
+    hero_state.gold = gold;
+    true
+}
+
 /// MVP 商店清單（前端固定順序，對應後端 item id）
 const SHOP_ITEMS: &[(&str, &str, i32)] = &[
     ("dmg_sword", "長劍", 500),
@@ -6952,6 +6964,11 @@ impl Plugin for Game {
                     // 攜帶英雄元資料（名稱/頭銜/等級/經驗值/金幣/
                     // 力量/敏捷/智力/主要屬性）所以
                     // 面板可以以與舊版 NetworkBridge 路徑相同的方式呈現。
+                    let has_player_economy_gold = apply_snapshot_player_gold(
+                        &mut self.hero_state,
+                        &snapshot,
+                        self.local_player_id,
+                    );
                     let local_hero = snapshot
                         .entities
                         .iter()
@@ -6978,7 +6995,9 @@ impl Plugin for Game {
                         self.hero_state.strength = hero.hero_strength;
                         self.hero_state.agility = hero.hero_agility;
                         self.hero_state.intelligence = hero.hero_intelligence;
-                        self.hero_state.gold = hero.gold;
+                        if !has_player_economy_gold {
+                            self.hero_state.gold = hero.gold;
+                        }
                         self.hero_state.entity_id = Some(hero.entity_id);
 
                         // 階段 3.3：源自 sim 的派生英雄統計數據
@@ -18871,6 +18890,24 @@ fn circle_hits_polygon(center: Vector2<f32>, r: f32, poly: &[Vector2<f32>]) -> b
 #[cfg(test)]
 mod input_latency_tests {
     use super::*;
+
+    #[test]
+    fn snapshot_player_gold_updates_local_account_without_hero() {
+        let snapshot = sim_runner::SimWorldSnapshot {
+            entities: Vec::new(),
+            player_gold: std::collections::BTreeMap::from([(1, 650), (2, 10_000)]),
+            ..Default::default()
+        };
+        let mut hero_state = LocalHeroState::default();
+
+        assert!(apply_snapshot_player_gold(&mut hero_state, &snapshot, 2));
+        assert_eq!(hero_state.gold, 10_000);
+        assert_eq!(hero_state.entity_id, None);
+
+        assert!(!apply_snapshot_player_gold(&mut hero_state, &snapshot, 3));
+        assert_eq!(hero_state.gold, 10_000);
+        assert_eq!(hero_state.entity_id, None);
+    }
 
     fn ability_entity(
         entity_id: u32,
