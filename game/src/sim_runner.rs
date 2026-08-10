@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,7 +21,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use log::{debug, error, info};
 use omoba_core::lockstep_timing::LockstepTiming;
 
-use specs::{World, WorldExt};
+use specs::{Join, World, WorldExt};
 
 pub use omoba_core::runtime::PlayerInput;
 
@@ -58,6 +58,211 @@ pub use omoba_core::runtime::{
 pub const DEFAULT_EXTRACT_DATA_FOR_RENDER_EVERY_TICKS: u32 = 1;
 const WAIT_PRECISION_WINDOW: Duration = Duration::from_millis(2);
 const WAIT_STARVATION_TIMEOUT: Duration = Duration::from_secs(1);
+const HERO_KNOWLEDGE_PROFILE_PATH: &str = "omb/player_profile.json";
+const HERO_KNOWLEDGE_TREE_PATH: &str = "scripts/lua_data/knowledge_tree.json";
+
+fn hero_knowledge_profile_mtime() -> Option<SystemTime> {
+    std::fs::metadata(HERO_KNOWLEDGE_PROFILE_PATH)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn reload_hero_knowledge_from_profile(world: &mut World) -> Option<SystemTime> {
+    let profile_mtime = hero_knowledge_profile_mtime();
+    let (enabled, unlocked_nodes) = read_hero_knowledge_profile();
+    let bonuses_by_category = if enabled {
+        build_hero_knowledge_bonus_map(&unlocked_nodes)
+    } else {
+        HashMap::new()
+    };
+
+    {
+        let mut resource = world.write_resource::<omoba_core::comp::KnowledgeBonusResource>();
+        resource.enabled = enabled;
+        resource.bonuses_by_category = bonuses_by_category;
+        resource.unlocked_nodes = unlocked_nodes;
+    }
+
+    reapply_hero_knowledge_buffs_to_live_entities(world);
+    profile_mtime
+}
+
+fn poll_hero_knowledge_profile_reload(
+    world: &mut World,
+    last_profile_mtime: &mut Option<SystemTime>,
+) {
+    let current = hero_knowledge_profile_mtime();
+    if current == *last_profile_mtime {
+        return;
+    }
+
+    info!("sim_runner: player_profile.json changed; reloading hero knowledge buffs");
+    *last_profile_mtime = reload_hero_knowledge_from_profile(world);
+}
+
+fn read_hero_knowledge_profile() -> (bool, Vec<String>) {
+    let Ok(raw) = std::fs::read_to_string(HERO_KNOWLEDGE_PROFILE_PATH) else {
+        return (true, Vec::new());
+    };
+    let Ok(profile) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (true, Vec::new());
+    };
+    let enabled = profile
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let unlocked_nodes = profile
+        .get("unlocked_nodes")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    (enabled, unlocked_nodes)
+}
+
+fn build_hero_knowledge_bonus_map(unlocked_nodes: &[String]) -> HashMap<String, Vec<(String, String)>> {
+    let unlocked: std::collections::HashSet<&str> =
+        unlocked_nodes.iter().map(|id| id.as_str()).collect();
+    let Ok(raw) = std::fs::read_to_string(HERO_KNOWLEDGE_TREE_PATH) else {
+        return HashMap::new();
+    };
+    let Ok(tree) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return HashMap::new();
+    };
+    let Some(nodes) = tree.as_array() else {
+        return HashMap::new();
+    };
+
+    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for node in nodes {
+        let Some(id) = node.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !unlocked.contains(id) {
+            continue;
+        }
+        let Some(category) = node.get("category").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let payload = build_hero_knowledge_payload_json(node);
+        if payload == "{}" {
+            continue;
+        }
+        map.entry(category.to_string())
+            .or_default()
+            .push((format!("gk_{}", id), payload));
+    }
+    map
+}
+
+fn build_hero_knowledge_payload_json(node: &serde_json::Value) -> String {
+    let mut payload = serde_json::Map::new();
+    let Some(bonuses) = node.get("bonuses").and_then(|value| value.as_array()) else {
+        return serde_json::Value::Object(payload).to_string();
+    };
+    for bonus in bonuses {
+        let Some(stat_key) = bonus.get("stat_key").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if let Some(add) = bonus.get("add").and_then(|value| value.as_f64()) {
+            payload.insert(
+                stat_key.to_string(),
+                serde_json::Value::Number(((add * 1024.0) as i64).into()),
+            );
+        }
+        if let Some(multiply) = bonus.get("multiply").and_then(|value| value.as_f64()) {
+            let key = if stat_key.ends_with("_multiplier") {
+                stat_key.to_string()
+            } else {
+                format!("{}_multiplier", stat_key)
+            };
+            payload.insert(
+                key,
+                serde_json::Value::Number(((multiply * 1024.0) as i64).into()),
+            );
+        }
+    }
+    serde_json::Value::Object(payload).to_string()
+}
+
+fn reapply_hero_knowledge_buffs_to_live_entities(world: &mut World) {
+    let applications: Vec<(specs::Entity, Vec<(String, String)>)> = {
+        let gk = world.read_resource::<omoba_core::comp::KnowledgeBonusResource>();
+        let entities = world.entities();
+        let heroes = world.read_storage::<omoba_core::comp::Hero>();
+        let towers = world.read_storage::<omoba_core::comp::Tower>();
+        let script_tags = world.read_storage::<omoba_core::runtime::ScriptUnitTag>();
+        let mut applications = Vec::new();
+
+        for (entity, _) in (&entities, &heroes).join() {
+            let buffs = if gk.enabled {
+                gk.bonuses_for("hero").to_vec()
+            } else {
+                Vec::new()
+            };
+            applications.push((entity, buffs));
+        }
+
+        for (entity, _) in (&entities, &towers).join() {
+            let buffs = script_tags
+                .get(entity)
+                .map(|tag| {
+                    let category =
+                        omoba_core::runtime::hero_knowledge_category_for_unit_id(&tag.unit_id);
+                    if gk.enabled && !category.is_empty() {
+                        gk.bonuses_for(category)
+                            .iter()
+                            .chain(gk.global_bonuses().iter())
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_default();
+            applications.push((entity, buffs));
+        }
+
+        applications
+    };
+
+    if applications.is_empty() {
+        return;
+    }
+
+    let mut buff_store = world.write_resource::<omoba_core::runtime::BuffStore>();
+    let mut applied_count = 0usize;
+    for (entity, buffs) in &applications {
+        let old_gk_buffs: Vec<String> = buff_store
+            .iter_for(*entity)
+            .map(|(buff_id, _)| buff_id)
+            .filter(|buff_id| buff_id.starts_with("gk_"))
+            .map(str::to_string)
+            .collect();
+        for buff_id in old_gk_buffs {
+            buff_store.remove(*entity, &buff_id);
+        }
+
+        for (buff_id, payload_str) in buffs {
+            let payload: serde_json::Value = serde_json::from_str(payload_str)
+                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+            buff_store.add(
+                *entity,
+                buff_id,
+                omoba_sim::Fixed64::from_raw(i64::MAX),
+                payload,
+            );
+            applied_count += 1;
+        }
+    }
+
+    info!(
+        "sim_runner: reapplied {} hero knowledge buffs across {} live heroes/towers",
+        applied_count,
+        applications.len()
+    );
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SimStartMetadata {
@@ -300,6 +505,8 @@ fn run_sim_loop(
     let script_registry: omoba_core::runtime::ScriptRegistry =
         std::mem::take(&mut *world.write_resource::<omoba_core::runtime::ScriptRegistry>());
 
+    let mut hero_knowledge_profile_modified = reload_hero_knowledge_from_profile(&mut world);
+
     info!("sim_runner: dispatcher ready, entering tick loop");
 
     let mut last_starvation_log = std::time::Instant::now();
@@ -499,6 +706,7 @@ fn run_sim_loop(
             .map(|meta| meta.input_id)
             .collect::<Vec<_>>();
         push_inputs_into_world(&mut world, batch.tick, batch.inputs);
+        poll_hero_knowledge_profile_reload(&mut world, &mut hero_knowledge_profile_modified);
 
         // 更新 Tick + Time + DeltaTime，以便時間閘控系統（creep_wave、
         // 增益計時器、彈丸飛行）實際上是提前的。鎖步 cadence 由
