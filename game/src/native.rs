@@ -79,11 +79,14 @@ pub(crate) mod render_bridge;
 pub(crate) mod sim_runner;
 #[path = "sprite_resources.rs"]
 pub(crate) mod sprite_resources;
+#[path = "visual_autoplay.rs"]
+pub(crate) mod visual_autoplay;
 
 const ABILITY_ICON_FALLBACK_PATH: &str = "data/ability_icons/ability_default_placeholder.png";
 const DEFAULT_DLL_PATH: &str = "scripts/base_content.dll";
 const DEFAULT_GAME_TOML_PATH: &str = "game.toml";
 const DEFAULT_STORY_DATA_DIR: &str = "scripts/lua_data";
+const AUTOPLAY_LOCAL_PLAYER_ID: u32 = omoba_core::runtime::AUTOPLAY_PLAYER_ID;
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
@@ -3404,6 +3407,17 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
+    /// Uncapped local TD 1-100 autoplay worker used only when
+    /// `OMFX_AUTOPLAY_100=1`. It never connects to the KCP backend.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    visual_autoplay_handle: Option<visual_autoplay::VisualAutoplayHandle>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    ui_visual_autoplay_overlay: Handle<Text>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    visual_autoplay_overlay_text: String,
     /// 最近一次 frontend 已套用的 Lua content generation/hash。
     /// 變更時清除 Lua-derived UI/asset caches，讓下一份 snapshot 重新 seed。
     #[visit(skip)]
@@ -6196,9 +6210,31 @@ impl Plugin for Game {
             }
         }
 
+        self.ui_visual_autoplay_overlay = TextBuilder::new(
+            WidgetBuilder::new()
+                .with_desired_position(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS))
+                .with_width(620.0)
+                .with_height(128.0)
+                .with_background(Brush::Solid(Color::from_rgba(8, 18, 28, 220)).into())
+                .with_foreground(Brush::Solid(Color::from_rgba(245, 250, 255, 255)).into()),
+        )
+        .with_text(String::new())
+        .with_font_size(22.0.into())
+        .with_wrap(WrapMode::Word)
+        .with_horizontal_text_alignment(HorizontalAlignment::Left)
+        .with_vertical_text_alignment(VerticalAlignment::Center)
+        .build(&mut ui.build_ctx());
+
         apply_frontend_runtime_env_from_config();
         self.connection_status = ConnectionStatus::Disconnected;
-        if frontend_env_truthy("OMFX_LEGACY_AUTOSTART") {
+        if frontend_env_truthy("OMFX_AUTOPLAY_100") {
+            log::info!("OMFX_AUTOPLAY_100 enabled; starting local visual autoplay");
+            if let Err(err) = self.start_visual_autoplay() {
+                log::error!("visual autoplay startup failed: {}", err);
+                self.connection_status = ConnectionStatus::Failed(err);
+                self.pregame_runtime.mark_in_game();
+            }
+        } else if frontend_env_truthy("OMFX_LEGACY_AUTOSTART") {
             if let Some(selection) = self.default_session_selection() {
                 log::info!("OMFX_LEGACY_AUTOSTART enabled; starting default pregame session");
                 if let Err(err) = self.start_game_session(selection) {
@@ -6339,7 +6375,7 @@ impl Plugin for Game {
             self.hide_pregame_ui(ui);
             self.update_in_game_return_button(ui);
         }
-        if self.game_ended {
+        if self.game_ended && self.visual_autoplay_handle.is_none() {
             log::info!("game ended; tearing down active session");
             self.shutdown_game_session(false);
             self.pregame_runtime.state = pregame::PregameState::SessionEnded;
@@ -6636,7 +6672,9 @@ impl Plugin for Game {
         let mut render_bridge_ns: u128 = 0;
         let snapshot_span =
             tracing::trace_span!("omfx::frame::snapshot_consumption", perfetto = true,).entered();
-        let sim_state_for_frame = if let Some(ref sim) = self.sim_runner_handle {
+        let sim_state_for_frame = if let Some(ref visual) = self.visual_autoplay_handle {
+            visual.state_if_ready()
+        } else if let Some(ref sim) = self.sim_runner_handle {
             self.wait_for_applied_input_render_data(sim, &forwarded_pending_input_ids);
             Some(sim.state.clone())
         } else {
@@ -6771,7 +6809,11 @@ impl Plugin for Game {
                     // 因此改由快照欄位判斷：
                     //   Defeat  — lives <= 0（TD 模式下生命耗盡）
                     //   Victory — round >= total_rounds 且目前波次已結束
-                    if !self.game_ended && snapshot.tick > 0 && snapshot.total_rounds > 0 {
+                    if self.visual_autoplay_handle.is_none()
+                        && !self.game_ended
+                        && snapshot.tick > 0
+                        && snapshot.total_rounds > 0
+                    {
                         let is_defeat = snapshot.lives <= 0;
                         let is_victory = snapshot.round >= snapshot.total_rounds
                             && !snapshot.round_is_running;
@@ -7892,6 +7934,7 @@ impl Plugin for Game {
         let ui = context.user_interfaces.first_mut();
         let win = self.window_size;
         self.update_tower_ability_bar_ui(ui, now);
+        self.update_visual_autoplay_overlay(ui);
 
         // 刪除已刪除實體的標籤
         for label in self.pending_label_deletions.drain(..) {
@@ -7989,8 +8032,13 @@ impl Plugin for Game {
         // 上面的network_entities驅動的循環。讀取相同的快照
         // render_bridge 消耗；每個可見實體一個文字小工具，保留
         // 透過“sim_entity_labels”同步。
-        if let Some(ref sim) = self.sim_runner_handle {
-            if let Ok(snapshot) = sim.state.try_lock() {
+        let label_sim_state = self
+            .visual_autoplay_handle
+            .as_ref()
+            .and_then(|visual| visual.state_if_ready())
+            .or_else(|| self.sim_runner_handle.as_ref().map(|sim| sim.state.clone()));
+        if let Some(sim_state) = label_sim_state {
+            if let Ok(snapshot) = sim_state.try_lock() {
                 // 註：Creep 死亡特效的 spawn 已移到 `update_sim_batches`（音效同一個移除迴圈），
                 // 因為這裡的 `try_lock()` 在鎖被 sim 執行緒佔用時會失敗、整段跳過，導致特效有時不觸發。
                 const SIM_NAME_LABEL_HIDE_THRESHOLD: usize = 200;
@@ -12015,6 +12063,99 @@ impl Game {
         material
     }
 
+    fn start_visual_autoplay(&mut self) -> Result<(), String> {
+        if self.visual_autoplay_handle.is_some()
+            || self.lockstep_handle.is_some()
+            || self.sim_runner_handle.is_some()
+            || self.backend_session.is_some()
+        {
+            return Err("game session is already active".to_string());
+        }
+        apply_frontend_runtime_env_from_config();
+        let dll_path = std::env::var("OMB_DLL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                frontend_config_path("content", "DLL_PATH")
+                    .or_else(|| frontend_config_path("client", "DLL_PATH"))
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DLL_PATH))
+            });
+        let dll_path = absolute_existing_or_joined_path(dll_path);
+        let scripts_dir = dll_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("script DLL path has no parent: {}", dll_path.display()))?;
+        self.local_player_id = AUTOPLAY_LOCAL_PLAYER_ID;
+        self.current_round = 0;
+        self.total_rounds = 100;
+        self.is_td_mode = true;
+        self.td_auto_start_enabled = false;
+        self.visual_autoplay_handle = Some(visual_autoplay::VisualAutoplayHandle::spawn(
+            scripts_dir.clone(),
+        ));
+        self.pregame_runtime.mark_in_game();
+        self.connection_status = ConnectionStatus::Connected;
+        log::info!(
+            "visual autoplay session started: scripts_dir={} player_id={}",
+            scripts_dir.display(),
+            self.local_player_id
+        );
+        Ok(())
+    }
+
+    fn update_visual_autoplay_overlay(&mut self, ui: &mut UserInterface) {
+        let Some(handle) = self.visual_autoplay_handle.as_ref() else {
+            if !self.visual_autoplay_overlay_text.is_empty() {
+                ui.send(
+                    self.ui_visual_autoplay_overlay,
+                    WidgetMessage::DesiredPosition(Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS)),
+                );
+                self.visual_autoplay_overlay_text.clear();
+            }
+            return;
+        };
+        let text = if let Some(frame) = handle.latest_frame() {
+            let status = match frame.status {
+                omoba_core::runtime::TdAutoplayRunStatus::Running => "RUNNING",
+                omoba_core::runtime::TdAutoplayRunStatus::Completed => "COMPLETED",
+                omoba_core::runtime::TdAutoplayRunStatus::Failed => "FAILED",
+                omoba_core::runtime::TdAutoplayRunStatus::Cancelled => "CANCELLED",
+            };
+            let error = frame
+                .error
+                .as_deref()
+                .map(|error| {
+                    let summary = error.chars().take(180).collect::<String>();
+                    format!("\nError: {summary}\nReport: target/td-autoplay/failure.txt")
+                })
+                .unwrap_or_default();
+            format!(
+                "AUTOPLAY 1-100  {status}\nRound {}/{}  {:>3}%  Tick {}\nCash {}  Lives {}  Towers {}  Enemies {}{}",
+                frame.round,
+                frame.total_rounds,
+                frame.completion_percent,
+                frame.tick,
+                frame.cash,
+                frame.lives,
+                frame.tower_count,
+                frame.enemy_count,
+                error,
+            )
+        } else {
+            "AUTOPLAY 1-100  INITIALIZING\nLoading TD content and script DLL...".to_string()
+        };
+        if text != self.visual_autoplay_overlay_text {
+            ui.send(
+                self.ui_visual_autoplay_overlay,
+                TextMessage::Text(text.clone()),
+            );
+            self.visual_autoplay_overlay_text = text;
+        }
+        ui.send(
+            self.ui_visual_autoplay_overlay,
+            WidgetMessage::DesiredPosition(Vector2::new(18.0, 18.0)),
+        );
+    }
+
     fn default_session_selection(&self) -> Option<pregame::SessionSelection> {
         let map = self
             .pregame_runtime
@@ -12065,6 +12206,7 @@ impl Game {
     fn start_game_session(&mut self, selection: pregame::SessionSelection) -> Result<(), String> {
         if self.lockstep_handle.is_some()
             || self.sim_runner_handle.is_some()
+            || self.visual_autoplay_handle.is_some()
             || self.backend_session.is_some()
         {
             return Err("game session is already active".to_string());
@@ -12166,6 +12308,9 @@ impl Game {
     }
 
     fn shutdown_game_session(&mut self, return_to_menu: bool) {
+        if let Some(visual_autoplay) = self.visual_autoplay_handle.take() {
+            drop(visual_autoplay);
+        }
         if let Some(lockstep) = self.lockstep_handle.take() {
             lockstep.shutdown();
         }
@@ -12202,6 +12347,7 @@ impl Game {
         self.sim_speed_last_tick = 0;
         self.sim_speed_last_at = None;
         self.sim_speed_tps = 0.0;
+        self.visual_autoplay_overlay_text.clear();
         self.render_pacing_last_frame_at = None;
         self.render_pacing_last_snapshot_tick = None;
         self.sim_batches_last_snapshot_tick = None;
@@ -15630,7 +15776,12 @@ impl Game {
         resource_manager: &ResourceManager,
         dt: f32,
     ) {
-        let Some(sim_state) = self.sim_runner_handle.as_ref().map(|sim| sim.state.clone()) else {
+        let sim_state = self
+            .visual_autoplay_handle
+            .as_ref()
+            .and_then(|visual| visual.state_if_ready())
+            .or_else(|| self.sim_runner_handle.as_ref().map(|sim| sim.state.clone()));
+        let Some(sim_state) = sim_state else {
             return;
         };
         let Ok(snapshot) = sim_state.try_lock() else {
