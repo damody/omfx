@@ -71,6 +71,8 @@ pub(crate) mod backend_session;
 pub(crate) mod hotkeys;
 #[path = "lockstep_client.rs"]
 pub(crate) mod lockstep_client;
+#[path = "match_statistics.rs"]
+pub(crate) mod match_statistics;
 #[path = "pregame.rs"]
 pub(crate) mod pregame;
 #[path = "render_bridge.rs"]
@@ -1821,7 +1823,10 @@ impl TowerPlacementBlockReason {
 
     fn localized_text(&self) -> String {
         match self {
-            Self::InsufficientGold { required, available } => {
+            Self::InsufficientGold {
+                required,
+                available,
+            } => {
                 format!("金幣不足（需要 {required}，目前 {available}）")
             }
             Self::TooCloseToRoad => "離道路太近".into(),
@@ -2792,14 +2797,14 @@ fn dessert_hit_spec(kind: DessertBullet) -> ([u8; 4], f32, HitStyle) {
         DessertBullet::Toothpick => ([250, 240, 210, 255], 1.0, HitStyle::Sparkle), // 糖針=星芒
         DessertBullet::TackBlade => ([220, 225, 235, 255], 1.3, HitStyle::Slash),   // 刀片=斬擊
         DessertBullet::Macaron => ([255, 110, 180, 255], 2.2, HitStyle::CreamSplat), // 馬卡龍=奶油圈
-        DessertBullet::BombFrag => ([205, 130, 55, 255], 1.4, HitStyle::Crumbs),    // 碎片=碎屑
-        DessertBullet::Snowflake => ([150, 220, 255, 255], 2.0, HitStyle::Frost),   // 冰晶=結晶爆刺
-        DessertBullet::Icicle => ([200, 240, 255, 255], 2.0, HitStyle::Frost),      // 冰刺=結晶爆刺
-        DessertBullet::Churro => ([245, 175, 50, 255], 2.2, HitStyle::Crumbs),      // 吉拿棒=金碎屑
-        DessertBullet::Banana => ([255, 220, 50, 255], 1.4, HitStyle::CreamSplat),  // 香蕉=黃奶油圈
-        DessertBullet::Shuriken => ([185, 195, 210, 255], 1.3, HitStyle::Slash),    // 手裡劍=斬擊
+        DessertBullet::BombFrag => ([205, 130, 55, 255], 1.4, HitStyle::Crumbs),     // 碎片=碎屑
+        DessertBullet::Snowflake => ([150, 220, 255, 255], 2.0, HitStyle::Frost), // 冰晶=結晶爆刺
+        DessertBullet::Icicle => ([200, 240, 255, 255], 2.0, HitStyle::Frost),    // 冰刺=結晶爆刺
+        DessertBullet::Churro => ([245, 175, 50, 255], 2.2, HitStyle::Crumbs),    // 吉拿棒=金碎屑
+        DessertBullet::Banana => ([255, 220, 50, 255], 1.4, HitStyle::CreamSplat), // 香蕉=黃奶油圈
+        DessertBullet::Shuriken => ([185, 195, 210, 255], 1.3, HitStyle::Slash),  // 手裡劍=斬擊
         DessertBullet::HeroPellet => ([255, 250, 235, 255], 1.1, HitStyle::Sparkle), // 英雄=白星芒
-        DessertBullet::Fallback => ([255, 190, 90, 255], 1.1, HitStyle::Burst),     // fallback=環
+        DessertBullet::Fallback => ([255, 190, 90, 255], 1.1, HitStyle::Burst),   // fallback=環
     }
 }
 
@@ -3997,6 +4002,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     game_ended: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    match_statistics: match_statistics::MatchSessionTracker,
     #[visit(skip)]
     #[reflect(hidden)]
     viewport_sync_elapsed: f32,
@@ -5504,8 +5512,14 @@ impl Plugin for Game {
                             from: Vector2::new(0.0, 0.0),
                             to: Vector2::new(0.0, 44.0),
                             stops: vec![
-                                GradientPoint { stop: 0.0, color: Color::from_rgba(180, 140, 60, 255) },
-                                GradientPoint { stop: 1.0, color: Color::from_rgba(120, 90, 30, 255) },
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(180, 140, 60, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(120, 90, 30, 255),
+                                },
                             ],
                         }
                         .into(),
@@ -6122,16 +6136,14 @@ impl Plugin for Game {
 
             self.ui_profile.bg = new_border(ui, (22, 42, 30, 255), 0.0);
             self.ui_profile.back_btn = new_border(ui, (65, 158, 218, 255), 12.0);
-            self.ui_profile.back_btn_text =
-                new_text(ui, WHITE, 22.0, HorizontalAlignment::Center);
+            self.ui_profile.back_btn_text = new_text(ui, WHITE, 22.0, HorizontalAlignment::Center);
 
             self.ui_profile.header_bg = new_border(ui, (58, 46, 28, 255), 14.0);
             self.ui_profile.avatar_bg = new_border(ui, (60, 130, 200, 255), 999.0);
             self.ui_profile.avatar_text = new_text(ui, WHITE, 34.0, HorizontalAlignment::Center);
             self.ui_profile.name_text = new_text(ui, WHITE, 26.0, HorizontalAlignment::Left);
             self.ui_profile.level_badge_bg = new_border(ui, (245, 195, 40, 255), 8.0);
-            self.ui_profile.level_text =
-                new_text(ui, DARK_TEXT, 16.0, HorizontalAlignment::Center);
+            self.ui_profile.level_text = new_text(ui, DARK_TEXT, 16.0, HorizontalAlignment::Center);
             self.ui_profile.xp_track = new_border(ui, (42, 32, 18, 255), 999.0);
             self.ui_profile.xp_fill = new_border(ui, (80, 190, 70, 255), 999.0);
             self.ui_profile.followers_text =
@@ -6771,6 +6783,14 @@ impl Plugin for Game {
                     self.current_round = snapshot.round;
                     self.total_rounds = snapshot.total_rounds;
                     self.round_is_running = snapshot.round_is_running;
+                    self.match_statistics.observe(
+                        match_statistics::player_visible_wave(
+                            snapshot.round,
+                            snapshot.total_rounds,
+                            snapshot.round_is_running,
+                        ),
+                        snapshot.match_kills,
+                    );
                     self.is_game_paused = snapshot.is_paused;
                     self.game_speed_multiplier = snapshot.game_speed_multiplier;
                     if self.round_is_running {
@@ -6815,8 +6835,8 @@ impl Plugin for Game {
                         && snapshot.total_rounds > 0
                     {
                         let is_defeat = snapshot.lives <= 0;
-                        let is_victory = snapshot.round >= snapshot.total_rounds
-                            && !snapshot.round_is_running;
+                        let is_victory =
+                            snapshot.round >= snapshot.total_rounds && !snapshot.round_is_running;
                         if is_defeat || is_victory {
                             log::info!(
                                 "[game_end] defeat={} victory={} lives={} round={}/{} running={}",
@@ -6827,6 +6847,11 @@ impl Plugin for Game {
                                 snapshot.total_rounds,
                                 snapshot.round_is_running,
                             );
+                            self.match_statistics.mark_terminal(if is_victory {
+                                match_statistics::MatchResult::Victory
+                            } else {
+                                match_statistics::MatchResult::Defeat
+                            });
                             self.game_ended = true;
                         }
                     }
@@ -7668,8 +7693,11 @@ impl Plugin for Game {
                                     let th = (k as f32) * tau / 18.0;
                                     let (s, c) = th.sin_cos();
                                     let next = Vector3::new(-(px + rr * c), py + rr * s, z);
-                                    scene.drawing_context
-                                        .add_line(Line { begin: prev, end: next, color });
+                                    scene.drawing_context.add_line(Line {
+                                        begin: prev,
+                                        end: next,
+                                        color,
+                                    });
                                     prev = next;
                                 }
                             }
@@ -7743,8 +7771,11 @@ impl Plugin for Game {
                                 let th = (k as f32) * tau / (RING as f32);
                                 let (s, c) = th.sin_cos();
                                 let next = Vector3::new(-(px + cur_r * c), py + cur_r * s, z);
-                                scene.drawing_context
-                                    .add_line(Line { begin: prev, end: next, color });
+                                scene.drawing_context.add_line(Line {
+                                    begin: prev,
+                                    end: next,
+                                    color,
+                                });
                                 prev = next;
                             }
                         }
@@ -8258,9 +8289,7 @@ impl Plugin for Game {
             .selected_tower_kind
             .as_ref()
             .and_then(|kind| self.td_templates.get(kind))
-            .and_then(|template| {
-                self.tower_placement_block_reason(template, self.mouse_world_pos)
-            })
+            .and_then(|template| self.tower_placement_block_reason(template, self.mouse_world_pos))
         {
             status_str.push_str(" | 建塔：");
             status_str.push_str(&reason.localized_text());
@@ -11970,14 +11999,12 @@ impl Game {
         tpl: &TdTemplate,
         pos: Vector2<f32>,
     ) -> Option<TowerRoadPlacementProbe> {
-        let required_clearance_backend =
-            tpl.placement_radius_backend + TD_PATH_HALF_WIDTH_BACKEND;
+        let required_clearance_backend = tpl.placement_radius_backend + TD_PATH_HALF_WIDTH_BACKEND;
         let mut nearest: Option<TowerRoadPlacementProbe> = None;
         for (path_index, path) in self.td_paths_render.iter().enumerate() {
             for segment_index in 0..path.len().saturating_sub(1) {
                 let distance_backend =
-                    point_segment_dist_sq(pos, path[segment_index], path[segment_index + 1])
-                        .sqrt()
+                    point_segment_dist_sq(pos, path[segment_index], path[segment_index + 1]).sqrt()
                         / WORLD_SCALE;
                 let candidate = TowerRoadPlacementProbe {
                     path_index,
@@ -12302,12 +12329,14 @@ impl Game {
             scene_path,
             extract_data_for_render_every_ticks,
         ));
+        self.match_statistics.start();
         self.pregame_runtime.mark_in_game();
         self.connection_status = ConnectionStatus::Connected;
         Ok(())
     }
 
     fn shutdown_game_session(&mut self, return_to_menu: bool) {
+        let settlement = self.match_statistics.take_settlement();
         if let Some(visual_autoplay) = self.visual_autoplay_handle.take() {
             drop(visual_autoplay);
         }
@@ -12319,6 +12348,24 @@ impl Game {
         }
         if let Some(mut backend) = self.backend_session.take() {
             backend.shutdown();
+        }
+        if let Some(settlement) = settlement {
+            let profile_path = match_statistics::default_profile_path();
+            match match_statistics::settle_profile(&profile_path, settlement) {
+                Ok(stats) => {
+                    log::info!(
+                        "match statistics settled result={} games_played={} wins={} highest_wave={} total_kills={} path={}",
+                        settlement.result.as_str(),
+                        stats.games_played,
+                        stats.wins,
+                        stats.highest_wave,
+                        stats.total_kills,
+                        profile_path.display(),
+                    );
+                    self.load_gk_profile();
+                }
+                Err(error) => log::error!("{error}"),
+            }
         }
         self.reset_session_state();
         if return_to_menu {
@@ -12396,6 +12443,7 @@ impl Game {
         self.auto_start_sent = false;
         self.auto_noop_next_at_s = None;
         self.game_ended = false;
+        self.match_statistics.reset();
         self.session_render_reset_pending = true;
         // 回到選單時確保英雄知識面板關閉，避免 pregame 點擊被面板攔截
         self.gk_panel_visible = false;
@@ -13830,7 +13878,12 @@ impl Game {
             ui.send(medal.bg, WidgetMessage::DesiredPosition(h));
             ui.send(medal.count_text, WidgetMessage::DesiredPosition(h));
         }
-        for portrait in self.ui_profile.heroes.iter().chain(self.ui_profile.monkeys.iter()) {
+        for portrait in self
+            .ui_profile
+            .heroes
+            .iter()
+            .chain(self.ui_profile.monkeys.iter())
+        {
             ui.send(portrait.bg, WidgetMessage::DesiredPosition(h));
             ui.send(portrait.name_text, WidgetMessage::DesiredPosition(h));
             ui.send(portrait.count_text, WidgetMessage::DesiredPosition(h));
@@ -13874,14 +13927,8 @@ impl Game {
             self.ui_profile.back_btn_text,
             WidgetMessage::DesiredPosition(back.pos()),
         );
-        ui.send(
-            self.ui_profile.back_btn_text,
-            WidgetMessage::Width(back.w),
-        );
-        ui.send(
-            self.ui_profile.back_btn_text,
-            WidgetMessage::Height(back.h),
-        );
+        ui.send(self.ui_profile.back_btn_text, WidgetMessage::Width(back.w));
+        ui.send(self.ui_profile.back_btn_text, WidgetMessage::Height(back.h));
         ui.send(
             self.ui_profile.back_btn_text,
             TextMessage::Text("< 返回".to_string()),
@@ -13911,10 +13958,7 @@ impl Game {
             WidgetMessage::DesiredPosition(avatar.pos()),
         );
         ui.send(self.ui_profile.avatar_text, WidgetMessage::Width(avatar.w));
-        ui.send(
-            self.ui_profile.avatar_text,
-            WidgetMessage::Height(avatar.h),
-        );
+        ui.send(self.ui_profile.avatar_text, WidgetMessage::Height(avatar.h));
         ui.send(
             self.ui_profile.avatar_text,
             TextMessage::Text(
@@ -13973,24 +14017,15 @@ impl Game {
             self.ui_profile.xp_track,
             WidgetMessage::DesiredPosition(xp_track.pos()),
         );
-        ui.send(
-            self.ui_profile.xp_track,
-            WidgetMessage::Width(xp_track.w),
-        );
-        ui.send(
-            self.ui_profile.xp_track,
-            WidgetMessage::Height(xp_track.h),
-        );
+        ui.send(self.ui_profile.xp_track, WidgetMessage::Width(xp_track.w));
+        ui.send(self.ui_profile.xp_track, WidgetMessage::Height(xp_track.h));
         let xp_fill_w = (xp_track.w * PROFILE_XP_PCT.clamp(0.0, 1.0)).max(1.0);
         ui.send(
             self.ui_profile.xp_fill,
             WidgetMessage::DesiredPosition(xp_track.pos()),
         );
         ui.send(self.ui_profile.xp_fill, WidgetMessage::Width(xp_fill_w));
-        ui.send(
-            self.ui_profile.xp_fill,
-            WidgetMessage::Height(xp_track.h),
-        );
+        ui.send(self.ui_profile.xp_fill, WidgetMessage::Height(xp_track.h));
 
         let followers = pregame_ref_rect(ws, 500.0, 150.0, 200.0, 60.0);
         ui.send(
@@ -14217,10 +14252,7 @@ impl Game {
             );
             ui.send(portrait.name_text, WidgetMessage::Width(name_rect.w));
             ui.send(portrait.name_text, WidgetMessage::Height(name_rect.h));
-            ui.send(
-                portrait.name_text,
-                TextMessage::Text(label.to_string()),
-            );
+            ui.send(portrait.name_text, TextMessage::Text(label.to_string()));
             let count_rect = UiRect {
                 x: rect.x,
                 y: rect.bottom() - rect.h * 0.12,
@@ -14292,10 +14324,7 @@ impl Game {
             );
             ui.send(portrait.name_text, WidgetMessage::Width(name_rect.w));
             ui.send(portrait.name_text, WidgetMessage::Height(name_rect.h));
-            ui.send(
-                portrait.name_text,
-                TextMessage::Text(label.to_string()),
-            );
+            ui.send(portrait.name_text, TextMessage::Text(label.to_string()));
             let count_rect = UiRect {
                 x: rect.x,
                 y: rect.bottom() - rect.h * 0.12,
@@ -14462,7 +14491,7 @@ impl Game {
                 1 => self.gk_wins.to_string(),         // 獲勝的遊戲
                 2 => self.gk_highest_wave.to_string(), // 最高回合(全部時間)
                 7 => self.gk_total_kills.to_string(),  // 擊殺的怪物數
-                _ => value.to_string(),                // 其餘（當前版本/CHIMPS/放氣/使用塔數）維持佔位
+                _ => value.to_string(), // 其餘（當前版本/CHIMPS/放氣/使用塔數）維持佔位
             };
             ui.send(row_ui.value_text, TextMessage::Text(display_value));
         }
@@ -14531,7 +14560,10 @@ impl Game {
         // 英雄知識入口按鈕只在主選單顯示，局中隱藏
         let h = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
         ui.send(self.gk_panel_ui.entry_bg, WidgetMessage::DesiredPosition(h));
-        ui.send(self.gk_panel_ui.entry_text_h, WidgetMessage::DesiredPosition(h));
+        ui.send(
+            self.gk_panel_ui.entry_text_h,
+            WidgetMessage::DesiredPosition(h),
+        );
         self.gk_panel_ui.entry_rect = UiRect::default();
     }
 
@@ -15928,9 +15960,9 @@ impl Game {
                     .projectile_dessert
                     .entry(e.entity_id)
                     .or_insert_with(|| {
-                        let owner = e.projectile_owner_entity_id.and_then(|oid| {
-                            snapshot.entities.iter().find(|o| o.entity_id == oid)
-                        });
+                        let owner = e
+                            .projectile_owner_entity_id
+                            .and_then(|oid| snapshot.entities.iter().find(|o| o.entity_id == oid));
                         classify_dessert_bullet(
                             &e.unit_id,
                             owner.map(|o| o.unit_id.as_str()),
@@ -15956,7 +15988,11 @@ impl Game {
                 // body_batch 尚有容量時才配置，避免 stress 場景撐爆 batch 觸發 debug_assert。
                 if render.accent.is_some()
                     && slots.proj_accent_slot.is_none()
-                    && self.body_batch.as_ref().map(|b| b.can_alloc()).unwrap_or(false)
+                    && self
+                        .body_batch
+                        .as_ref()
+                        .map(|b| b.can_alloc())
+                        .unwrap_or(false)
                 {
                     if let Some(batch) = self.body_batch.as_mut() {
                         slots.proj_accent_slot = Some(batch.alloc());
@@ -15975,9 +16011,7 @@ impl Game {
                             z: z - 0.01,
                         },
                     );
-                    if let (Some(acc_slot), Some(acc)) =
-                        (slots.proj_accent_slot, render.accent)
-                    {
+                    if let (Some(acc_slot), Some(acc)) = (slots.proj_accent_slot, render.accent) {
                         batch.write_quad(
                             acc_slot,
                             &sprite_resources::QuadParams {
@@ -16146,7 +16180,9 @@ impl Game {
         for &eid in &snapshot.removed_entity_ids {
             // 每個 Creep 死亡：播一聲餅乾碎裂 + 在其最後位置爆出死亡特效（白環+紅放射線）。
             // 音效與特效共用同一個判斷/迴圈，保證一起觸發、不會有時有無。
-            if self.entity_kind_cache.get(&eid)
+            if self
+                .entity_kind_cache
+                .get(&eid)
                 .map(|k| matches!(k, sim_runner::EntityKind::Creep))
                 .unwrap_or(false)
             {
@@ -16218,7 +16254,9 @@ impl Game {
             .collect();
         for id in to_remove {
             // 備用路徑（entity 從 alive 集消失但沒進 removed_entity_ids）：同樣播音效 + 死亡特效
-            if self.entity_kind_cache.get(&id)
+            if self
+                .entity_kind_cache
+                .get(&id)
                 .map(|k| matches!(k, sim_runner::EntityKind::Creep))
                 .unwrap_or(false)
             {
@@ -17106,14 +17144,9 @@ impl Game {
         match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(v) => {
-                    self.gk_available_kp = v
-                        .get("total_kp")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0) as u32;
-                    let spent = v
-                        .get("spent_kp")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0) as u32;
+                    self.gk_available_kp =
+                        v.get("total_kp").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    let spent = v.get("spent_kp").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                     self.gk_available_kp = self.gk_available_kp.saturating_sub(spent);
                     self.gk_unlocked_nodes.clear();
                     if let Some(arr) = v.get("unlocked_nodes").and_then(|x| x.as_array()) {
@@ -17124,10 +17157,8 @@ impl Game {
                         }
                     }
                     // enabled 欄位不存在時預設 true
-                    self.gk_knowledge_enabled = v
-                        .get("enabled")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(true);
+                    self.gk_knowledge_enabled =
+                        v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
                     // Phase 2 戰績（欄位不存在時預設 0，相容舊存檔）
                     self.gk_games_played =
                         v.get("games_played").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -17170,9 +17201,10 @@ impl Game {
             None => return,
         };
         // 找到目標節點
-        let node = match nodes.iter().find(|n| {
-            n.get("id").and_then(|v| v.as_str()) == Some(node_id)
-        }) {
+        let node = match nodes
+            .iter()
+            .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(node_id))
+        {
             Some(n) => n,
             None => {
                 log::warn!("[gk] node '{}' not found in tree", node_id);
@@ -17185,7 +17217,11 @@ impl Game {
             for req in requires {
                 if let Some(req_id) = req.as_str() {
                     if !self.gk_unlocked_nodes.contains(req_id) {
-                        log::info!("[gk] unlock '{}' blocked: requires '{}' first", node_id, req_id);
+                        log::info!(
+                            "[gk] unlock '{}' blocked: requires '{}' first",
+                            node_id,
+                            req_id
+                        );
                         self.gk_panel_status = format!("需先解鎖前置節點：{}", req_id);
                         return;
                     }
@@ -17194,8 +17230,14 @@ impl Game {
         }
         // 驗證 KP
         if self.gk_available_kp < kp_cost {
-            log::info!("[gk] unlock '{}' blocked: need {} KP, have {}", node_id, kp_cost, self.gk_available_kp);
-            self.gk_panel_status = format!("KP 不足（需要 {}，剩餘 {}）", kp_cost, self.gk_available_kp);
+            log::info!(
+                "[gk] unlock '{}' blocked: need {} KP, have {}",
+                node_id,
+                kp_cost,
+                self.gk_available_kp
+            );
+            self.gk_panel_status =
+                format!("KP 不足（需要 {}，剩餘 {}）", kp_cost, self.gk_available_kp);
             return;
         }
         // 讀取現有 profile JSON
@@ -17203,13 +17245,21 @@ impl Game {
         let mut profile: serde_json::Value = std::fs::read_to_string(&profile_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({
-                "total_kp": 20, "spent_kp": 0, "unlocked_nodes": []
-            }));
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "total_kp": 20, "spent_kp": 0, "unlocked_nodes": []
+                })
+            });
         // 更新 spent_kp、unlocked_nodes、enabled
-        let spent = profile.get("spent_kp").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let spent = profile
+            .get("spent_kp")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         profile["spent_kp"] = serde_json::json!(spent + kp_cost);
-        if let Some(arr) = profile.get_mut("unlocked_nodes").and_then(|v| v.as_array_mut()) {
+        if let Some(arr) = profile
+            .get_mut("unlocked_nodes")
+            .and_then(|v| v.as_array_mut())
+        {
             arr.push(serde_json::json!(node_id));
         }
         profile["enabled"] = serde_json::json!(self.gk_knowledge_enabled);
@@ -17230,7 +17280,11 @@ impl Game {
         self.gk_unlocked_nodes.insert(node_id.to_string());
         self.gk_available_kp = self.gk_available_kp.saturating_sub(kp_cost);
         self.gk_panel_status = format!("已解鎖！剩餘 KP：{}", self.gk_available_kp);
-        log::info!("[gk] unlocked '{}', remaining KP={}", node_id, self.gk_available_kp);
+        log::info!(
+            "[gk] unlocked '{}', remaining KP={}",
+            node_id,
+            self.gk_available_kp
+        );
     }
 
     /// 切換英雄知識加成啟用狀態，並寫回 player_profile.json。
@@ -17240,14 +17294,20 @@ impl Game {
         let mut profile: serde_json::Value = std::fs::read_to_string(&profile_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({
-                "total_kp": 20, "spent_kp": 0, "unlocked_nodes": [], "enabled": true
-            }));
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "total_kp": 20, "spent_kp": 0, "unlocked_nodes": [], "enabled": true
+                })
+            });
         profile["enabled"] = serde_json::json!(self.gk_knowledge_enabled);
         if let Ok(json_str) = serde_json::to_string_pretty(&profile) {
             let _ = std::fs::write(&profile_path, json_str);
         }
-        let state = if self.gk_knowledge_enabled { "啟用" } else { "停用" };
+        let state = if self.gk_knowledge_enabled {
+            "啟用"
+        } else {
+            "停用"
+        };
         self.gk_panel_status = format!("英雄知識加成已{}（下局生效）", state);
         log::info!("[gk] knowledge_enabled={}", self.gk_knowledge_enabled);
     }
@@ -17355,14 +17415,32 @@ impl Game {
                 ui.send(panel.toggle_text, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.status_text, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.bottom_bg, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.bottom_icon_ring, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.bottom_icon_face, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.bottom_icon_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(
+                    panel.bottom_icon_ring,
+                    WidgetMessage::DesiredPosition(hidden),
+                );
+                ui.send(
+                    panel.bottom_icon_face,
+                    WidgetMessage::DesiredPosition(hidden),
+                );
+                ui.send(
+                    panel.bottom_icon_text,
+                    WidgetMessage::DesiredPosition(hidden),
+                );
                 ui.send(panel.bottom_title, WidgetMessage::DesiredPosition(hidden));
                 ui.send(panel.bottom_desc, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.bottom_cost_text, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.bottom_unlock_bg, WidgetMessage::DesiredPosition(hidden));
-                ui.send(panel.bottom_unlock_text, WidgetMessage::DesiredPosition(hidden));
+                ui.send(
+                    panel.bottom_cost_text,
+                    WidgetMessage::DesiredPosition(hidden),
+                );
+                ui.send(
+                    panel.bottom_unlock_bg,
+                    WidgetMessage::DesiredPosition(hidden),
+                );
+                ui.send(
+                    panel.bottom_unlock_text,
+                    WidgetMessage::DesiredPosition(hidden),
+                );
                 for node in &panel.node_cards {
                     ui.send(node.halo, WidgetMessage::DesiredPosition(hidden));
                     ui.send(node.ring, WidgetMessage::DesiredPosition(hidden));
@@ -17380,7 +17458,10 @@ impl Game {
                 for h in &panel.cat_header_texts {
                     ui.send(*h, WidgetMessage::DesiredPosition(hidden));
                 }
-                panel.node_rects.iter_mut().for_each(|r| *r = UiRect::default());
+                panel
+                    .node_rects
+                    .iter_mut()
+                    .for_each(|r| *r = UiRect::default());
                 panel.close_rect = UiRect::default();
                 panel.toggle_rect = UiRect::default();
                 panel.bottom_unlock_rect = UiRect::default();
@@ -17399,7 +17480,11 @@ impl Game {
                     .unwrap_or_default()
                     .iter()
                     .map(|n| {
-                        let id = n.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                        let id = n
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
                         let cat = n
                             .get("category")
                             .and_then(|v| v.as_str())
@@ -17415,7 +17500,11 @@ impl Game {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let label = n.get("label").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+                        let label = n
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&id)
+                            .to_string();
                         let desc = n
                             .get("description")
                             .and_then(|v| v.as_str())
@@ -17468,8 +17557,14 @@ impl Game {
                             from: Vector2::new(0.0, 0.0),
                             to: Vector2::new(0.0, 80.0),
                             stops: vec![
-                                GradientPoint { stop: 0.0, color: Color::from_rgba(156, 94, 45, 255) },
-                                GradientPoint { stop: 1.0, color: Color::from_rgba(116, 68, 32, 255) },
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(156, 94, 45, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(116, 68, 32, 255),
+                                },
                             ],
                         }
                         .into(),
@@ -17508,8 +17603,14 @@ impl Game {
                             from: Vector2::new(0.0, 0.0),
                             to: Vector2::new(0.0, 60.0),
                             stops: vec![
-                                GradientPoint { stop: 0.0, color: Color::from_rgba(64, 215, 255, 255) },
-                                GradientPoint { stop: 1.0, color: Color::from_rgba(20, 135, 220, 255) },
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(64, 215, 255, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(20, 135, 220, 255),
+                                },
                             ],
                         }
                         .into(),
@@ -17627,8 +17728,14 @@ impl Game {
                             from: Vector2::new(0.0, 0.0),
                             to: Vector2::new(0.0, 54.0),
                             stops: vec![
-                                GradientPoint { stop: 0.0, color: Color::from_rgba(126, 228, 70, 255) },
-                                GradientPoint { stop: 1.0, color: Color::from_rgba(50, 164, 34, 255) },
+                                GradientPoint {
+                                    stop: 0.0,
+                                    color: Color::from_rgba(126, 228, 70, 255),
+                                },
+                                GradientPoint {
+                                    stop: 1.0,
+                                    color: Color::from_rgba(50, 164, 34, 255),
+                                },
                             ],
                         }
                         .into(),
@@ -17774,12 +17881,16 @@ impl Game {
             panel.built = true;
         }
 
-        if self.gk_selected_node_index.map_or(true, |i| i >= panel.node_ids.len()) {
+        if self
+            .gk_selected_node_index
+            .map_or(true, |i| i >= panel.node_ids.len())
+        {
             let first_locked = panel
                 .node_ids
                 .iter()
                 .position(|id| !self.gk_unlocked_nodes.contains(id));
-            self.gk_selected_node_index = first_locked.or_else(|| (!panel.node_ids.is_empty()).then_some(0));
+            self.gk_selected_node_index =
+                first_locked.or_else(|| (!panel.node_ids.is_empty()).then_some(0));
         }
 
         let ws = self.window_size;
@@ -17816,15 +17927,27 @@ impl Game {
         } else {
             ("加成停用", Color::from_rgba(176, 72, 52, 255))
         };
-        ui.send(panel.toggle_bg, WidgetMessage::Background(Brush::Solid(toggle_bg_color).into()));
+        ui.send(
+            panel.toggle_bg,
+            WidgetMessage::Background(Brush::Solid(toggle_bg_color).into()),
+        );
         send_rect(ui, panel.toggle_bg, panel.toggle_rect);
         send_rect_text(ui, panel.toggle_text, panel.toggle_rect);
-        ui.send(panel.toggle_text, TextMessage::Text(toggle_label.to_string()));
+        ui.send(
+            panel.toggle_text,
+            TextMessage::Text(toggle_label.to_string()),
+        );
 
-        ui.send(panel.kp_text, TextMessage::Text(format!("KP {}", self.gk_available_kp)));
+        ui.send(
+            panel.kp_text,
+            TextMessage::Text(format!("KP {}", self.gk_available_kp)),
+        );
         send_rect_text(ui, panel.kp_text, rr(1510.0, 18.0, 330.0, 56.0));
         send_rect_text(ui, panel.status_text, rr(360.0, 736.0, 1200.0, 48.0));
-        ui.send(panel.status_text, TextMessage::Text(self.gk_panel_status.clone()));
+        ui.send(
+            panel.status_text,
+            TextMessage::Text(self.gk_panel_status.clone()),
+        );
 
         let node_ids_snap = panel.node_ids.clone();
         let node_kp_snap = panel.node_kp_costs.clone();
@@ -17880,7 +18003,10 @@ impl Game {
             }
             if let Some(h) = panel.cat_header_texts.get(cat_idx).copied() {
                 send_rect_text(ui, h, hdr_r);
-                ui.send(h, TextMessage::Text(gk_cat_display_name(cat_name).to_string()));
+                ui.send(
+                    h,
+                    TextMessage::Text(gk_cat_display_name(cat_name).to_string()),
+                );
             }
         }
 
@@ -17901,19 +18027,32 @@ impl Game {
                 };
                 let mid_y = (from.y + to.y) * 0.5;
                 let segments = [
-                    (from.x - 4.0, from.y + NODE_SIZE * 0.43, 8.0, (mid_y - from.y).abs()),
+                    (
+                        from.x - 4.0,
+                        from.y + NODE_SIZE * 0.43,
+                        8.0,
+                        (mid_y - from.y).abs(),
+                    ),
                     (
                         from.x.min(to.x) - 4.0,
                         mid_y - 4.0,
                         (to.x - from.x).abs() + 8.0,
                         8.0,
                     ),
-                    (to.x - 4.0, mid_y, 8.0, (to.y - mid_y - NODE_SIZE * 0.43).max(0.0)),
+                    (
+                        to.x - 4.0,
+                        mid_y,
+                        8.0,
+                        (to.y - mid_y - NODE_SIZE * 0.43).max(0.0),
+                    ),
                 ];
                 for (x, y, w, h) in segments {
                     if let Some(line) = panel.connector_lines.get(line_idx).copied() {
                         send_rect(ui, line, rr(x, y, w.max(8.0), h.max(8.0)));
-                        ui.send(line, WidgetMessage::Background(Brush::Solid(line_color).into()));
+                        ui.send(
+                            line,
+                            WidgetMessage::Background(Brush::Solid(line_color).into()),
+                        );
                     }
                     line_idx += 1;
                 }
@@ -17925,7 +18064,12 @@ impl Game {
 
         for (i, node_id) in node_ids_snap.iter().enumerate() {
             let center = centers[i];
-            let node_r = rr(center.x - NODE_SIZE * 0.5, center.y - NODE_SIZE * 0.5, NODE_SIZE, NODE_SIZE);
+            let node_r = rr(
+                center.x - NODE_SIZE * 0.5,
+                center.y - NODE_SIZE * 0.5,
+                NODE_SIZE,
+                NODE_SIZE,
+            );
             panel.node_rects[i] = node_r;
             let unlocked = self.gk_unlocked_nodes.contains(node_id);
             let prereq_met = node_requires_snap[i]
@@ -17971,18 +18115,36 @@ impl Game {
             send_rect(ui, node.ring, ring_r);
             send_rect(ui, node.face, face_r);
             send_rect_text(ui, node.symbol_text, face_r);
-            ui.send(node.halo, WidgetMessage::Background(Brush::Solid(halo_color).into()));
-            ui.send(node.ring, WidgetMessage::Background(Brush::Solid(ring_color).into()));
-            ui.send(node.face, WidgetMessage::Background(Brush::Solid(face_color).into()));
-            ui.send(node.symbol_text, WidgetMessage::Foreground(Brush::Solid(glyph_color).into()));
+            ui.send(
+                node.halo,
+                WidgetMessage::Background(Brush::Solid(halo_color).into()),
+            );
+            ui.send(
+                node.ring,
+                WidgetMessage::Background(Brush::Solid(ring_color).into()),
+            );
+            ui.send(
+                node.face,
+                WidgetMessage::Background(Brush::Solid(face_color).into()),
+            );
             ui.send(
                 node.symbol_text,
-                TextMessage::Text(gk_node_symbol(&node_cat_snap[i], &node_labels_snap[i], &node_descs_snap[i]).to_string()),
+                WidgetMessage::Foreground(Brush::Solid(glyph_color).into()),
+            );
+            ui.send(
+                node.symbol_text,
+                TextMessage::Text(
+                    gk_node_symbol(&node_cat_snap[i], &node_labels_snap[i], &node_descs_snap[i])
+                        .to_string(),
+                ),
             );
 
             let label_r = rr(center.x - 70.0, center.y + 52.0, 140.0, 42.0);
             send_rect_text(ui, node.label_text, label_r);
-            ui.send(node.label_text, TextMessage::Text(td_wrap_ui_text(&node_labels_snap[i], 8, 2)));
+            ui.send(
+                node.label_text,
+                TextMessage::Text(td_wrap_ui_text(&node_labels_snap[i], 8, 2)),
+            );
             let kp_r = rr(center.x - 44.0, center.y - 76.0, 88.0, 22.0);
             send_rect_text(ui, node.kp_text, kp_r);
             let kp_label = if unlocked {
@@ -17996,15 +18158,27 @@ impl Game {
         }
 
         let selected_i = self.gk_selected_node_index.unwrap_or(0);
-        let selected_id = node_ids_snap.get(selected_i).map(|s| s.as_str()).unwrap_or("");
+        let selected_id = node_ids_snap
+            .get(selected_i)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let selected_label = node_labels_snap
             .get(selected_i)
             .map(|s| s.as_str())
             .unwrap_or(selected_id);
-        let selected_desc = node_descs_snap.get(selected_i).map(|s| s.as_str()).unwrap_or("");
-        let selected_cat = node_cat_snap.get(selected_i).map(|s| s.as_str()).unwrap_or("global");
+        let selected_desc = node_descs_snap
+            .get(selected_i)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let selected_cat = node_cat_snap
+            .get(selected_i)
+            .map(|s| s.as_str())
+            .unwrap_or("global");
         let selected_cost = node_kp_snap.get(selected_i).copied().unwrap_or(0);
-        let selected_reqs = node_requires_snap.get(selected_i).cloned().unwrap_or_default();
+        let selected_reqs = node_requires_snap
+            .get(selected_i)
+            .cloned()
+            .unwrap_or_default();
         let selected_unlocked = self.gk_unlocked_nodes.contains(selected_id);
         let selected_prereq_met = selected_reqs
             .iter()
@@ -18018,12 +18192,20 @@ impl Game {
         send_rect_text(ui, panel.bottom_icon_text, rr(188.0, 852.0, 100.0, 100.0));
         ui.send(
             panel.bottom_icon_text,
-            TextMessage::Text(gk_node_symbol(selected_cat, selected_label, selected_desc).to_string()),
+            TextMessage::Text(
+                gk_node_symbol(selected_cat, selected_label, selected_desc).to_string(),
+            ),
         );
         send_rect_text(ui, panel.bottom_title, rr(346.0, 816.0, 760.0, 52.0));
-        ui.send(panel.bottom_title, TextMessage::Text(selected_label.to_string()));
+        ui.send(
+            panel.bottom_title,
+            TextMessage::Text(selected_label.to_string()),
+        );
         send_rect_text(ui, panel.bottom_desc, rr(346.0, 872.0, 980.0, 96.0));
-        ui.send(panel.bottom_desc, TextMessage::Text(selected_desc.to_string()));
+        ui.send(
+            panel.bottom_desc,
+            TextMessage::Text(selected_desc.to_string()),
+        );
         let cost_text = if selected_unlocked {
             "狀態：已解鎖".to_string()
         } else if !selected_prereq_met {
@@ -18058,7 +18240,10 @@ impl Game {
             unlock_color = Color::from_rgba(64, 176, 48, 255);
             panel.bottom_unlock_rect = rr(1418.0, 900.0, 250.0, 58.0);
         }
-        ui.send(panel.bottom_unlock_bg, WidgetMessage::Background(Brush::Solid(unlock_color).into()));
+        ui.send(
+            panel.bottom_unlock_bg,
+            WidgetMessage::Background(Brush::Solid(unlock_color).into()),
+        );
         let unlock_r = if panel.bottom_unlock_rect.w > 0.0 {
             panel.bottom_unlock_rect
         } else {
@@ -18066,7 +18251,10 @@ impl Game {
         };
         send_rect(ui, panel.bottom_unlock_bg, unlock_r);
         send_rect_text(ui, panel.bottom_unlock_text, unlock_r);
-        ui.send(panel.bottom_unlock_text, TextMessage::Text(unlock_label.to_string()));
+        ui.send(
+            panel.bottom_unlock_text,
+            TextMessage::Text(unlock_label.to_string()),
+        );
 
         self.gk_panel_ui.visible_applied = true;
     }
@@ -18296,13 +18484,12 @@ impl Game {
                 // 沙箱分類的熱鍵在非沙箱 session 一定會被後端 SandboxMode 閘門
                 // 擋下（見 omoba-core player_input_tick.rs），面板上標註提醒，
                 // 避免玩家以為按了沒反應是 bug。
-                let label_text = if def.category == hotkeys::HotkeyCategory::Sandbox
-                    && !self.sandbox_mode
-                {
-                    format!("{}（需沙箱模式）", def.label)
-                } else {
-                    def.label.to_string()
-                };
+                let label_text =
+                    if def.category == hotkeys::HotkeyCategory::Sandbox && !self.sandbox_mode {
+                        format!("{}（需沙箱模式）", def.label)
+                    } else {
+                        def.label.to_string()
+                    };
                 let label = TextBuilder::new(
                     WidgetBuilder::new()
                         .with_desired_position(hidden)
@@ -19673,25 +19860,20 @@ mod input_latency_tests {
 
     #[test]
     fn twin_gate_reported_green_gap_accepts_tower_placement() {
-        let template =
-            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let template = td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
         let mut game = Game::default();
         game.hero_state.gold = 1_000;
         game.td_paths_render = twin_gate_render_paths();
 
-        let reason = game
-            .tower_placement_block_reason(
-                &template,
-                backend_to_frontend_world(-420.0, -250.0),
-            );
+        let reason =
+            game.tower_placement_block_reason(&template, backend_to_frontend_world(-420.0, -250.0));
 
         assert_eq!(reason, None);
     }
 
     #[test]
     fn twin_gate_frontend_matches_backend_for_reported_blocked_point() {
-        let template =
-            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let template = td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
         let mut game = Game::default();
         game.hero_state.gold = 1_000;
         game.td_paths_render = twin_gate_render_paths();
@@ -19711,8 +19893,7 @@ mod input_latency_tests {
 
     #[test]
     fn tower_placement_reports_road_and_gold_rejections() {
-        let template =
-            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let template = td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
         let mut game = Game::default();
         game.hero_state.gold = 1_000;
         game.td_paths_render = twin_gate_render_paths();
@@ -19739,8 +19920,7 @@ mod input_latency_tests {
 
     #[test]
     fn tower_road_clearance_uses_visual_placement_radius() {
-        let template =
-            td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
+        let template = td_template_from_snapshot(&sample_tower_template(200, 350.0, "base.png"));
         let mut game = Game::default();
         game.hero_state.gold = 1_000;
         game.td_paths_render = vec![vec![

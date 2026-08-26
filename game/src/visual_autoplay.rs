@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use omoba_core::runtime::{
     run_td_autoplay_1_to_100_observed, SimWorldSnapshot, TdAutoplayFrame,
-    TdAutoplayObservedOutcome, TdAutoplayObserverControl, TdAutoplayRunConfig,
-    TdAutoplayRunStatus,
+    TdAutoplayObservedOutcome, TdAutoplayObserverControl, TdAutoplayRunConfig, TdAutoplayRunStatus,
 };
 
 pub const VISUAL_AUTOPLAY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
