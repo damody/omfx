@@ -78,7 +78,7 @@ pub(crate) mod pregame;
 #[path = "render_bridge.rs"]
 pub(crate) mod render_bridge;
 #[path = "filtered_render_bridge.rs"]
-pub(crate) mod filtered_render_bridge;
+pub mod filtered_render_bridge;
 #[path = "sim_runner.rs"]
 pub(crate) mod sim_runner;
 #[path = "sprite_resources.rs"]
