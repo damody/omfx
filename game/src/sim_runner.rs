@@ -320,6 +320,137 @@ pub struct SimRunnerDiagnostics {
     pub backlog_receives: u32,
 }
 
+pub struct SelectiveReplicaOwner {
+    runtime: Option<omoba_core::runtime::SelectiveReplicaRuntime>,
+    barrier: BTreeMap<u64, Arc<[u8]>>,
+    expected_team_sequence: u64,
+    negotiated_buffer_ticks: usize,
+    pub stall: omoba_core::runtime::ReplicaStallState,
+    pub last_disclosed_render: Option<omoba_core::runtime::FilteredRenderSnapshot>,
+    pub accepted_inputs: Vec<omoba_core::game_proto::TeamAcceptedInput>,
+    staging: omoba_core::runtime::IncompleteSnapshotStaging,
+}
+
+impl std::fmt::Debug for SelectiveReplicaOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SelectiveReplicaOwner")
+            .field("bootstrapped", &self.runtime.is_some())
+            .field("barrier_len", &self.barrier.len())
+            .field("expected_team_sequence", &self.expected_team_sequence)
+            .field("negotiated_buffer_ticks", &self.negotiated_buffer_ticks)
+            .field("stall", &self.stall).finish()
+    }
+}
+
+impl Default for SelectiveReplicaOwner {
+    fn default() -> Self {
+        Self {
+            runtime: None,
+            barrier: BTreeMap::new(),
+            expected_team_sequence: 0,
+            negotiated_buffer_ticks: 12,
+            stall: omoba_core::runtime::ReplicaStallState::Running,
+            last_disclosed_render: None,
+            accepted_inputs: Vec::new(),
+            staging: omoba_core::runtime::IncompleteSnapshotStaging::default(),
+        }
+    }
+}
+
+impl SelectiveReplicaOwner {
+    pub fn bootstrap(&mut self, start: &omoba_core::game_proto::TeamGameStart) -> Result<(), String> {
+        let mut runtime = omoba_core::runtime::SelectiveReplicaRuntime::bootstrap_from_team_game_start(
+            start, Default::default(), Default::default(),
+        ).map_err(|error| format!("selective bootstrap: {error:?}"))?;
+        self.expected_team_sequence = start.next_team_sequence;
+        self.negotiated_buffer_ticks = if start.replica_buffer_ticks == 0 {
+            12
+        } else {
+            start.replica_buffer_ticks.clamp(3, 24) as usize
+        };
+        self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
+        self.runtime = Some(runtime);
+        self.barrier.clear();
+        self.stall = omoba_core::runtime::ReplicaStallState::Running;
+        Ok(())
+    }
+
+    pub fn receive_frame(
+        &mut self,
+        frame: &omoba_core::game_proto::TeamTickFrame,
+        encoded: Arc<[u8]>,
+    ) -> Result<(), String> {
+        if self.runtime.is_none() { return Err("selective frame before bootstrap".into()); }
+        self.barrier.entry(frame.team_sequence).or_insert(encoded);
+        self.advance_barrier()
+    }
+
+    fn advance_barrier(&mut self) -> Result<(), String> {
+        if !self.barrier.contains_key(&self.expected_team_sequence) {
+            if let Some(received) = self.barrier.keys().next().copied() {
+                self.stall = omoba_core::runtime::ReplicaStallState::MissingSequence {
+                    expected: self.expected_team_sequence,
+                    received,
+                };
+            }
+            return Ok(());
+        }
+        if self.barrier.len() < self.negotiated_buffer_ticks { return Ok(()); }
+        while let Some(encoded) = self.barrier.remove(&self.expected_team_sequence) {
+            let runtime = self.runtime.as_mut().expect("checked runtime");
+            let result = runtime.apply_encoded_frame(&encoded, &mut omoba_core::runtime::NoopDisclosedWorldStepper)
+                .map_err(|error| format!("selective frame apply: {error:?}"))?;
+            match result {
+                omoba_core::runtime::FrameApplyResult::Applied { team_sequence, .. } => {
+                    self.expected_team_sequence = team_sequence.saturating_add(1);
+                    self.accepted_inputs.extend(runtime.take_accepted_inputs());
+                    self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
+                    self.stall = omoba_core::runtime::ReplicaStallState::Running;
+                }
+                omoba_core::runtime::FrameApplyResult::Duplicate => {}
+                omoba_core::runtime::FrameApplyResult::Stalled(stall) => {
+                    self.stall = stall;
+                    break;
+                }
+            }
+            if self.barrier.len() < self.negotiated_buffer_ticks { break; }
+        }
+        Ok(())
+    }
+
+    pub fn receive_rebase_chunk(&mut self, chunk: &omoba_core::game_proto::TeamViewRebaseChunk) -> bool {
+        if chunk.chunk_index == 0 {
+            if let Some(snapshot_id) = chunk.snapshot_id.clone() {
+                self.staging.begin(snapshot_id, chunk.chunk_count);
+            }
+        }
+        self.staging.insert(chunk)
+    }
+
+    pub fn receive_rebase_manifest(&mut self, manifest: &omoba_core::game_proto::TeamViewRebase) -> Result<(), String> {
+        let bytes = self.staging.finish(manifest).ok_or_else(|| "unverified selective rebase".to_string())?;
+        let snapshot = omoba_core::game_proto::FilteredTeamSnapshot {
+            snapshot_schema_version: manifest.snapshot_schema_version,
+            snapshot_id: manifest.snapshot_id.clone(),
+            team_id: manifest.team_id,
+            view_epoch: manifest.view_epoch.clone(),
+            authoritative_tick: manifest.authoritative_tick,
+            disclosed_world: bytes.clone(),
+            public_metadata: Vec::new(),
+            team_private_metadata: Vec::new(),
+            filtered_snapshot_hash: manifest.filtered_snapshot_hash.clone(),
+        };
+        let runtime = self.runtime.as_mut().ok_or_else(|| "rebase before bootstrap".to_string())?;
+        runtime.apply_verified_rebase(&snapshot, manifest, &bytes)
+            .map_err(|error| format!("selective rebase apply: {error:?}"))?;
+        self.expected_team_sequence = manifest.resume_team_sequence;
+        self.barrier.retain(|sequence, _| *sequence >= self.expected_team_sequence);
+        self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
+        self.stall = omoba_core::runtime::ReplicaStallState::Running;
+        Ok(())
+    }
+}
+
 /// 返回 omfx 遊戲的句柄，以便渲染線程可以讀取快照
 /// 鎖步饋線可以推送刻度輸入。
 #[derive(Debug)]
@@ -331,6 +462,7 @@ pub struct SimRunnerHandle {
     pub tick_input_tx: Sender<TickBatchPayload>,
     /// Low-frequency sim_runner profile snapshot for render-frame SLO logs.
     pub diagnostics: Arc<Mutex<SimRunnerDiagnostics>>,
+    pub selective_replica: Arc<Mutex<SelectiveReplicaOwner>>,
     /// 在「GameStart」到達後發送「master_seed」一次。這
     /// 在初始化世界之前，工作人員會阻止此操作，因此
     /// MasterSeed 資源在第一個tick 運行之前設定。
@@ -379,6 +511,7 @@ pub fn spawn_sim_runner_with_render_extract_rate(
     let state = Arc::new(Mutex::new(SimWorldSnapshot::default()));
     let state_for_thread = state.clone();
     let diagnostics = Arc::new(Mutex::new(SimRunnerDiagnostics::default()));
+    let selective_replica = Arc::new(Mutex::new(SelectiveReplicaOwner::default()));
     let diagnostics_for_thread = diagnostics.clone();
 
     let (tick_input_tx, tick_input_rx) = unbounded::<TickBatchPayload>();
@@ -405,6 +538,7 @@ pub fn spawn_sim_runner_with_render_extract_rate(
         state,
         tick_input_tx,
         diagnostics,
+        selective_replica,
         master_seed_tx,
         cancel_tx,
         _thread: handle,
@@ -1381,6 +1515,7 @@ mod tests {
             state: Arc::new(Mutex::new(SimWorldSnapshot::default())),
             tick_input_tx,
             diagnostics: Arc::new(Mutex::new(SimRunnerDiagnostics::default())),
+            selective_replica: Arc::new(Mutex::new(SelectiveReplicaOwner::default())),
             master_seed_tx,
             cancel_tx,
             _thread: thread,

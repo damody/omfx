@@ -81,6 +81,19 @@ pub struct LockstepTickInput {
 
 #[derive(Debug, Clone)]
 pub enum LockstepEvent {
+    SelectiveConnected {
+        start: omoba_core::game_proto::TeamGameStart,
+    },
+    SelectiveTeamFrame {
+        frame: omoba_core::game_proto::TeamTickFrame,
+        encoded: Arc<[u8]>,
+    },
+    SelectiveRebaseChunk {
+        chunk: omoba_core::game_proto::TeamViewRebaseChunk,
+    },
+    SelectiveRebaseManifest {
+        manifest: omoba_core::game_proto::TeamViewRebase,
+    },
     Connected {
         master_seed: u64,
         player_id: u32,
@@ -309,7 +322,7 @@ async fn run_client(
             &mut cancel_rx,
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                client.join_lockstep(player_name.clone(), player_id, false),
+                client.join_selective_lockstep(player_name.clone(), player_id),
             ),
         )
         .await
@@ -317,7 +330,7 @@ async fn run_client(
             Some(result) => result,
             None => return,
         };
-        let master_seed = match join_result {
+        let start = match join_result {
             Err(_timeout) => {
                 warn!("lockstep-client join_lockstep timed out after 10s (server may have rejected player_id={} as duplicate)", player_id);
                 send_or_return!(LockstepEvent::Disconnected {
@@ -332,19 +345,18 @@ async fn run_client(
                 });
                 continue;
             }
-            Ok(Ok(seed)) => seed,
+            Ok(Ok(start)) => start,
         };
         let player_id = client.lockstep_player_id().unwrap_or(0);
         let step_fps = client.lockstep_step_fps().unwrap_or(LOCKSTEP_TPS);
         info!(
-            "lockstep-client joined: master_seed=0x{:016x} player_id={} step_fps={}",
-            master_seed, player_id, step_fps
+            "selective lockstep client joined: team={} player_id={} step_fps={}",
+            start.team_id, player_id, step_fps
         );
-        send_or_return!(LockstepEvent::Connected {
-            master_seed,
-            player_id,
-            step_fps,
-        });
+        let mut expected_team_sequence = start.next_team_sequence;
+        let selective_view_epoch = start.view_epoch.as_ref().map_or(0, |epoch| epoch.value);
+        let mut replay_request_id = 1u64;
+        send_or_return!(LockstepEvent::SelectiveConnected { start });
 
         // 接管 lockstep 入站串流。`join_lockstep` 已經耗掉第一筆
         // `GameStart`，之後這個 rx 會回傳 `TickBatch` / `StateHash` /
@@ -470,6 +482,42 @@ async fn run_client(
                     {
                         return;
                     }
+                }
+                Ok(Some(LockstepInbound::TeamGameStart { msg, wire_bytes, logical_bytes })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    send_or_return!(LockstepEvent::SelectiveConnected { start: msg });
+                }
+                Ok(Some(LockstepInbound::TeamTickFrame { msg, encoded, wire_bytes, logical_bytes })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    last_known_tick = msg.replica_tick.min(u32::MAX as u64) as u32;
+                    latest_tick.store(last_known_tick, Ordering::Relaxed);
+                    last_stall_log = std::time::Instant::now();
+                    last_tickbatch_time = last_stall_log;
+                    if msg.team_sequence > expected_team_sequence {
+                        if let Err(error) = client.request_team_replay(
+                            replay_request_id,
+                            expected_team_sequence,
+                            selective_view_epoch,
+                        ).await {
+                            warn!("selective replay request failed: {}", error);
+                        }
+                        replay_request_id = replay_request_id.saturating_add(1);
+                    } else if msg.team_sequence == expected_team_sequence {
+                        expected_team_sequence = expected_team_sequence.saturating_add(1);
+                    }
+                    send_or_return!(LockstepEvent::SelectiveTeamFrame { frame: msg, encoded });
+                }
+                Ok(Some(LockstepInbound::TeamViewRebaseChunk { msg, wire_bytes, logical_bytes })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    send_or_return!(LockstepEvent::SelectiveRebaseChunk { chunk: msg });
+                }
+                Ok(Some(LockstepInbound::TeamViewRebaseManifest { msg, wire_bytes, logical_bytes })) => {
+                    wire_delta += wire_bytes as u64;
+                    logical_delta += logical_bytes as u64;
+                    send_or_return!(LockstepEvent::SelectiveRebaseManifest { manifest: msg });
                 }
                 Ok(Some(LockstepInbound::StateHash {
                     msg: sh,

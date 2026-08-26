@@ -6555,6 +6555,38 @@ impl Plugin for Game {
         ) {
             while let Ok(ev) = lh.events_rx.try_recv() {
                 match ev {
+                    lockstep_client::LockstepEvent::SelectiveConnected { start } => {
+                        self.server_step_fps = start.tick_rate_hz;
+                        self.current_sim_tick = start.replica_start_tick.min(u32::MAX as u64) as u32;
+                        if let Ok(mut owner) = sim.selective_replica.lock() {
+                            if let Err(error) = owner.bootstrap(&start) {
+                                log::error!("[selective-lockstep] {}", error);
+                            }
+                        }
+                    }
+                    lockstep_client::LockstepEvent::SelectiveTeamFrame { frame, encoded } => {
+                        self.current_sim_tick = frame.replica_tick.min(u32::MAX as u64) as u32;
+                        self.current_sim_tick_observed_at = Some(now);
+                        if let Ok(mut owner) = sim.selective_replica.lock() {
+                            if let Err(error) = owner.receive_frame(&frame, encoded) {
+                                log::error!("[selective-lockstep] {}", error);
+                            }
+                        }
+                    }
+                    lockstep_client::LockstepEvent::SelectiveRebaseChunk { chunk } => {
+                        if let Ok(mut owner) = sim.selective_replica.lock() {
+                            if !owner.receive_rebase_chunk(&chunk) {
+                                log::warn!("[selective-lockstep] rejected rebase chunk");
+                            }
+                        }
+                    }
+                    lockstep_client::LockstepEvent::SelectiveRebaseManifest { manifest } => {
+                        if let Ok(mut owner) = sim.selective_replica.lock() {
+                            if let Err(error) = owner.receive_rebase_manifest(&manifest) {
+                                log::error!("[selective-lockstep] {}", error);
+                            }
+                        }
+                    }
                     lockstep_client::LockstepEvent::Connected {
                         master_seed,
                         player_id,
