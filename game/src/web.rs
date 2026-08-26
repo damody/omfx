@@ -380,6 +380,10 @@ fn send_initial_join(socket: &WebSocket, player_name: &str) -> Result<(), String
             player_name: player_name.to_string(),
             role: JoinRole::RolePlayer as i32,
             player_id: 1,
+            requested_protocol: 1,
+            supported_protocols: vec![1],
+            secure_fog_capability: false,
+            view_epoch: 0,
         },
     )
 }
