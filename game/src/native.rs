@@ -6572,12 +6572,13 @@ impl Plugin for Game {
                     lockstep_client::LockstepEvent::SelectiveTeamFrame { frame, encoded } => {
                         self.current_sim_tick = frame.replica_tick.min(u32::MAX as u64) as u32;
                         self.current_sim_tick_observed_at = Some(now);
-                        let filtered_snapshot = if let Ok(mut owner) = sim.selective_replica.lock() {
+                        let (filtered_snapshot, controls) = if let Ok(mut owner) = sim.selective_replica.lock() {
                             if let Err(error) = owner.receive_frame(&frame, encoded) {
                                 log::error!("[selective-lockstep] {}", error);
                             }
-                            owner.last_disclosed_render.clone()
-                        } else { None };
+                            (owner.last_disclosed_render.clone(), owner.take_controls())
+                        } else { (None, Vec::new()) };
+                        for control in controls { let _ = lh.selective_control_tx.send(control); }
                         if let Some(snapshot) = filtered_snapshot {
                             let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
                         }
@@ -6590,12 +6591,13 @@ impl Plugin for Game {
                         }
                     }
                     lockstep_client::LockstepEvent::SelectiveRebaseManifest { manifest } => {
-                        let filtered_snapshot = if let Ok(mut owner) = sim.selective_replica.lock() {
+                        let (filtered_snapshot, controls) = if let Ok(mut owner) = sim.selective_replica.lock() {
                             if let Err(error) = owner.receive_rebase_manifest(&manifest) {
                                 log::error!("[selective-lockstep] {}", error);
                             }
-                            owner.last_disclosed_render.clone()
-                        } else { None };
+                            (owner.last_disclosed_render.clone(), owner.take_controls())
+                        } else { (None, Vec::new()) };
+                        for control in controls { let _ = lh.selective_control_tx.send(control); }
                         if let Some(snapshot) = filtered_snapshot {
                             let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
                         }

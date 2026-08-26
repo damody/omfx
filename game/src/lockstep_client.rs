@@ -144,11 +144,18 @@ pub struct LockstepClientHandle {
     /// 階段 2 暫存區 — UI 還不會產生輸入；階段 3 會透過這裡
     /// 將玩家輸入轉交背景 client，並由背景端呼叫 `submit_input`。
     pub input_tx: Sender<LockstepInputMsg>,
+    pub selective_control_tx: Sender<SelectiveClientControl>,
     input_id_counter: AtomicU32,
     latest_tick: Arc<AtomicU32>,
     cancel_tx: watch::Sender<bool>,
     /// 保留 join handle，讓 session shutdown 能等待背景執行緒結束。
     _thread: thread::JoinHandle<()>,
+}
+
+#[derive(Clone, Debug)]
+pub enum SelectiveClientControl {
+    HashMismatch(omoba_core::game_proto::ClientTeamHashMismatch),
+    RebaseVerified { team_id: u32, resume_sequence: u64, view_epoch: u64 },
 }
 
 impl LockstepClientHandle {
@@ -200,6 +207,7 @@ pub fn spawn_lockstep_client(
 ) -> LockstepClientHandle {
     let (events_tx, events_rx) = unbounded();
     let (input_tx, input_rx) = unbounded::<LockstepInputMsg>();
+    let (selective_control_tx, selective_control_rx) = unbounded::<SelectiveClientControl>();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let latest_tick = Arc::new(AtomicU32::new(0));
     let latest_tick_for_thread = latest_tick.clone();
@@ -227,6 +235,7 @@ pub fn spawn_lockstep_client(
                     player_id,
                     events_tx,
                     input_rx,
+                    selective_control_rx,
                     latest_tick_for_thread,
                     cancel_rx,
                 )
@@ -238,6 +247,7 @@ pub fn spawn_lockstep_client(
     LockstepClientHandle {
         events_rx,
         input_tx,
+        selective_control_tx,
         input_id_counter: AtomicU32::new(1),
         latest_tick,
         cancel_tx,
@@ -251,6 +261,7 @@ async fn run_client(
     player_id: u32,
     events_tx: Sender<LockstepEvent>,
     input_rx: Receiver<LockstepInputMsg>,
+    selective_control_rx: Receiver<SelectiveClientControl>,
     latest_tick: Arc<AtomicU32>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
@@ -431,57 +442,9 @@ async fn run_client(
                     });
                     break 'inner;
                 }
-                Ok(Some(LockstepInbound::TickBatch {
-                    msg: b,
-                    wire_bytes,
-                    logical_bytes,
-                })) => {
-                    let client_receive_us = wall_clock_us();
-                    wire_delta += wire_bytes as u64;
-                    logical_delta += logical_bytes as u64;
-                    tick_batches_since_log += 1;
-                    last_known_tick = b.tick;
-                    latest_tick.store(b.tick, Ordering::Relaxed);
-                    let now = std::time::Instant::now();
-                    last_stall_log = now;
-                    last_tickbatch_time = now;
-                    if now.duration_since(last_hb_log).as_secs() >= 5 {
-                        debug!(
-                            "[lockstep-client] healthy: {} TickBatch frames in last 5s (latest tick={})",
-                            tick_batches_since_log, b.tick,
-                        );
-                        last_hb_log = now;
-                        tick_batches_since_log = 0;
-                    }
-                    // 階段 3.3：從 `InputForPlayer` 的各列抽出輸入與 edge metadata。
-                    let inputs: Vec<LockstepTickInput> = b
-                        .inputs
-                        .into_iter()
-                        .filter_map(|ifp| {
-                            ifp.input.map(|inp| LockstepTickInput {
-                                player_id: ifp.player_id,
-                                input: inp,
-                                input_id: ifp.input_id,
-                                server_receive_tick: ifp.server_receive_tick,
-                                server_drain_tick: ifp.server_drain_tick,
-                                server_queue_us: ifp.server_queue_us,
-                                client_receive_us,
-                            })
-                        })
-                        .collect();
-                    let server_events = b.server_events;
-                    if events_tx
-                        .send(LockstepEvent::TickBatch {
-                            tick: b.tick,
-                            inputs,
-                            server_events,
-                            lua_content_generation: b.lua_content_generation,
-                            lua_content_hash: b.lua_content_hash,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+                Ok(Some(LockstepInbound::TickBatch { .. })) => {
+                    warn!("secure selective session denied legacy TickBatch fallback");
+                    continue;
                 }
                 Ok(Some(LockstepInbound::TeamGameStart { msg, wire_bytes, logical_bytes })) => {
                     wire_delta += wire_bytes as u64;
@@ -519,17 +482,9 @@ async fn run_client(
                     logical_delta += logical_bytes as u64;
                     send_or_return!(LockstepEvent::SelectiveRebaseManifest { manifest: msg });
                 }
-                Ok(Some(LockstepInbound::StateHash {
-                    msg: sh,
-                    wire_bytes,
-                    logical_bytes,
-                })) => {
-                    wire_delta += wire_bytes as u64;
-                    logical_delta += logical_bytes as u64;
-                    let _ = events_tx.send(LockstepEvent::StateHash {
-                        tick: sh.tick,
-                        hash: sh.hash,
-                    });
+                Ok(Some(LockstepInbound::StateHash { .. })) => {
+                    warn!("secure selective session denied global StateHash fallback");
+                    continue;
                 }
                 Ok(Some(LockstepInbound::GameStart {
                     wire_bytes,
@@ -549,21 +504,9 @@ async fn run_client(
                     logical_delta += logical_bytes as u64;
                     let _ = events_tx.send(LockstepEvent::Latency { rtt_us });
                 }
-                Ok(Some(LockstepInbound::SnapshotResp {
-                    msg: resp,
-                    wire_bytes,
-                    logical_bytes,
-                })) => {
-                    wire_delta += wire_bytes as u64;
-                    logical_delta += logical_bytes as u64;
-                    let (bytes_len, schema) = match &resp.state {
-                        Some(s) => (s.world_bytes.len(), s.schema_version),
-                        None => (0, 0),
-                    };
-                    info!(
-                        "lockstep-client received SnapshotResp tick={} bytes={} schema={} (Phase 5.3 logs only; apply is Phase 5+)",
-                        resp.tick, bytes_len, schema
-                    );
+                Ok(Some(LockstepInbound::SnapshotResp { .. })) => {
+                    warn!("secure selective session denied global SnapshotResp fallback");
+                    continue;
                 }
             }
 
@@ -592,6 +535,17 @@ async fn run_client(
                         });
                     }
                     Err(e) => warn!("lockstep-client submit_input failed: {}", e),
+                }
+            }
+            while let Ok(control) = selective_control_rx.try_recv() {
+                let result = match control {
+                    SelectiveClientControl::HashMismatch(report) =>
+                        client.report_team_hash_mismatch(&report).await,
+                    SelectiveClientControl::RebaseVerified { team_id, resume_sequence, view_epoch } =>
+                        client.acknowledge_team_rebase(team_id, resume_sequence, view_epoch).await,
+                };
+                if let Err(error) = result {
+                    warn!("selective recovery control send failed: {}", error);
                 }
             }
 

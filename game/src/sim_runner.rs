@@ -329,7 +329,29 @@ pub struct SelectiveReplicaOwner {
     pub last_disclosed_render: Option<omoba_core::runtime::FilteredRenderSnapshot>,
     pub accepted_inputs: Vec<omoba_core::game_proto::TeamAcceptedInput>,
     staging: omoba_core::runtime::IncompleteSnapshotStaging,
+    pub metrics: SelectiveClientRecoveryMetrics,
+    diagnostics: Vec<RedactedSelectiveDiagnostic>,
+    controls: Vec<super::lockstep_client::SelectiveClientControl>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SelectiveClientRecoveryMetrics {
+    pub duplicate_frames: u64,
+    pub barrier_stalls: u64,
+    pub sequence_gaps: u64,
+    pub verified_rebases: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedactedSelectiveDiagnostic {
+    pub team_id: u32,
+    pub frame_sequence: u64,
+    pub replica_tick: u64,
+    pub reason_class: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecureRecoveryDisposition { Replay, Repair, Replace, FilteredRebase, Terminate }
 
 impl std::fmt::Debug for SelectiveReplicaOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -353,6 +375,9 @@ impl Default for SelectiveReplicaOwner {
             last_disclosed_render: None,
             accepted_inputs: Vec::new(),
             staging: omoba_core::runtime::IncompleteSnapshotStaging::default(),
+            metrics: SelectiveClientRecoveryMetrics::default(),
+            diagnostics: Vec::new(),
+            controls: Vec::new(),
         }
     }
 }
@@ -371,6 +396,7 @@ impl SelectiveReplicaOwner {
         self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
         self.runtime = Some(runtime);
         self.barrier.clear();
+        self.staging.discard();
         self.stall = omoba_core::runtime::ReplicaStallState::Running;
         Ok(())
     }
@@ -381,6 +407,20 @@ impl SelectiveReplicaOwner {
         encoded: Arc<[u8]>,
     ) -> Result<(), String> {
         if self.runtime.is_none() { return Err("selective frame before bootstrap".into()); }
+        if frame.team_sequence < self.expected_team_sequence {
+            self.metrics.duplicate_frames = self.metrics.duplicate_frames.saturating_add(1);
+            return Ok(());
+        }
+        if frame.team_sequence > self.expected_team_sequence {
+            self.metrics.sequence_gaps = self.metrics.sequence_gaps.saturating_add(1);
+            self.metrics.barrier_stalls = self.metrics.barrier_stalls.saturating_add(1);
+            self.diagnostics.push(RedactedSelectiveDiagnostic {
+                team_id: frame.team_id,
+                frame_sequence: frame.team_sequence,
+                replica_tick: frame.replica_tick,
+                reason_class: "MISSING_SEQUENCE",
+            });
+        }
         self.barrier.entry(frame.team_sequence).or_insert(encoded);
         self.advance_barrier()
     }
@@ -401,7 +441,20 @@ impl SelectiveReplicaOwner {
             let result = runtime.apply_encoded_frame(&encoded, &mut omoba_core::runtime::NoopDisclosedWorldStepper)
                 .map_err(|error| format!("selective frame apply: {error:?}"))?;
             match result {
-                omoba_core::runtime::FrameApplyResult::Applied { team_sequence, .. } => {
+                omoba_core::runtime::FrameApplyResult::Applied { team_sequence, team_hash, .. } => {
+                    if let Some((checkpoint, team_id, view_epoch)) = frame_checkpoint(&encoded) {
+                        if checkpoint.canonical_team_hash.as_slice() != team_hash.as_slice() {
+                            self.controls.push(super::lockstep_client::SelectiveClientControl::HashMismatch(
+                                omoba_core::game_proto::ClientTeamHashMismatch {
+                                    team_id,
+                                    frame_sequence: team_sequence,
+                                    replica_tick: checkpoint.replica_tick,
+                                    received_hash: team_hash.to_vec(),
+                                    view_epoch: Some(omoba_core::game_proto::ViewEpoch { value: view_epoch }),
+                                },
+                            ));
+                        }
+                    }
                     self.expected_team_sequence = team_sequence.saturating_add(1);
                     self.accepted_inputs.extend(runtime.take_accepted_inputs());
                     self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
@@ -447,8 +500,28 @@ impl SelectiveReplicaOwner {
         self.barrier.retain(|sequence, _| *sequence >= self.expected_team_sequence);
         self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
         self.stall = omoba_core::runtime::ReplicaStallState::Running;
+        self.metrics.verified_rebases = self.metrics.verified_rebases.saturating_add(1);
+        self.controls.push(super::lockstep_client::SelectiveClientControl::RebaseVerified {
+            team_id: manifest.team_id,
+            resume_sequence: manifest.resume_team_sequence,
+            view_epoch: manifest.view_epoch.as_ref().map_or(0, |epoch| epoch.value),
+        });
         Ok(())
     }
+
+    pub fn take_controls(&mut self) -> Vec<super::lockstep_client::SelectiveClientControl> {
+        std::mem::take(&mut self.controls)
+    }
+
+    pub fn diagnostic_bundle(&self) -> &[RedactedSelectiveDiagnostic] { &self.diagnostics }
+}
+
+fn frame_checkpoint(encoded: &[u8]) -> Option<(omoba_core::game_proto::TeamHashCheckpoint, u32, u64)> {
+    use prost::Message as _;
+    let frame = omoba_core::game_proto::TeamTickFrame::decode(encoded).ok()?;
+    let team_id = frame.team_id;
+    let view_epoch = frame.view_epoch.as_ref().map_or(0, |epoch| epoch.value);
+    Some((frame.post_step?.hash_checkpoint?, team_id, view_epoch))
 }
 
 /// 返回 omfx 遊戲的句柄，以便渲染線程可以讀取快照
