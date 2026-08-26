@@ -77,6 +77,8 @@ pub(crate) mod match_statistics;
 pub(crate) mod pregame;
 #[path = "render_bridge.rs"]
 pub(crate) mod render_bridge;
+#[path = "filtered_render_bridge.rs"]
+pub(crate) mod filtered_render_bridge;
 #[path = "sim_runner.rs"]
 pub(crate) mod sim_runner;
 #[path = "sprite_resources.rs"]
@@ -3453,6 +3455,9 @@ pub struct Game {
     render_bridge: render_bridge::RenderBridge,
     #[visit(skip)]
     #[reflect(hidden)]
+    filtered_render_bridge: filtered_render_bridge::FilteredRenderBridge,
+    #[visit(skip)]
+    #[reflect(hidden)]
     session_render_reset_pending: bool,
     #[visit(skip)]
     #[reflect(hidden)]
@@ -6567,10 +6572,14 @@ impl Plugin for Game {
                     lockstep_client::LockstepEvent::SelectiveTeamFrame { frame, encoded } => {
                         self.current_sim_tick = frame.replica_tick.min(u32::MAX as u64) as u32;
                         self.current_sim_tick_observed_at = Some(now);
-                        if let Ok(mut owner) = sim.selective_replica.lock() {
+                        let filtered_snapshot = if let Ok(mut owner) = sim.selective_replica.lock() {
                             if let Err(error) = owner.receive_frame(&frame, encoded) {
                                 log::error!("[selective-lockstep] {}", error);
                             }
+                            owner.last_disclosed_render.clone()
+                        } else { None };
+                        if let Some(snapshot) = filtered_snapshot {
+                            let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
                         }
                     }
                     lockstep_client::LockstepEvent::SelectiveRebaseChunk { chunk } => {
@@ -6581,10 +6590,14 @@ impl Plugin for Game {
                         }
                     }
                     lockstep_client::LockstepEvent::SelectiveRebaseManifest { manifest } => {
-                        if let Ok(mut owner) = sim.selective_replica.lock() {
+                        let filtered_snapshot = if let Ok(mut owner) = sim.selective_replica.lock() {
                             if let Err(error) = owner.receive_rebase_manifest(&manifest) {
                                 log::error!("[selective-lockstep] {}", error);
                             }
+                            owner.last_disclosed_render.clone()
+                        } else { None };
+                        if let Some(snapshot) = filtered_snapshot {
+                            let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
                         }
                     }
                     lockstep_client::LockstepEvent::Connected {
