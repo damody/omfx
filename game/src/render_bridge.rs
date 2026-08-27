@@ -13,6 +13,7 @@ use fyrox::core::algebra::{Vector2, Vector3};
 use fyrox::core::color::Color;
 use fyrox::core::pool::Handle;
 use fyrox::graph::prelude::*;
+use fyrox::material::{Material, MaterialResource};
 use fyrox::scene::base::BaseBuilder;
 use fyrox::scene::dim2::rectangle::RectangleBuilder;
 use fyrox::scene::transform::TransformBuilder;
@@ -20,6 +21,7 @@ use fyrox::scene::{node::Node, Scene};
 use omoba_core::lockstep_timing::LOCKSTEP_ONE_SECOND_TICKS_U32;
 
 use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
+use crate::sprite_resources::{BatchedSpriteMesh, QuadParams};
 
 const WORLD_SCALE: f32 = 0.01;
 const Z_RB_PATH: f32 = 4.4;
@@ -39,9 +41,9 @@ const REGION_OUTLINE_COLOR: (u8, u8, u8, u8) = (105, 105, 112, 190);
 /// （目前 omb 的 `BlockedRegion` 無半徑值），但為未來向前相容已預留。
 const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = REGION_OUTLINE_COLOR;
 const REGION_CIRCLE_SEGMENTS: usize = 32;
-const FOG_TILE_BACKEND: f32 = 100.0;
-const FOG_MIN_BACKEND: i32 = -2600;
-const FOG_MAX_BACKEND: i32 = 2600;
+const FOG_TILE_BACKEND: f32 = 10.0;
+const FOG_COLUMNS: i32 = 220;
+const FOG_ROWS: i32 = 180;
 const FOG_COLOR: (u8, u8, u8, u8) = (32, 36, 43, 165);
 
 /// 路徑鋸齒線寬（render 單位）。按 `64.0 *
@@ -65,7 +67,9 @@ pub struct RenderBridge {
     /// 行為與 `paths_drawn` 相同。
     region_nodes: Vec<Handle<Node>>,
     regions_drawn: bool,
-    fog_nodes: Vec<(Vector2<f32>, Handle<Node>)>,
+    fog_batch: Option<BatchedSpriteMesh>,
+    fog_slots: Vec<u32>,
+    fog_origin_cell: Option<(i32, i32)>,
     fog_occluders: Vec<crate::sim_runner::BlockedRegionSnapshot>,
 }
 
@@ -81,9 +85,11 @@ impl RenderBridge {
         for node in self.region_nodes.drain(..) {
             scene.graph.remove_node(node);
         }
-        for (_, node) in self.fog_nodes.drain(..) {
-            scene.graph.remove_node(node);
+        if let Some(batch) = self.fog_batch.take() {
+            scene.graph.remove_node(batch.mesh_handle());
         }
+        self.fog_slots.clear();
+        self.fog_origin_cell = None;
         self.fog_occluders.clear();
         self.last_applied_tick = None;
         self.paths_drawn = false;
@@ -248,36 +254,20 @@ impl RenderBridge {
     }
 
     fn ensure_fog_tiles(&mut self, scene: &mut Scene) {
-        if !self.fog_nodes.is_empty() {
+        if self.fog_batch.is_some() {
             return;
         }
-        let tile_render = FOG_TILE_BACKEND * WORLD_SCALE * 1.04;
-        for y in (FOG_MIN_BACKEND..=FOG_MAX_BACKEND).step_by(FOG_TILE_BACKEND as usize) {
-            for x in (FOG_MIN_BACKEND..=FOG_MAX_BACKEND).step_by(FOG_TILE_BACKEND as usize) {
-                let center = Vector2::new(x as f32, y as f32);
-                let node: Handle<Node> = RectangleBuilder::new(
-                    BaseBuilder::new().with_local_transform(
-                        TransformBuilder::new()
-                            .with_local_position(Vector3::new(
-                                -center.x * WORLD_SCALE,
-                                center.y * WORLD_SCALE,
-                                Z_FOG,
-                            ))
-                            .with_local_scale(Vector3::new(tile_render, tile_render, f32::EPSILON))
-                            .build(),
-                    ),
-                )
-                .with_color(Color::from_rgba(
-                    FOG_COLOR.0,
-                    FOG_COLOR.1,
-                    FOG_COLOR.2,
-                    FOG_COLOR.3,
-                ))
-                .build(&mut scene.graph)
-                .transmute();
-                self.fog_nodes.push((center, node));
-            }
+        let capacity = (FOG_COLUMNS * FOG_ROWS) as u32;
+        let mut batch = BatchedSpriteMesh::new(
+            scene,
+            capacity,
+            MaterialResource::new_embedded(Material::standard_2d()),
+        );
+        self.fog_slots.reserve(capacity as usize);
+        for _ in 0..capacity {
+            self.fog_slots.push(batch.alloc());
         }
+        self.fog_batch = Some(batch);
     }
 
     pub fn update_fog_of_war(
@@ -286,14 +276,50 @@ impl RenderBridge {
         hero_render: Option<Vector2<f32>>,
         vision_radius_backend: f32,
     ) {
-        let hero = hero_render.map(|value| value / WORLD_SCALE);
-        for (center, node) in &self.fog_nodes {
-            let visible = hero.is_some_and(|source| {
-                (*center - source).norm_squared() <= vision_radius_backend * vision_radius_backend
-                    && !segment_blocked(source, *center, &self.fog_occluders)
-            });
-            scene.graph[*node].set_visibility(!visible);
+        let Some(hero) = hero_render.map(|value| value / WORLD_SCALE) else {
+            return;
+        };
+        let hero_cell = (
+            (hero.x / FOG_TILE_BACKEND).floor() as i32,
+            (hero.y / FOG_TILE_BACKEND).floor() as i32,
+        );
+        if self.fog_origin_cell == Some(hero_cell) {
+            return;
         }
+        self.fog_origin_cell = Some(hero_cell);
+        let Some(batch) = self.fog_batch.as_mut() else {
+            return;
+        };
+        let tile_render = FOG_TILE_BACKEND * WORLD_SCALE * 1.02;
+        for row in 0..FOG_ROWS {
+            for column in 0..FOG_COLUMNS {
+                let cell_x = hero_cell.0 + column - FOG_COLUMNS / 2;
+                let cell_y = hero_cell.1 + row - FOG_ROWS / 2;
+                let center = Vector2::new(
+                    (cell_x as f32 + 0.5) * FOG_TILE_BACKEND,
+                    (cell_y as f32 + 0.5) * FOG_TILE_BACKEND,
+                );
+                let visible = (center - hero).norm_squared()
+                    <= vision_radius_backend * vision_radius_backend
+                    && !segment_blocked(hero, center, &self.fog_occluders);
+                let slot = self.fog_slots[(row * FOG_COLUMNS + column) as usize];
+                batch.write_quad(
+                    slot,
+                    &QuadParams {
+                        center: Vector2::new(-center.x * WORLD_SCALE, center.y * WORLD_SCALE),
+                        size: Vector2::new(tile_render, tile_render),
+                        color: if visible {
+                            [0, 0, 0, 0]
+                        } else {
+                            [FOG_COLOR.0, FOG_COLOR.1, FOG_COLOR.2, FOG_COLOR.3]
+                        },
+                        rotation: 0.0,
+                        z: Z_FOG,
+                    },
+                );
+            }
+        }
+        batch.flush(scene);
     }
 
     fn ensure_paths_drawn(&mut self, paths: &[Vec<(f32, f32)>], scene: &mut Scene) {
