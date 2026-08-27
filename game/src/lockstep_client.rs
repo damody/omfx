@@ -155,7 +155,11 @@ pub struct LockstepClientHandle {
 #[derive(Clone, Debug)]
 pub enum SelectiveClientControl {
     HashMismatch(omoba_core::game_proto::ClientTeamHashMismatch),
-    RebaseVerified { team_id: u32, resume_sequence: u64, view_epoch: u64 },
+    RebaseVerified {
+        team_id: u32,
+        resume_sequence: u64,
+        view_epoch: u64,
+    },
 }
 
 impl LockstepClientHandle {
@@ -446,12 +450,21 @@ async fn run_client(
                     warn!("secure selective session denied legacy TickBatch fallback");
                     continue;
                 }
-                Ok(Some(LockstepInbound::TeamGameStart { msg, wire_bytes, logical_bytes })) => {
+                Ok(Some(LockstepInbound::TeamGameStart {
+                    msg,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
                     wire_delta += wire_bytes as u64;
                     logical_delta += logical_bytes as u64;
                     send_or_return!(LockstepEvent::SelectiveConnected { start: msg });
                 }
-                Ok(Some(LockstepInbound::TeamTickFrame { msg, encoded, wire_bytes, logical_bytes })) => {
+                Ok(Some(LockstepInbound::TeamTickFrame {
+                    msg,
+                    encoded,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
                     wire_delta += wire_bytes as u64;
                     logical_delta += logical_bytes as u64;
                     last_known_tick = msg.replica_tick.min(u32::MAX as u64) as u32;
@@ -459,25 +472,39 @@ async fn run_client(
                     last_stall_log = std::time::Instant::now();
                     last_tickbatch_time = last_stall_log;
                     if msg.team_sequence > expected_team_sequence {
-                        if let Err(error) = client.request_team_replay(
-                            replay_request_id,
-                            expected_team_sequence,
-                            selective_view_epoch,
-                        ).await {
+                        if let Err(error) = client
+                            .request_team_replay(
+                                replay_request_id,
+                                expected_team_sequence,
+                                selective_view_epoch,
+                            )
+                            .await
+                        {
                             warn!("selective replay request failed: {}", error);
                         }
                         replay_request_id = replay_request_id.saturating_add(1);
                     } else if msg.team_sequence == expected_team_sequence {
                         expected_team_sequence = expected_team_sequence.saturating_add(1);
                     }
-                    send_or_return!(LockstepEvent::SelectiveTeamFrame { frame: msg, encoded });
+                    send_or_return!(LockstepEvent::SelectiveTeamFrame {
+                        frame: msg,
+                        encoded
+                    });
                 }
-                Ok(Some(LockstepInbound::TeamViewRebaseChunk { msg, wire_bytes, logical_bytes })) => {
+                Ok(Some(LockstepInbound::TeamViewRebaseChunk {
+                    msg,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
                     wire_delta += wire_bytes as u64;
                     logical_delta += logical_bytes as u64;
                     send_or_return!(LockstepEvent::SelectiveRebaseChunk { chunk: msg });
                 }
-                Ok(Some(LockstepInbound::TeamViewRebaseManifest { msg, wire_bytes, logical_bytes })) => {
+                Ok(Some(LockstepInbound::TeamViewRebaseManifest {
+                    msg,
+                    wire_bytes,
+                    logical_bytes,
+                })) => {
                     wire_delta += wire_bytes as u64;
                     logical_delta += logical_bytes as u64;
                     send_or_return!(LockstepEvent::SelectiveRebaseManifest { manifest: msg });
@@ -539,10 +566,18 @@ async fn run_client(
             }
             while let Ok(control) = selective_control_rx.try_recv() {
                 let result = match control {
-                    SelectiveClientControl::HashMismatch(report) =>
-                        client.report_team_hash_mismatch(&report).await,
-                    SelectiveClientControl::RebaseVerified { team_id, resume_sequence, view_epoch } =>
-                        client.acknowledge_team_rebase(team_id, resume_sequence, view_epoch).await,
+                    SelectiveClientControl::HashMismatch(report) => {
+                        client.report_team_hash_mismatch(&report).await
+                    }
+                    SelectiveClientControl::RebaseVerified {
+                        team_id,
+                        resume_sequence,
+                        view_epoch,
+                    } => {
+                        client
+                            .acknowledge_team_rebase(team_id, resume_sequence, view_epoch)
+                            .await
+                    }
                 };
                 if let Err(error) = result {
                     warn!("selective recovery control send failed: {}", error);

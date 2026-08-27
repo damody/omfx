@@ -351,16 +351,24 @@ pub struct RedactedSelectiveDiagnostic {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SecureRecoveryDisposition { Replay, Repair, Replace, FilteredRebase, Terminate }
+pub enum SecureRecoveryDisposition {
+    Replay,
+    Repair,
+    Replace,
+    FilteredRebase,
+    Terminate,
+}
 
 impl std::fmt::Debug for SelectiveReplicaOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SelectiveReplicaOwner")
+        formatter
+            .debug_struct("SelectiveReplicaOwner")
             .field("bootstrapped", &self.runtime.is_some())
             .field("barrier_len", &self.barrier.len())
             .field("expected_team_sequence", &self.expected_team_sequence)
             .field("negotiated_buffer_ticks", &self.negotiated_buffer_ticks)
-            .field("stall", &self.stall).finish()
+            .field("stall", &self.stall)
+            .finish()
     }
 }
 
@@ -383,13 +391,20 @@ impl Default for SelectiveReplicaOwner {
 }
 
 impl SelectiveReplicaOwner {
-    pub fn bootstrap(&mut self, start: &omoba_core::game_proto::TeamGameStart) -> Result<(), String> {
+    pub fn bootstrap(
+        &mut self,
+        start: &omoba_core::game_proto::TeamGameStart,
+    ) -> Result<(), String> {
         let component_allowlist = std::collections::BTreeSet::from([
             omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID,
         ]);
-        let mut runtime = omoba_core::runtime::SelectiveReplicaRuntime::bootstrap_from_team_game_start(
-            start, component_allowlist, Default::default(),
-        ).map_err(|error| format!("selective bootstrap: {error:?}"))?;
+        let mut runtime =
+            omoba_core::runtime::SelectiveReplicaRuntime::bootstrap_from_team_game_start(
+                start,
+                component_allowlist,
+                Default::default(),
+            )
+            .map_err(|error| format!("selective bootstrap: {error:?}"))?;
         self.expected_team_sequence = start.next_team_sequence;
         self.negotiated_buffer_ticks = if start.replica_buffer_ticks == 0 {
             12
@@ -409,7 +424,9 @@ impl SelectiveReplicaOwner {
         frame: &omoba_core::game_proto::TeamTickFrame,
         encoded: Arc<[u8]>,
     ) -> Result<(), String> {
-        if self.runtime.is_none() { return Err("selective frame before bootstrap".into()); }
+        if self.runtime.is_none() {
+            return Err("selective frame before bootstrap".into());
+        }
         if frame.team_sequence < self.expected_team_sequence {
             self.metrics.duplicate_frames = self.metrics.duplicate_frames.saturating_add(1);
             return Ok(());
@@ -438,24 +455,38 @@ impl SelectiveReplicaOwner {
             }
             return Ok(());
         }
-        if self.barrier.len() < self.negotiated_buffer_ticks { return Ok(()); }
+        if self.barrier.len() < self.negotiated_buffer_ticks {
+            return Ok(());
+        }
         while let Some(encoded) = self.barrier.remove(&self.expected_team_sequence) {
             let runtime = self.runtime.as_mut().expect("checked runtime");
-            let result = runtime.apply_encoded_frame(&encoded, &mut omoba_core::runtime::NoopDisclosedWorldStepper)
+            let result = runtime
+                .apply_encoded_frame(
+                    &encoded,
+                    &mut omoba_core::runtime::NoopDisclosedWorldStepper,
+                )
                 .map_err(|error| format!("selective frame apply: {error:?}"))?;
             match result {
-                omoba_core::runtime::FrameApplyResult::Applied { team_sequence, team_hash, .. } => {
+                omoba_core::runtime::FrameApplyResult::Applied {
+                    team_sequence,
+                    team_hash,
+                    ..
+                } => {
                     if let Some((checkpoint, team_id, view_epoch)) = frame_checkpoint(&encoded) {
                         if checkpoint.canonical_team_hash.as_slice() != team_hash.as_slice() {
-                            self.controls.push(super::lockstep_client::SelectiveClientControl::HashMismatch(
-                                omoba_core::game_proto::ClientTeamHashMismatch {
-                                    team_id,
-                                    frame_sequence: team_sequence,
-                                    replica_tick: checkpoint.replica_tick,
-                                    received_hash: team_hash.to_vec(),
-                                    view_epoch: Some(omoba_core::game_proto::ViewEpoch { value: view_epoch }),
-                                },
-                            ));
+                            self.controls.push(
+                                super::lockstep_client::SelectiveClientControl::HashMismatch(
+                                    omoba_core::game_proto::ClientTeamHashMismatch {
+                                        team_id,
+                                        frame_sequence: team_sequence,
+                                        replica_tick: checkpoint.replica_tick,
+                                        received_hash: team_hash.to_vec(),
+                                        view_epoch: Some(omoba_core::game_proto::ViewEpoch {
+                                            value: view_epoch,
+                                        }),
+                                    },
+                                ),
+                            );
                         }
                     }
                     self.expected_team_sequence = team_sequence.saturating_add(1);
@@ -469,12 +500,17 @@ impl SelectiveReplicaOwner {
                     break;
                 }
             }
-            if self.barrier.len() < self.negotiated_buffer_ticks { break; }
+            if self.barrier.len() < self.negotiated_buffer_ticks {
+                break;
+            }
         }
         Ok(())
     }
 
-    pub fn receive_rebase_chunk(&mut self, chunk: &omoba_core::game_proto::TeamViewRebaseChunk) -> bool {
+    pub fn receive_rebase_chunk(
+        &mut self,
+        chunk: &omoba_core::game_proto::TeamViewRebaseChunk,
+    ) -> bool {
         if chunk.chunk_index == 0 {
             if let Some(snapshot_id) = chunk.snapshot_id.clone() {
                 self.staging.begin(snapshot_id, chunk.chunk_count);
@@ -483,8 +519,14 @@ impl SelectiveReplicaOwner {
         self.staging.insert(chunk)
     }
 
-    pub fn receive_rebase_manifest(&mut self, manifest: &omoba_core::game_proto::TeamViewRebase) -> Result<(), String> {
-        let bytes = self.staging.finish(manifest).ok_or_else(|| "unverified selective rebase".to_string())?;
+    pub fn receive_rebase_manifest(
+        &mut self,
+        manifest: &omoba_core::game_proto::TeamViewRebase,
+    ) -> Result<(), String> {
+        let bytes = self
+            .staging
+            .finish(manifest)
+            .ok_or_else(|| "unverified selective rebase".to_string())?;
         let snapshot = omoba_core::game_proto::FilteredTeamSnapshot {
             snapshot_schema_version: manifest.snapshot_schema_version,
             snapshot_id: manifest.snapshot_id.clone(),
@@ -496,19 +538,26 @@ impl SelectiveReplicaOwner {
             team_private_metadata: Vec::new(),
             filtered_snapshot_hash: manifest.filtered_snapshot_hash.clone(),
         };
-        let runtime = self.runtime.as_mut().ok_or_else(|| "rebase before bootstrap".to_string())?;
-        runtime.apply_verified_rebase(&snapshot, manifest, &bytes)
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| "rebase before bootstrap".to_string())?;
+        runtime
+            .apply_verified_rebase(&snapshot, manifest, &bytes)
             .map_err(|error| format!("selective rebase apply: {error:?}"))?;
         self.expected_team_sequence = manifest.resume_team_sequence;
-        self.barrier.retain(|sequence, _| *sequence >= self.expected_team_sequence);
+        self.barrier
+            .retain(|sequence, _| *sequence >= self.expected_team_sequence);
         self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
         self.stall = omoba_core::runtime::ReplicaStallState::Running;
         self.metrics.verified_rebases = self.metrics.verified_rebases.saturating_add(1);
-        self.controls.push(super::lockstep_client::SelectiveClientControl::RebaseVerified {
-            team_id: manifest.team_id,
-            resume_sequence: manifest.resume_team_sequence,
-            view_epoch: manifest.view_epoch.as_ref().map_or(0, |epoch| epoch.value),
-        });
+        self.controls.push(
+            super::lockstep_client::SelectiveClientControl::RebaseVerified {
+                team_id: manifest.team_id,
+                resume_sequence: manifest.resume_team_sequence,
+                view_epoch: manifest.view_epoch.as_ref().map_or(0, |epoch| epoch.value),
+            },
+        );
         Ok(())
     }
 
@@ -516,10 +565,14 @@ impl SelectiveReplicaOwner {
         std::mem::take(&mut self.controls)
     }
 
-    pub fn diagnostic_bundle(&self) -> &[RedactedSelectiveDiagnostic] { &self.diagnostics }
+    pub fn diagnostic_bundle(&self) -> &[RedactedSelectiveDiagnostic] {
+        &self.diagnostics
+    }
 }
 
-fn frame_checkpoint(encoded: &[u8]) -> Option<(omoba_core::game_proto::TeamHashCheckpoint, u32, u64)> {
+fn frame_checkpoint(
+    encoded: &[u8],
+) -> Option<(omoba_core::game_proto::TeamHashCheckpoint, u32, u64)> {
     use prost::Message as _;
     let frame = omoba_core::game_proto::TeamTickFrame::decode(encoded).ok()?;
     let team_id = frame.team_id;
@@ -648,6 +701,18 @@ fn run_sim_loop(
         "sim_runner: thread started; waiting for master_seed (dll={:?}, scene={:?}, extract_data_for_render_every_ticks={})",
         dll_path, scene_path, extract_data_for_render_every_ticks
     );
+
+    // 公開地圖幾何不依賴 master seed。先發布樹木/地形 presentation，讓只消費
+    // team-filtered replica 的 FOG demo 即使 local sim 尚在等待 GameStart 也能畫出
+    // server 使用的遮蔽物。這份資料永遠不參與 client disclosure 判定。
+    match load_public_vision_occluder_snapshot(&scene_path) {
+        Ok(occluders) => {
+            if let Ok(mut snapshot) = state_out.lock() {
+                snapshot.vision_occluders = occluders;
+            }
+        }
+        Err(error) => error!("sim_runner: public vision occluder load failed: {error}"),
+    }
 
     // 阻止第一個 master_seed（由 LockstepClient 在
     // 遊戲開始於階段 3.3)。提早返回——沒有滴答作響——
@@ -1170,6 +1235,7 @@ fn run_sim_loop(
             if let Ok(mut s) = state_out.lock() {
                 snapshot.paths = s.paths.clone();
                 snapshot.blocked_regions = s.blocked_regions.clone();
+                snapshot.vision_occluders = s.vision_occluders.clone();
                 snapshot.abilities = abilities_arc.clone();
                 snapshot.tower_templates = tower_templates_arc.clone();
                 snapshot.tower_upgrades = tower_upgrades_arc.clone();
@@ -1235,6 +1301,46 @@ fn run_sim_loop(
         }
         drop(tick_span);
     }
+}
+
+fn load_public_vision_occluder_snapshot(
+    scene_path: &Path,
+) -> Result<Vec<BlockedRegionSnapshot>, String> {
+    let story_id = scene_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "scene_path does not end in a valid story id".to_string())?;
+    let campaign = omoba_core::ue4::import_campaign::load_generated(story_id)
+        .map_err(|error| format!("load_generated({story_id}) failed: {error}"))?;
+    let set = omoba_core::runtime::VisionOccluderSet::from_descriptors(
+        &campaign.map.VisionTrees,
+        &campaign.map.VisionOccluderPolygons,
+    )
+    .map_err(|error| format!("invalid public vision occluders: {error}"))?;
+    Ok(set
+        .0
+        .iter()
+        .map(|occluder| match occluder {
+            omoba_core::runtime::VisionOccluder::Tree(tree) => BlockedRegionSnapshot {
+                points: Vec::new(),
+                circle: Some((
+                    (
+                        tree.center.x.to_f32_for_render(),
+                        tree.center.y.to_f32_for_render(),
+                    ),
+                    tree.radius.to_f32_for_render(),
+                )),
+            },
+            omoba_core::runtime::VisionOccluder::Terrain(polygon) => BlockedRegionSnapshot {
+                points: polygon
+                    .vertices
+                    .iter()
+                    .map(|point| (point.x.to_f32_for_render(), point.y.to_f32_for_render()))
+                    .collect(),
+                circle: None,
+            },
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1340,6 +1446,31 @@ fn build_initial_render_seed(
             circle: None,
         })
         .collect();
+    let vision_occluders: Vec<BlockedRegionSnapshot> = world
+        .read_resource::<omoba_core::runtime::VisionOccluderSet>()
+        .0
+        .iter()
+        .map(|occluder| match occluder {
+            omoba_core::runtime::VisionOccluder::Tree(tree) => BlockedRegionSnapshot {
+                points: Vec::new(),
+                circle: Some((
+                    (
+                        tree.center.x.to_f32_for_render(),
+                        tree.center.y.to_f32_for_render(),
+                    ),
+                    tree.radius.to_f32_for_render(),
+                )),
+            },
+            omoba_core::runtime::VisionOccluder::Terrain(polygon) => BlockedRegionSnapshot {
+                points: polygon
+                    .vertices
+                    .iter()
+                    .map(|point| (point.x.to_f32_for_render(), point.y.to_f32_for_render()))
+                    .collect(),
+                circle: None,
+            },
+        })
+        .collect();
 
     let total_rounds = world
         .read_resource::<Vec<omoba_core::runtime::CreepWave>>()
@@ -1353,6 +1484,7 @@ fn build_initial_render_seed(
     SimWorldSnapshot {
         paths,
         blocked_regions,
+        vision_occluders,
         player_gold,
         abilities: abilities_arc,
         tower_templates: tower_templates_arc,

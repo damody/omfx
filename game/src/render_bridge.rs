@@ -36,7 +36,7 @@ const REGION_LINE_THICKNESS: f32 = PATH_LINE_THICKNESS * 0.5;
 const REGION_OUTLINE_COLOR: (u8, u8, u8, u8) = (255, 80, 80, 255);
 /// 階段 4.1：可選圓形阻擋色彩為橘色。
 /// （目前 omb 的 `BlockedRegion` 無半徑值），但為未來向前相容已預留。
-const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = (255, 165, 0, 255);
+const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = (55, 150, 75, 255);
 
 /// 路徑鋸齒線寬（render 單位）。按 `64.0 *
 /// WORLD_SCALE * 2.0 = 1.28` 計算。對齊舊版 MVP 的「粗奶油
@@ -87,7 +87,11 @@ impl RenderBridge {
         self.last_applied_tick = Some(snapshot.tick);
 
         self.ensure_paths_drawn(&snapshot.paths, scene);
-        self.ensure_blocked_regions_drawn(&snapshot.blocked_regions, scene);
+        if !self.regions_drawn {
+            let mut public_regions = snapshot.blocked_regions.clone();
+            public_regions.extend(snapshot.vision_occluders.iter().cloned());
+            self.ensure_blocked_regions_drawn(&public_regions, scene);
+        }
 
         if snapshot.tick % LOCKSTEP_ONE_SECOND_TICKS_U32 == 0 {
             log::debug!(
@@ -174,26 +178,50 @@ impl RenderBridge {
                 let rx = -cx * WORLD_SCALE;
                 let ry = cy * WORLD_SCALE;
                 let rr = r * WORLD_SCALE;
-                // 以正方形 sprite 近似圓形；
-                // 作為 debug overlay 足夠，渲染器日後可換成正規圓形紋理；
-                //
-                let node: Handle<Node> = RectangleBuilder::new(
-                    BaseBuilder::new().with_local_transform(
-                        TransformBuilder::new()
-                            .with_local_position(Vector3::new(rx, ry, Z_RB_REGION))
-                            .with_local_scale(Vector3::new(rr * 2.0, rr * 2.0, f32::EPSILON))
-                            .build(),
-                    ),
-                )
-                .with_color(Color::from_rgba(
-                    REGION_CIRCLE_COLOR.0,
-                    REGION_CIRCLE_COLOR.1,
-                    REGION_CIRCLE_COLOR.2,
-                    REGION_CIRCLE_COLOR.3,
-                ))
-                .build(&mut scene.graph)
-                .transmute();
-                self.region_nodes.push(node);
+                // 以 20 段綠色圓環呈現樹冠，避免正方形標記讓 LOS 邊界產生誤解。
+                const SEGMENTS: usize = 20;
+                for index in 0..SEGMENTS {
+                    let a = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+                    let b = std::f32::consts::TAU * (index + 1) as f32 / SEGMENTS as f32;
+                    let x1 = rx + rr * a.cos();
+                    let y1 = ry + rr * a.sin();
+                    let x2 = rx + rr * b.cos();
+                    let y2 = ry + rr * b.sin();
+                    let dx = x2 - x1;
+                    let dy = y2 - y1;
+                    let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                    let node: Handle<Node> = RectangleBuilder::new(
+                        BaseBuilder::new().with_local_transform(
+                            TransformBuilder::new()
+                                .with_local_position(Vector3::new(
+                                    (x1 + x2) * 0.5,
+                                    (y1 + y2) * 0.5,
+                                    Z_RB_REGION,
+                                ))
+                                .with_local_rotation(
+                                    fyrox::core::algebra::UnitQuaternion::from_axis_angle(
+                                        &fyrox::core::algebra::Vector3::z_axis(),
+                                        dy.atan2(dx),
+                                    ),
+                                )
+                                .with_local_scale(Vector3::new(
+                                    len,
+                                    REGION_LINE_THICKNESS,
+                                    f32::EPSILON,
+                                ))
+                                .build(),
+                        ),
+                    )
+                    .with_color(Color::from_rgba(
+                        REGION_CIRCLE_COLOR.0,
+                        REGION_CIRCLE_COLOR.1,
+                        REGION_CIRCLE_COLOR.2,
+                        REGION_CIRCLE_COLOR.3,
+                    ))
+                    .build(&mut scene.graph)
+                    .transmute();
+                    self.region_nodes.push(node);
+                }
                 circles += 1;
             }
         }

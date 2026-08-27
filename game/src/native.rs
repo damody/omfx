@@ -67,6 +67,8 @@ pub(crate) mod audio_settings;
 #[path = "backend_session.rs"]
 pub(crate) mod backend_session;
 
+#[path = "filtered_render_bridge.rs"]
+pub mod filtered_render_bridge;
 #[path = "hotkeys.rs"]
 pub(crate) mod hotkeys;
 #[path = "lockstep_client.rs"]
@@ -77,8 +79,6 @@ pub(crate) mod match_statistics;
 pub(crate) mod pregame;
 #[path = "render_bridge.rs"]
 pub(crate) mod render_bridge;
-#[path = "filtered_render_bridge.rs"]
-pub mod filtered_render_bridge;
 #[path = "sim_runner.rs"]
 pub(crate) mod sim_runner;
 #[path = "sprite_resources.rs"]
@@ -6567,7 +6567,8 @@ impl Plugin for Game {
                     lockstep_client::LockstepEvent::SelectiveConnected { start } => {
                         self.local_team_id = start.team_id;
                         self.server_step_fps = start.tick_rate_hz;
-                        self.current_sim_tick = start.replica_start_tick.min(u32::MAX as u64) as u32;
+                        self.current_sim_tick =
+                            start.replica_start_tick.min(u32::MAX as u64) as u32;
                         if let Ok(mut owner) = sim.selective_replica.lock() {
                             if let Err(error) = owner.bootstrap(&start) {
                                 log::error!("[selective-lockstep] {}", error);
@@ -6577,13 +6578,18 @@ impl Plugin for Game {
                     lockstep_client::LockstepEvent::SelectiveTeamFrame { frame, encoded } => {
                         self.current_sim_tick = frame.replica_tick.min(u32::MAX as u64) as u32;
                         self.current_sim_tick_observed_at = Some(now);
-                        let (filtered_snapshot, controls) = if let Ok(mut owner) = sim.selective_replica.lock() {
-                            if let Err(error) = owner.receive_frame(&frame, encoded) {
-                                log::error!("[selective-lockstep] {}", error);
-                            }
-                            (owner.last_disclosed_render.clone(), owner.take_controls())
-                        } else { (None, Vec::new()) };
-                        for control in controls { let _ = lh.selective_control_tx.send(control); }
+                        let (filtered_snapshot, controls) =
+                            if let Ok(mut owner) = sim.selective_replica.lock() {
+                                if let Err(error) = owner.receive_frame(&frame, encoded) {
+                                    log::error!("[selective-lockstep] {}", error);
+                                }
+                                (owner.last_disclosed_render.clone(), owner.take_controls())
+                            } else {
+                                (None, Vec::new())
+                            };
+                        for control in controls {
+                            let _ = lh.selective_control_tx.send(control);
+                        }
                         if let Some(snapshot) = filtered_snapshot {
                             let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
                         }
@@ -6596,13 +6602,18 @@ impl Plugin for Game {
                         }
                     }
                     lockstep_client::LockstepEvent::SelectiveRebaseManifest { manifest } => {
-                        let (filtered_snapshot, controls) = if let Ok(mut owner) = sim.selective_replica.lock() {
-                            if let Err(error) = owner.receive_rebase_manifest(&manifest) {
-                                log::error!("[selective-lockstep] {}", error);
-                            }
-                            (owner.last_disclosed_render.clone(), owner.take_controls())
-                        } else { (None, Vec::new()) };
-                        for control in controls { let _ = lh.selective_control_tx.send(control); }
+                        let (filtered_snapshot, controls) =
+                            if let Ok(mut owner) = sim.selective_replica.lock() {
+                                if let Err(error) = owner.receive_rebase_manifest(&manifest) {
+                                    log::error!("[selective-lockstep] {}", error);
+                                }
+                                (owner.last_disclosed_render.clone(), owner.take_controls())
+                            } else {
+                                (None, Vec::new())
+                            };
+                        for control in controls {
+                            let _ = lh.selective_control_tx.send(control);
+                        }
                         if let Some(snapshot) = filtered_snapshot {
                             let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
                         }
@@ -7563,10 +7574,24 @@ impl Plugin for Game {
                 omoba_sim::Fixed64::from_raw(state.x_raw).to_f32_for_render() * WORLD_SCALE,
                 omoba_sim::Fixed64::from_raw(state.y_raw).to_f32_for_render() * WORLD_SCALE,
             );
-            add_circle_lines(scene, center, 0.16, 12, Color::from_rgba(150, 150, 165, 75), Z_RING - 0.02);
+            add_circle_lines(
+                scene,
+                center,
+                0.16,
+                12,
+                Color::from_rgba(150, 150, 165, 75),
+                Z_RING - 0.02,
+            );
         }
         if let Some(center) = local_hero {
-            add_circle_lines(scene, center, visual_vision_radius, 64, Color::from_rgba(90, 210, 255, 150), Z_RING - 0.03);
+            add_circle_lines(
+                scene,
+                center,
+                visual_vision_radius,
+                64,
+                Color::from_rgba(90, 210, 255, 150),
+                Z_RING - 0.03,
+            );
         }
 
         // 階段 5.x：將 sim_runner 支援的實體寫入 body_batch + hp_batch
@@ -12328,7 +12353,10 @@ impl Game {
     fn default_session_selection(&self) -> Option<pregame::SessionSelection> {
         let map = if let Ok(story) = std::env::var("OMB_STORY") {
             let story = story.trim();
-            self.pregame_runtime.catalog.enabled_maps().into_iter()
+            self.pregame_runtime
+                .catalog
+                .enabled_maps()
+                .into_iter()
                 .find(|map| map.story_id() == story)
                 .cloned()
                 .unwrap_or_else(|| pregame::MapEntry {
@@ -12341,7 +12369,12 @@ impl Game {
                     ..Default::default()
                 })
         } else {
-            self.pregame_runtime.catalog.enabled_maps().into_iter().next()?.clone()
+            self.pregame_runtime
+                .catalog
+                .enabled_maps()
+                .into_iter()
+                .next()?
+                .clone()
         };
         let difficulty = self
             .pregame_runtime
