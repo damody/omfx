@@ -384,8 +384,11 @@ impl Default for SelectiveReplicaOwner {
 
 impl SelectiveReplicaOwner {
     pub fn bootstrap(&mut self, start: &omoba_core::game_proto::TeamGameStart) -> Result<(), String> {
+        let component_allowlist = std::collections::BTreeSet::from([
+            omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID,
+        ]);
         let mut runtime = omoba_core::runtime::SelectiveReplicaRuntime::bootstrap_from_team_game_start(
-            start, Default::default(), Default::default(),
+            start, component_allowlist, Default::default(),
         ).map_err(|error| format!("selective bootstrap: {error:?}"))?;
         self.expected_team_sequence = start.next_team_sequence;
         self.negotiated_buffer_ticks = if start.replica_buffer_ticks == 0 {

@@ -191,13 +191,25 @@ fn main() {
         Some(suffix) => format!("omfx - Tower Defense - {}", suffix),
         None => "omfx - Tower Defense".to_string(),
     };
+    let env_f64 = |key: &str, fallback: f64| {
+        std::env::var(key).ok().and_then(|value| value.parse().ok()).unwrap_or(fallback)
+    };
+    let window_width = env_f64("OMFX_WINDOW_WIDTH", 1280.0).max(320.0);
+    let window_height = env_f64("OMFX_WINDOW_HEIGHT", 720.0).max(240.0);
+    let mut window_attributes = fyrox::window::WindowAttributes::default()
+        .with_title(window_title)
+        .with_inner_size(fyrox::dpi::LogicalSize::new(window_width, window_height));
+    if let (Some(x), Some(y)) = (
+        std::env::var("OMFX_WINDOW_X").ok().and_then(|value| value.parse::<i32>().ok()),
+        std::env::var("OMFX_WINDOW_Y").ok().and_then(|value| value.parse::<i32>().ok()),
+    ) {
+        window_attributes = window_attributes.with_position(fyrox::dpi::PhysicalPosition::new(x, y));
+    }
 
     let mut executor = Executor::from_params(
         EventLoop::new().ok(),
         fyrox::engine::GraphicsContextParams {
-            window_attributes: fyrox::window::WindowAttributes::default()
-                .with_title(window_title)
-                .with_inner_size(fyrox::dpi::LogicalSize::new(1280.0, 720.0)),
+            window_attributes,
             vsync: false,
             msaa_sample_count: None,
             graphics_server_constructor: Default::default(),

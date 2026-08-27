@@ -61,6 +61,25 @@ impl Default for FilteredRenderBridge {
 }
 
 impl FilteredRenderBridge {
+    pub fn deterministic_count(&self) -> usize { self.deterministic.len() }
+
+    pub fn remembered_count(&self) -> usize { self.remembered.len() }
+
+    pub fn deterministic_demo_states(&self) -> impl Iterator<Item = (u64, omoba_core::runtime::DemoRenderState)> + '_ {
+        self.deterministic.iter().filter_map(|(id, entity)| {
+            entity.components.get(&omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID)
+                .and_then(|bytes| omoba_core::runtime::decode_demo_render_state(bytes))
+                .map(|state| (*id, state))
+        })
+    }
+
+    pub fn remembered_demo_states(&self) -> impl Iterator<Item = (RememberedAssociationKey, omoba_core::runtime::DemoRenderState)> + '_ {
+        self.remembered.iter().filter_map(|(key, presentation)| {
+            omoba_core::runtime::decode_demo_render_state(&presentation.sanitized_payload)
+                .map(|state| (*key, state))
+        })
+    }
+
     pub fn apply(&mut self, snapshot: &FilteredRenderSnapshot) -> Vec<FilteredSceneAction> {
         let mut actions = Vec::new();
         self.expire(snapshot.replica_tick, &mut actions);

@@ -3391,6 +3391,10 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     local_player_id: u32,
+    /// Selective lockstep handshake 指定的觀戰隊伍；0 代表尚未完成握手。
+    #[visit(skip)]
+    #[reflect(hidden)]
+    local_team_id: u32,
     #[visit(skip)]
     #[reflect(hidden)]
     pending_inputs: HashMap<u32, PendingInput>,
@@ -6561,6 +6565,7 @@ impl Plugin for Game {
             while let Ok(ev) = lh.events_rx.try_recv() {
                 match ev {
                     lockstep_client::LockstepEvent::SelectiveConnected { start } => {
+                        self.local_team_id = start.team_id;
                         self.server_step_fps = start.tick_rate_hz;
                         self.current_sim_tick = start.replica_start_tick.min(u32::MAX as u64) as u32;
                         if let Ok(mut owner) = sim.selective_replica.lock() {
@@ -7494,6 +7499,76 @@ impl Plugin for Game {
 
         self.draw_hero_command_queue_overlay(scene);
 
+        // FOG_2TEAM_DEMO 的安全呈現只讀取 team-filtered replica。未揭露的 canonical
+        // entity 從未進入此 bridge，因此這裡無法誤畫伺服器完整世界。
+        let demo_states: Vec<_> = self
+            .filtered_render_bridge
+            .deterministic_demo_states()
+            .collect();
+        let local_hero = demo_states
+            .iter()
+            .find(|(_, state)| state.kind == 1 && state.owner_player_id == self.local_player_id)
+            .map(|(_, state)| {
+                Vector2::new(
+                    omoba_sim::Fixed64::from_raw(state.x_raw).to_f32_for_render() * WORLD_SCALE,
+                    omoba_sim::Fixed64::from_raw(state.y_raw).to_f32_for_render() * WORLD_SCALE,
+                )
+            });
+        let visual_vision_radius = 700.0 * WORLD_SCALE;
+        for (_, state) in demo_states {
+            let center = Vector2::new(
+                omoba_sim::Fixed64::from_raw(state.x_raw).to_f32_for_render() * WORLD_SCALE,
+                omoba_sim::Fixed64::from_raw(state.y_raw).to_f32_for_render() * WORLD_SCALE,
+            );
+            // Server 的 Forget transition 是資料安全邊界；這裡再使用相同半徑做
+            // presentation 裁切，避免 transition commit delay 期間仍畫出剛離圈的單位。
+            // 自己的英雄是 OwnerTeam scope，永遠保留。
+            let is_local_hero = state.kind == 1 && state.owner_player_id == self.local_player_id;
+            if !is_local_hero
+                && local_hero.is_some_and(|hero| {
+                    let delta = center - hero;
+                    delta.dot(&delta) > visual_vision_radius * visual_vision_radius
+                })
+            {
+                continue;
+            }
+            let color = match state.team_id {
+                1 => Color::from_rgba(65, 145, 255, 245),
+                2 => Color::from_rgba(255, 75, 75, 245),
+                _ => Color::from_rgba(185, 185, 185, 220),
+            };
+            let radius = if is_local_hero {
+                0.48
+            } else if state.kind == 1 {
+                0.34
+            } else {
+                0.16
+            };
+            add_circle_lines(scene, center, radius, 16, color, Z_RING - 0.01);
+            if is_local_hero {
+                // 雙環與旗標讓玩家不會把自己的英雄和 100 個測試單位混淆。
+                add_circle_lines(
+                    scene,
+                    center,
+                    0.60,
+                    24,
+                    Color::from_rgba(255, 255, 255, 255),
+                    Z_RING - 0.005,
+                );
+                add_command_queue_flag(scene, center, Z_COMMAND_QUEUE);
+            }
+        }
+        for (_, state) in self.filtered_render_bridge.remembered_demo_states() {
+            let center = Vector2::new(
+                omoba_sim::Fixed64::from_raw(state.x_raw).to_f32_for_render() * WORLD_SCALE,
+                omoba_sim::Fixed64::from_raw(state.y_raw).to_f32_for_render() * WORLD_SCALE,
+            );
+            add_circle_lines(scene, center, 0.16, 12, Color::from_rgba(150, 150, 165, 75), Z_RING - 0.02);
+        }
+        if let Some(center) = local_hero {
+            add_circle_lines(scene, center, visual_vision_radius, 64, Color::from_rgba(90, 210, 255, 150), Z_RING - 0.03);
+        }
+
         // 階段 5.x：將 sim_runner 支援的實體寫入 body_batch + hp_batch
         // 沖洗前。替換每個實體的 RectangleBuilder 生成
         // 早期的 4.2 render_bridge — 每個實體曾經是單獨的場景
@@ -7954,7 +8029,19 @@ impl Plugin for Game {
         //     TD 模式下：相機固定在地圖中心、拉遠到能看完整條路線。
         let t_cam = std::time::Instant::now();
         let camera_span = tracing::trace_span!("omfx::frame::camera", perfetto = true).entered();
-        if self.is_td_mode {
+        if self.local_team_id != 0 {
+            // 選擇性同步 demo 的相機優先於 legacy TD/MOBA mode 判定。安全
+            // replica 已提供自己的英雄位置，固定跟隨才能讓右鍵移動有直接回饋。
+            if let Some(hero_pos) = local_hero {
+                scene.graph[self.camera]
+                    .local_transform_mut()
+                    .set_position(Vector3::new(-hero_pos.x, hero_pos.y, -100.0));
+                self.camera_world_pos = hero_pos;
+            } else {
+                let cam_pos = scene.graph[self.camera].local_transform().position();
+                self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
+            }
+        } else if self.is_td_mode {
             let td_camera = td_camera_view_config();
             // 固定 TD 視角每幀套用一次，讓 hot reload / 同一局調整相機時立即生效。
             if let Some(cam) = scene.graph[self.camera].cast_mut::<fyrox::scene::camera::Camera>() {
@@ -7989,9 +8076,8 @@ impl Plugin for Game {
                 // 視口，因此不再需要此提示。
             }
         } else {
-            // MOBA 模式：相機不再跟隨英雄移動。保留 camera 在 scene.rgs 載入時的初始位置，
-            // camera_world_pos 從 camera 當前 transform 反推（X 渲染負號 → world.x = -cam.x），
-            // 確保 name label 螢幕投影仍正確。
+            // 選擇性同步示範必須以本地英雄為視角中心；本地英雄使用 OwnerTeam
+            // scope，因此即使附近沒有其他實體也能可靠取得位置並持續跟隨。
             let cam_pos = scene.graph[self.camera].local_transform().position();
             self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
             // 階段 5.1：刪除了與 NetworkBridge 的定期視窗同步。
@@ -10229,7 +10315,16 @@ impl Plugin for Game {
                 }
             }
             let is_td_hud = hs.lives > 0 || self.is_td_mode;
-            let hud = if is_td_hud {
+            let hud = if self.local_team_id != 0 {
+                format!(
+                    "P{} / Team {}  |  Tick {}  |  可見 {}  記憶 {}  |  白色雙環旗標＝你的英雄  |  右鍵移動",
+                    self.local_player_id,
+                    self.local_team_id,
+                    self.current_sim_tick,
+                    self.filtered_render_bridge.deterministic_count(),
+                    self.filtered_render_bridge.remembered_count(),
+                )
+            } else if is_td_hud {
                 String::new()
             } else {
                 format!(
@@ -12231,13 +12326,23 @@ impl Game {
     }
 
     fn default_session_selection(&self) -> Option<pregame::SessionSelection> {
-        let map = self
-            .pregame_runtime
-            .catalog
-            .enabled_maps()
-            .into_iter()
-            .next()?
-            .clone();
+        let map = if let Ok(story) = std::env::var("OMB_STORY") {
+            let story = story.trim();
+            self.pregame_runtime.catalog.enabled_maps().into_iter()
+                .find(|map| map.story_id() == story)
+                .cloned()
+                .unwrap_or_else(|| pregame::MapEntry {
+                    id: story.to_ascii_lowercase(),
+                    label: story.to_string(),
+                    description: "環境變數指定的直接啟動場景".into(),
+                    story: story.to_string(),
+                    runtime: story.to_string(),
+                    enabled: true,
+                    ..Default::default()
+                })
+        } else {
+            self.pregame_runtime.catalog.enabled_maps().into_iter().next()?.clone()
+        };
         let difficulty = self
             .pregame_runtime
             .catalog
