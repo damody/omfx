@@ -7525,6 +7525,16 @@ impl Plugin for Game {
                     omoba_sim::Fixed64::from_raw(state.y_raw).to_f32_for_render() * WORLD_SCALE,
                 )
             });
+        // 相機必須在建立本幀的 selective presentation 前移到英雄位置。
+        // Fyrox 會在 frame 邊界更新 graph 的 hierarchical transform；若等到
+        // 後面的通用 camera 區段才寫入，動態建立的 debug geometry 會長期以
+        // 舊 view transform 呈現，表面上就像英雄黏在畫面右下角。
+        if let Some(hero_pos) = local_hero {
+            scene.graph[self.camera]
+                .local_transform_mut()
+                .set_position(selective_hero_camera_position(hero_pos));
+            self.camera_world_pos = hero_pos;
+        }
         let visual_vision_radius = 700.0 * WORLD_SCALE;
         for (_, state) in demo_states {
             let center = Vector2::new(
@@ -7557,7 +7567,9 @@ impl Plugin for Game {
             };
             add_circle_lines(scene, center, radius, 16, color, Z_RING - 0.01);
             if is_local_hero {
-                // 雙環與旗標讓玩家不會把自己的英雄和 100 個測試單位混淆。
+                // 用實心隊色核心呈現英雄本體；外圈和旗標只負責選取辨識。
+                // 這不是 remembered/vision debug 線，因此不能被迷霧層遮住。
+                add_filled_circle_lines(scene, center, 0.42, 10, 18, color, Z_RING - 0.004);
                 add_circle_lines(
                     scene,
                     center,
@@ -7622,6 +7634,16 @@ impl Plugin for Game {
         // 3D 網格節點具有過時的 global_transform = 身分 → 所有 sprite
         // 在世界原點 (0,0,0) 處渲染。每幀強制更新一次。
         scene.graph.update_hierarchical_data();
+        if local_hero.is_some() {
+            // Camera::view_matrix 在 frame 開頭、plugin update 之前快取。
+            // selective camera 是本幀才由 replica 決定，因此更新 graph 後要立即
+            // 重算矩陣，否則 renderer 仍使用原點視角。
+            if let Some(camera) =
+                scene.graph[self.camera].cast_mut::<fyrox::scene::camera::Camera>()
+            {
+                camera.calculate_matrices(self.window_size);
+            }
+        }
 
         let interp_ns = t_interp.elapsed().as_nanos();
         drop(interp_span);
@@ -8056,18 +8078,16 @@ impl Plugin for Game {
         //     TD 模式下：相機固定在地圖中心、拉遠到能看完整條路線。
         let t_cam = std::time::Instant::now();
         let camera_span = tracing::trace_span!("omfx::frame::camera", perfetto = true).entered();
-        if self.local_team_id != 0 {
-            // 選擇性同步 demo 的相機優先於 legacy TD/MOBA mode 判定。安全
-            // replica 已提供自己的英雄位置，固定跟隨才能讓右鍵移動有直接回饋。
-            if let Some(hero_pos) = local_hero {
-                scene.graph[self.camera]
-                    .local_transform_mut()
-                    .set_position(Vector3::new(-hero_pos.x, hero_pos.y, -100.0));
-                self.camera_world_pos = hero_pos;
-            } else {
-                let cam_pos = scene.graph[self.camera].local_transform().position();
-                self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
-            }
+        if let Some(hero_pos) = local_hero {
+            // filtered replica 找到本地英雄本身就是充分條件；不能再依賴
+            // TeamGameStart 與 render frame 的事件先後順序，否則相機會留在原點。
+            scene.graph[self.camera]
+                .local_transform_mut()
+                .set_position(selective_hero_camera_position(hero_pos));
+            self.camera_world_pos = hero_pos;
+        } else if self.local_team_id != 0 {
+            let cam_pos = scene.graph[self.camera].local_transform().position();
+            self.camera_world_pos = Vector2::new(-cam_pos.x, cam_pos.y);
         } else if self.is_td_mode {
             let td_camera = td_camera_view_config();
             // 固定 TD 視角每幀套用一次，讓 hot reload / 同一局調整相機時立即生效。
@@ -19380,6 +19400,31 @@ fn add_circle_lines(
     }
 }
 
+fn selective_hero_camera_position(hero_pos: Vector2<f32>) -> Vector3<f32> {
+    Vector3::new(-hero_pos.x, hero_pos.y, -100.0)
+}
+
+fn add_filled_circle_lines(
+    scene: &mut Scene,
+    center: Vector2<f32>,
+    radius: f32,
+    rings: usize,
+    segments: usize,
+    color: Color,
+    z: f32,
+) {
+    for ring in 1..=rings {
+        add_circle_lines(
+            scene,
+            center,
+            radius * ring as f32 / rings as f32,
+            segments,
+            color,
+            z,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 輔助函數
 // ---------------------------------------------------------------------------
@@ -20278,6 +20323,12 @@ mod input_latency_tests {
         assert_eq!(input_lookahead_ticks(LockstepTiming::new(120).unwrap()), 2);
         assert_eq!(input_lookahead_ticks(LockstepTiming::new(90).unwrap()), 2);
         assert_eq!(input_lookahead_ticks(LockstepTiming::new(60).unwrap()), 2);
+    }
+
+    #[test]
+    fn selective_camera_centers_on_filtered_local_hero() {
+        let position = selective_hero_camera_position(Vector2::new(-13.2, -11.0));
+        assert_eq!(position, Vector3::new(13.2, -11.0, -100.0));
     }
 
     #[test]

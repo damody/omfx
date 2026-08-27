@@ -12,6 +12,24 @@ use std::fs::File;
 
 const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS;
 
+#[cfg(target_os = "windows")]
+fn enable_per_monitor_dpi_awareness() {
+    // 必須在建立 EventLoop/Window 前設定。未設定時，Windows 會在高 DPI 螢幕
+    // 虛擬化視窗座標，但 Fyrox 仍使用實體 framebuffer，造成場景中心與滑鼠
+    // picking 一起偏到右下角。這個 legacy renderer 目前使用 logical pixel
+    // layout，因此明確採 DPI_UNAWARE（-1），交給 DWM 等比例縮放完整 framebuffer。
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+    }
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(-1isize);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enable_per_monitor_dpi_awareness() {}
+
 struct LogSettings {
     level: LevelFilter,
     allow_modules: Vec<String>,
@@ -130,6 +148,7 @@ extern "system" {
 }
 
 fn main() {
+    enable_per_monitor_dpi_awareness();
     // Windows 預設 timer granularity 是 15.6ms，`thread::sleep(Duration::from_millis(1))`
     // 實際會 sleep 8-15ms 把 fps 鎖到 ~60。呼叫 timeBeginPeriod(1) 把全系統 timer
     // resolution 降到 1ms，sleep 就會接近真實 1ms。
@@ -192,7 +211,10 @@ fn main() {
         None => "omfx - Tower Defense".to_string(),
     };
     let env_f64 = |key: &str, fallback: f64| {
-        std::env::var(key).ok().and_then(|value| value.parse().ok()).unwrap_or(fallback)
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback)
     };
     let window_width = env_f64("OMFX_WINDOW_WIDTH", 1280.0).max(320.0);
     let window_height = env_f64("OMFX_WINDOW_HEIGHT", 720.0).max(240.0);
@@ -200,10 +222,15 @@ fn main() {
         .with_title(window_title)
         .with_inner_size(fyrox::dpi::LogicalSize::new(window_width, window_height));
     if let (Some(x), Some(y)) = (
-        std::env::var("OMFX_WINDOW_X").ok().and_then(|value| value.parse::<i32>().ok()),
-        std::env::var("OMFX_WINDOW_Y").ok().and_then(|value| value.parse::<i32>().ok()),
+        std::env::var("OMFX_WINDOW_X")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok()),
+        std::env::var("OMFX_WINDOW_Y")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok()),
     ) {
-        window_attributes = window_attributes.with_position(fyrox::dpi::PhysicalPosition::new(x, y));
+        window_attributes =
+            window_attributes.with_position(fyrox::dpi::PhysicalPosition::new(x, y));
     }
 
     let mut executor = Executor::from_params(

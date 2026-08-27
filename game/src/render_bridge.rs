@@ -303,16 +303,13 @@ impl RenderBridge {
                     <= vision_radius_backend * vision_radius_backend
                     && !segment_blocked(hero, center, &self.fog_occluders);
                 let slot = self.fog_slots[(row * FOG_COLUMNS + column) as usize];
+                let (size, color) = fog_tile_style(visible, tile_render);
                 batch.write_quad(
                     slot,
                     &QuadParams {
                         center: Vector2::new(-center.x * WORLD_SCALE, center.y * WORLD_SCALE),
-                        size: Vector2::new(tile_render, tile_render),
-                        color: if visible {
-                            [0, 0, 0, 0]
-                        } else {
-                            [FOG_COLOR.0, FOG_COLOR.1, FOG_COLOR.2, FOG_COLOR.3]
-                        },
+                        size,
+                        color,
                         rotation: 0.0,
                         z: Z_FOG,
                     },
@@ -373,6 +370,19 @@ impl RenderBridge {
             self.path_nodes.len(),
             paths.len()
         );
+    }
+}
+
+fn fog_tile_style(visible: bool, tile_render: f32) -> (Vector2<f32>, [u8; 4]) {
+    if visible {
+        // Alpha=0 的 Standard2D quad 仍可能寫入 depth buffer，遮住英雄 sprite。
+        // 退化成零尺寸才能確保可見區完全沒有迷霧幾何覆蓋。
+        (Vector2::new(0.0, 0.0), [0, 0, 0, 0])
+    } else {
+        (
+            Vector2::new(tile_render, tile_render),
+            [FOG_COLOR.0, FOG_COLOR.1, FOG_COLOR.2, FOG_COLOR.3],
+        )
     }
 }
 
@@ -577,5 +587,12 @@ mod tests {
             Vector2::new(10.0, 0.0),
             &[tree]
         ));
+    }
+
+    #[test]
+    fn visible_fog_tile_is_degenerate_and_cannot_depth_occlude_hero() {
+        let (size, color) = fog_tile_style(true, 0.1);
+        assert_eq!(size, Vector2::new(0.0, 0.0));
+        assert_eq!(color[3], 0);
     }
 }
