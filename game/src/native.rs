@@ -7593,6 +7593,8 @@ impl Plugin for Game {
                 Z_RING - 0.03,
             );
         }
+        self.render_bridge
+            .update_fog_of_war(scene, local_hero, 700.0);
 
         // 階段 5.x：將 sim_runner 支援的實體寫入 body_batch + hp_batch
         // 沖洗前。替換每個實體的 RectangleBuilder 生成

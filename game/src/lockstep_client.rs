@@ -186,6 +186,14 @@ impl LockstepClientHandle {
     }
 }
 
+/// InputSubmit is scheduled on the authoritative server timeline.  The
+/// selective replica tick intentionally trails that timeline while Wave B and
+/// the client buffer commit disclosed state, so using it here makes otherwise
+/// valid input arrive late at the server.
+fn authoritative_input_base_tick(frame: &omoba_core::game_proto::TeamTickFrame) -> u32 {
+    frame.server_tick.min(u32::MAX as u64) as u32
+}
+
 async fn cancel_or<F>(cancel_rx: &mut watch::Receiver<bool>, future: F) -> Option<F::Output>
 where
     F: Future,
@@ -467,7 +475,7 @@ async fn run_client(
                 })) => {
                     wire_delta += wire_bytes as u64;
                     logical_delta += logical_bytes as u64;
-                    last_known_tick = msg.replica_tick.min(u32::MAX as u64) as u32;
+                    last_known_tick = authoritative_input_base_tick(&msg);
                     latest_tick.store(last_known_tick, Ordering::Relaxed);
                     last_stall_log = std::time::Instant::now();
                     last_tickbatch_time = last_stall_log;
@@ -617,5 +625,26 @@ mod tests {
 
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn selective_input_uses_authoritative_server_tick_not_delayed_replica_tick() {
+        let frame = omoba_core::game_proto::TeamTickFrame {
+            server_tick: 10_034,
+            replica_tick: 10_000,
+            ..Default::default()
+        };
+
+        assert_eq!(authoritative_input_base_tick(&frame), 10_034);
+    }
+
+    #[test]
+    fn selective_input_tick_saturates_at_wire_tick_limit() {
+        let frame = omoba_core::game_proto::TeamTickFrame {
+            server_tick: u64::MAX,
+            ..Default::default()
+        };
+
+        assert_eq!(authoritative_input_base_tick(&frame), u32::MAX);
     }
 }

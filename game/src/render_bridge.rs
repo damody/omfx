@@ -26,17 +26,23 @@ const Z_RB_PATH: f32 = 4.4;
 /// 階段 4.1：BlockedRegion 外框的 Z 層。繪製時略高於
 /// 路徑圖層，避免區域重疊時紅色外框被遮，確保仍可見
 /// （沿用舊版參考：同舊 map.regions debug overlay 的 Z）。
-const Z_RB_REGION: f32 = 4.5;
+const Z_RB_REGION: f32 = 3.2;
+const Z_FOG: f32 = 0.25;
 /// 階段 4.1：區域外框厚度（render 單位）。取路徑厚度的一半，
 /// 以避免紅色邊線比奶油色路徑更醒目。
-const REGION_LINE_THICKNESS: f32 = PATH_LINE_THICKNESS * 0.5;
+const REGION_LINE_THICKNESS: f32 = 0.025;
 /// 階段 4.1：區域外框顏色用紅色（對齊舊版慣例），
 /// "blocked region" overlay 規範；橘色預留給（未來）圓形阻擋物。
 ///（當 `circle` 阻擋物存在時）。
-const REGION_OUTLINE_COLOR: (u8, u8, u8, u8) = (255, 80, 80, 255);
+const REGION_OUTLINE_COLOR: (u8, u8, u8, u8) = (105, 105, 112, 190);
 /// 階段 4.1：可選圓形阻擋色彩為橘色。
 /// （目前 omb 的 `BlockedRegion` 無半徑值），但為未來向前相容已預留。
-const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = (55, 150, 75, 255);
+const REGION_CIRCLE_COLOR: (u8, u8, u8, u8) = REGION_OUTLINE_COLOR;
+const REGION_CIRCLE_SEGMENTS: usize = 32;
+const FOG_TILE_BACKEND: f32 = 100.0;
+const FOG_MIN_BACKEND: i32 = -2600;
+const FOG_MAX_BACKEND: i32 = 2600;
+const FOG_COLOR: (u8, u8, u8, u8) = (32, 36, 43, 165);
 
 /// 路徑鋸齒線寬（render 單位）。按 `64.0 *
 /// WORLD_SCALE * 2.0 = 1.28` 計算。對齊舊版 MVP 的「粗奶油
@@ -59,6 +65,8 @@ pub struct RenderBridge {
     /// 行為與 `paths_drawn` 相同。
     region_nodes: Vec<Handle<Node>>,
     regions_drawn: bool,
+    fog_nodes: Vec<(Vector2<f32>, Handle<Node>)>,
+    fog_occluders: Vec<crate::sim_runner::BlockedRegionSnapshot>,
 }
 
 impl RenderBridge {
@@ -73,6 +81,10 @@ impl RenderBridge {
         for node in self.region_nodes.drain(..) {
             scene.graph.remove_node(node);
         }
+        for (_, node) in self.fog_nodes.drain(..) {
+            scene.graph.remove_node(node);
+        }
+        self.fog_occluders.clear();
         self.last_applied_tick = None;
         self.paths_drawn = false;
         self.regions_drawn = false;
@@ -178,11 +190,10 @@ impl RenderBridge {
                 let rx = -cx * WORLD_SCALE;
                 let ry = cy * WORLD_SCALE;
                 let rr = r * WORLD_SCALE;
-                // 以 20 段綠色圓環呈現樹冠，避免正方形標記讓 LOS 邊界產生誤解。
-                const SEGMENTS: usize = 20;
-                for index in 0..SEGMENTS {
-                    let a = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
-                    let b = std::f32::consts::TAU * (index + 1) as f32 / SEGMENTS as f32;
+                for index in 0..REGION_CIRCLE_SEGMENTS {
+                    let a = std::f32::consts::TAU * index as f32 / REGION_CIRCLE_SEGMENTS as f32;
+                    let b =
+                        std::f32::consts::TAU * (index + 1) as f32 / REGION_CIRCLE_SEGMENTS as f32;
                     let x1 = rx + rr * a.cos();
                     let y1 = ry + rr * a.sin();
                     let x2 = rx + rr * b.cos();
@@ -225,6 +236,8 @@ impl RenderBridge {
                 circles += 1;
             }
         }
+        self.fog_occluders = regions.to_vec();
+        self.ensure_fog_tiles(scene);
         self.regions_drawn = true;
         log::info!(
             "render_bridge: drew {} region segments + {} circle markers for {} region(s)",
@@ -232,6 +245,55 @@ impl RenderBridge {
             circles,
             regions.len()
         );
+    }
+
+    fn ensure_fog_tiles(&mut self, scene: &mut Scene) {
+        if !self.fog_nodes.is_empty() {
+            return;
+        }
+        let tile_render = FOG_TILE_BACKEND * WORLD_SCALE * 1.04;
+        for y in (FOG_MIN_BACKEND..=FOG_MAX_BACKEND).step_by(FOG_TILE_BACKEND as usize) {
+            for x in (FOG_MIN_BACKEND..=FOG_MAX_BACKEND).step_by(FOG_TILE_BACKEND as usize) {
+                let center = Vector2::new(x as f32, y as f32);
+                let node: Handle<Node> = RectangleBuilder::new(
+                    BaseBuilder::new().with_local_transform(
+                        TransformBuilder::new()
+                            .with_local_position(Vector3::new(
+                                -center.x * WORLD_SCALE,
+                                center.y * WORLD_SCALE,
+                                Z_FOG,
+                            ))
+                            .with_local_scale(Vector3::new(tile_render, tile_render, f32::EPSILON))
+                            .build(),
+                    ),
+                )
+                .with_color(Color::from_rgba(
+                    FOG_COLOR.0,
+                    FOG_COLOR.1,
+                    FOG_COLOR.2,
+                    FOG_COLOR.3,
+                ))
+                .build(&mut scene.graph)
+                .transmute();
+                self.fog_nodes.push((center, node));
+            }
+        }
+    }
+
+    pub fn update_fog_of_war(
+        &mut self,
+        scene: &mut Scene,
+        hero_render: Option<Vector2<f32>>,
+        vision_radius_backend: f32,
+    ) {
+        let hero = hero_render.map(|value| value / WORLD_SCALE);
+        for (center, node) in &self.fog_nodes {
+            let visible = hero.is_some_and(|source| {
+                (*center - source).norm_squared() <= vision_radius_backend * vision_radius_backend
+                    && !segment_blocked(source, *center, &self.fog_occluders)
+            });
+            scene.graph[*node].set_visibility(!visible);
+        }
     }
 
     fn ensure_paths_drawn(&mut self, paths: &[Vec<(f32, f32)>], scene: &mut Scene) {
@@ -286,6 +348,45 @@ impl RenderBridge {
             paths.len()
         );
     }
+}
+
+fn segment_blocked(
+    source: Vector2<f32>,
+    target: Vector2<f32>,
+    occluders: &[crate::sim_runner::BlockedRegionSnapshot],
+) -> bool {
+    occluders.iter().any(|occluder| {
+        if let Some(((cx, cy), radius)) = occluder.circle {
+            let center = Vector2::new(cx, cy);
+            let delta = target - source;
+            let length_sq = delta.norm_squared();
+            let t = if length_sq <= f32::EPSILON {
+                0.0
+            } else {
+                ((center - source).dot(&delta) / length_sq).clamp(0.0, 1.0)
+            };
+            return (source + delta * t - center).norm_squared() <= radius * radius;
+        }
+        occluder
+            .points
+            .iter()
+            .enumerate()
+            .any(|(index, &(ax, ay))| {
+                let (bx, by) = occluder.points[(index + 1) % occluder.points.len()];
+                segments_intersect(source, target, Vector2::new(ax, ay), Vector2::new(bx, by))
+            })
+    })
+}
+
+fn segments_intersect(a: Vector2<f32>, b: Vector2<f32>, c: Vector2<f32>, d: Vector2<f32>) -> bool {
+    fn side(a: Vector2<f32>, b: Vector2<f32>, p: Vector2<f32>) -> f32 {
+        (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+    }
+    let ab_c = side(a, b, c);
+    let ab_d = side(a, b, d);
+    let cd_a = side(c, d, a);
+    let cd_b = side(c, d, b);
+    ab_c * ab_d <= 0.0 && cd_a * cd_b <= 0.0
 }
 
 fn kind_histogram(entities: &[EntityRenderData]) -> [usize; 5] {
@@ -437,5 +538,18 @@ mod tests {
         let (ca, _, _) = style_for_entity(&a);
         let (cb, _, _) = style_for_entity(&b);
         assert_ne!((ca[0], ca[1], ca[2]), (cb[0], cb[1], cb[2]));
+    }
+
+    #[test]
+    fn fog_segment_is_blocked_by_tree_circle() {
+        let tree = crate::sim_runner::BlockedRegionSnapshot {
+            points: Vec::new(),
+            circle: Some(((5.0, 0.0), 1.0)),
+        };
+        assert!(segment_blocked(
+            Vector2::new(0.0, 0.0),
+            Vector2::new(10.0, 0.0),
+            &[tree]
+        ));
     }
 }
