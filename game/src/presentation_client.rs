@@ -145,10 +145,13 @@ async fn run_connection(
         ),
     )
     .await?;
+    let mut accepted_sequence = 0_u64;
     loop {
         tokio::select! {
             inbound = read_envelope(&mut reader) => {
                 let inbound = inbound?;
+                let snapshot_epoch=match &inbound.payload { Some(renderer_ipc_envelope::Payload::Snapshot(snapshot))=>Some(snapshot.view_epoch), _=>None };
+                validate_presentation_order(&mut accepted_sequence, view_epoch, inbound.sequence, snapshot_epoch)?;
                 if matches!(&inbound.payload, Some(renderer_ipc_envelope::Payload::RuntimeReady(_))) { ready.store(true, Ordering::Relaxed); continue; }
                 if let Some(renderer_ipc_envelope::Payload::Snapshot(snapshot)) = inbound.payload {
                     ready.store(true, Ordering::Relaxed);
@@ -171,6 +174,22 @@ async fn run_connection(
             }
         }
     }
+}
+
+fn validate_presentation_order(
+    accepted_sequence: &mut u64,
+    view_epoch: &AtomicU64,
+    sequence: u64,
+    snapshot_epoch: Option<u64>,
+) -> Result<(), String> {
+    if sequence < *accepted_sequence || (sequence == *accepted_sequence && sequence != 0) {
+        return Err("presentation sequence did not advance".into());
+    }
+    if snapshot_epoch.is_some_and(|epoch| epoch < view_epoch.load(Ordering::Relaxed)) {
+        return Err("presentation view epoch regressed".into());
+    }
+    *accepted_sequence = (*accepted_sequence).max(sequence);
+    Ok(())
 }
 
 async fn next_input(inputs: &Receiver<RendererIpcEnvelope>) -> Option<RendererIpcEnvelope> {
@@ -337,4 +356,18 @@ async fn write_envelope(
         .await
         .map_err(|error| error.to_string())?;
     writer.flush().await.map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod delay_safety_tests {
+    use super::*;
+    #[test]
+    fn stale_sequence_and_epoch_are_rejected() {
+        let epoch = AtomicU64::new(7);
+        let mut sequence = 10;
+        assert!(validate_presentation_order(&mut sequence, &epoch, 9, Some(7)).is_err());
+        assert!(validate_presentation_order(&mut sequence, &epoch, 11, Some(6)).is_err());
+        assert!(validate_presentation_order(&mut sequence, &epoch, 11, Some(7)).is_ok());
+        assert_eq!(sequence, 11)
+    }
 }
