@@ -77,6 +77,8 @@ pub(crate) mod lockstep_client;
 pub(crate) mod match_statistics;
 #[path = "pregame.rs"]
 pub(crate) mod pregame;
+#[path = "presentation_client.rs"]
+pub(crate) mod presentation_client;
 #[path = "render_bridge.rs"]
 pub(crate) mod render_bridge;
 #[path = "sim_runner.rs"]
@@ -3418,6 +3420,9 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     sim_runner_handle: Option<sim_runner::SimRunnerHandle>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    presentation_handle: Option<presentation_client::RendererPresentationHandle>,
     /// Uncapped local TD 1-100 autoplay worker used only when
     /// `OMFX_AUTOPLAY_100=1`. It never connects to the KCP backend.
     #[visit(skip)]
@@ -6555,6 +6560,22 @@ impl Plugin for Game {
         // - 斷開連接 → 記錄。
         // TickBatch 每秒採樣一次，以避免日誌垃圾郵件。
         let mut forwarded_pending_input_ids: Vec<u32> = Vec::new();
+        if let Some(handle) = self.presentation_handle.as_ref() {
+            self.connection_status = if handle.is_ready() {
+                ConnectionStatus::Connected
+            } else {
+                ConnectionStatus::Connecting
+            };
+            while let Ok(update) = handle.snapshots.try_recv() {
+                let snapshot = update.snapshot;
+                self.current_sim_tick = snapshot.replica_tick.min(u64::from(u32::MAX)) as u32;
+                self.current_sim_tick_observed_at = Some(now);
+                self.local_team_id = snapshot.team_id;
+                let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
+                self.render_bridge
+                    .set_authoritative_fog(update.vision_center_raw, update.visible_fog_cells);
+            }
+        }
         let t_lockstep = std::time::Instant::now();
         let event_drain_span =
             tracing::trace_span!("omfx::frame::lockstep_event_drain", perfetto = true,).entered();
@@ -7595,18 +7616,24 @@ impl Plugin for Game {
                 Z_RING - 0.02,
             );
         }
-        if let Some(center) = local_hero {
-            add_circle_lines(
-                scene,
-                center,
-                visual_vision_radius,
-                64,
-                Color::from_rgba(90, 210, 255, 150),
-                Z_RING - 0.03,
-            );
+        if std::env::var("OMFX_VISION_DEBUG").ok().as_deref() == Some("1") {
+            if let Some(center) = local_hero {
+                add_circle_lines(
+                    scene,
+                    center,
+                    visual_vision_radius,
+                    64,
+                    Color::from_rgba(90, 210, 255, 150),
+                    Z_RING - 0.03,
+                );
+            }
         }
-        self.render_bridge
-            .update_fog_of_war(scene, local_hero, 700.0);
+        if self.presentation_handle.is_some() {
+            self.render_bridge.update_authoritative_fog(scene);
+        } else {
+            self.render_bridge
+                .update_fog_of_war(scene, local_hero, 700.0);
+        }
 
         // 階段 5.x：將 sim_runner 支援的實體寫入 body_batch + hp_batch
         // 沖洗前。替換每個實體的 RectangleBuilder 生成
@@ -12440,6 +12467,7 @@ impl Game {
     fn start_game_session(&mut self, selection: pregame::SessionSelection) -> Result<(), String> {
         if self.lockstep_handle.is_some()
             || self.sim_runner_handle.is_some()
+            || self.presentation_handle.is_some()
             || self.visual_autoplay_handle.is_some()
             || self.backend_session.is_some()
         {
@@ -12458,8 +12486,13 @@ impl Game {
         let server_addr = backend_config.kcp_addr.clone();
         let story = backend_config.story.clone();
         let difficulty_config = backend_config.difficulty_config.clone();
-        let backend = backend_session::BackendSession::start(backend_config)?;
-        self.backend_session = Some(backend);
+        let renderer_only = std::env::var("OMFX_RENDERER_ONLY")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"));
+        if !renderer_only {
+            let backend = backend_session::BackendSession::start(backend_config)?;
+            self.backend_session = Some(backend);
+        }
 
         std::env::set_var("OMB_SESSION_ID", &session_id);
         std::env::set_var("OMB_MAP_ID", &selection.map.id);
@@ -12490,6 +12523,30 @@ impl Game {
             local_player_id
         );
         self.connection_status = ConnectionStatus::Connecting;
+        if renderer_only {
+            let presentation_addr = std::env::var("OMFX_PRESENTATION_ADDR")
+                .map_err(|_| {
+                    "OMFX_PRESENTATION_ADDR is required in renderer-only mode".to_string()
+                })?
+                .parse()
+                .map_err(|error| format!("invalid OMFX_PRESENTATION_ADDR: {error}"))?;
+            self.local_team_id = std::env::var("OMB_TEAM_ID")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|team| matches!(team, 1 | 2))
+                .ok_or_else(|| "OMB_TEAM_ID must be 1 or 2 in renderer-only mode".to_string())?;
+            self.presentation_handle = Some(presentation_client::spawn(presentation_addr));
+            self.match_statistics.start();
+            self.pregame_runtime.mark_in_game();
+            self.connection_status = ConnectionStatus::Connected;
+            log::info!(
+                "renderer-only session ready player_id={} team_id={} presentation={}",
+                self.local_player_id,
+                self.local_team_id,
+                presentation_addr
+            );
+            return Ok(());
+        }
         self.lockstep_handle = Some(lockstep_client::spawn_lockstep_client(
             server_addr,
             lockstep_player_name,
@@ -12549,6 +12606,9 @@ impl Game {
         }
         if let Some(lockstep) = self.lockstep_handle.take() {
             lockstep.shutdown();
+        }
+        if let Some(presentation) = self.presentation_handle.take() {
+            presentation.shutdown();
         }
         if let Some(sim_runner) = self.sim_runner_handle.take() {
             sim_runner.shutdown();
@@ -16716,6 +16776,12 @@ impl Game {
         origin_kind: lockstep_client::InputOriginKind,
         origin_us: u64,
     ) {
+        if let Some(handle) = self.presentation_handle.as_ref() {
+            if let Err(error) = handle.send_player_input(self.local_player_id, input) {
+                log::warn!("renderer-only input rejected locally: {error}");
+            }
+            return;
+        }
         let Some(handle) = self.lockstep_handle.as_ref() else {
             return;
         };

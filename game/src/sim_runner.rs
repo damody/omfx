@@ -322,6 +322,7 @@ pub struct SimRunnerDiagnostics {
 
 pub struct SelectiveReplicaOwner {
     runtime: Option<omoba_core::runtime::SelectiveReplicaRuntime>,
+    stepper: Option<omoba_core::runtime::SpecsDisclosedWorldStepper>,
     barrier: BTreeMap<u64, Arc<[u8]>>,
     expected_team_sequence: u64,
     negotiated_buffer_ticks: usize,
@@ -376,6 +377,7 @@ impl Default for SelectiveReplicaOwner {
     fn default() -> Self {
         Self {
             runtime: None,
+            stepper: None,
             barrier: BTreeMap::new(),
             expected_team_sequence: 0,
             negotiated_buffer_ticks: 12,
@@ -395,14 +397,13 @@ impl SelectiveReplicaOwner {
         &mut self,
         start: &omoba_core::game_proto::TeamGameStart,
     ) -> Result<(), String> {
-        let component_allowlist = std::collections::BTreeSet::from([
-            omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID,
-        ]);
+        let component_allowlist = omoba_core::runtime::secure_replica_component_allowlist();
+        let resource_allowlist = omoba_core::runtime::secure_replica_resource_allowlist();
         let mut runtime =
             omoba_core::runtime::SelectiveReplicaRuntime::bootstrap_from_team_game_start(
                 start,
-                component_allowlist,
-                Default::default(),
+                component_allowlist.clone(),
+                resource_allowlist.clone(),
             )
             .map_err(|error| format!("selective bootstrap: {error:?}"))?;
         self.expected_team_sequence = start.next_team_sequence;
@@ -412,7 +413,16 @@ impl SelectiveReplicaOwner {
             start.replica_buffer_ticks.clamp(3, 24) as usize
         };
         self.last_disclosed_render = Some(runtime.extract_filtered_render_snapshot());
+        let mut stepper = omoba_core::runtime::SpecsDisclosedWorldStepper::from_start(
+            start,
+            component_allowlist,
+            resource_allowlist,
+        );
+        stepper
+            .bootstrap_membership(runtime.world())
+            .map_err(|error| format!("selective Specs bootstrap: {error:?}"))?;
         self.runtime = Some(runtime);
+        self.stepper = Some(stepper);
         self.barrier.clear();
         self.staging.discard();
         self.stall = omoba_core::runtime::ReplicaStallState::Running;
@@ -460,11 +470,12 @@ impl SelectiveReplicaOwner {
         }
         while let Some(encoded) = self.barrier.remove(&self.expected_team_sequence) {
             let runtime = self.runtime.as_mut().expect("checked runtime");
+            let stepper = self
+                .stepper
+                .as_mut()
+                .ok_or("selective Specs stepper missing")?;
             let result = runtime
-                .apply_encoded_frame(
-                    &encoded,
-                    &mut omoba_core::runtime::NoopDisclosedWorldStepper,
-                )
+                .apply_encoded_frame(&encoded, stepper)
                 .map_err(|error| format!("selective frame apply: {error:?}"))?;
             match result {
                 omoba_core::runtime::FrameApplyResult::Applied {
@@ -1016,117 +1027,87 @@ fn run_sim_loop(
         }
         drop(input_apply_span);
 
-        let t_dispatch = Instant::now();
-        let dispatch_span =
-            tracing::trace_span!("omfx::sim_runner::dispatcher", perfetto = true).entered();
-        dispatcher.dispatch(&world);
-        world.maintain();
-        profile_dispatch_ns += t_dispatch.elapsed().as_nanos();
-        drop(dispatch_span);
-        {
-            let mut events = world.write_resource::<omoba_core::runtime::RuntimeEvents>();
-            events.clear();
-        }
-
-        let t_drains = Instant::now();
-        let drains_span =
-            tracing::trace_span!("omfx::sim_runner::pending_queue_drains", perfetto = true)
-                .entered();
-        omoba_core::runtime::drain_pending_hero_command_clears(&mut world);
-        world.maintain();
-
-        // 階段 2.1：drain `PendingTowerSpawnQueue`，與 authoritative runtime
-        // 使用相同 tick boundary，讓 TowerPlace input deterministic 地建立 TD tower。
-        omoba_core::runtime::drain_pending_tower_spawns(&mut world);
-        world.maintain();
-
-        // 階段 2.2：drain TowerSell input queue。退款與 entity removal 必須在
-        // authoritative/local replica 同步執行，讓 snapshots 保持一致。
-        omoba_core::runtime::drain_pending_tower_sells(&mut world);
-        world.maintain();
-
-        omoba_core::runtime::drain_pending_tower_target_priorities(&mut world);
-        world.maintain();
-
-        // 階段 2.4：drain ItemUse input queue。庫存冷卻與 CProperty
-        // (HP / msd) mutation 需在 authoritative/local replica 同步執行。
-        omoba_core::runtime::drain_pending_item_uses(&mut world);
-        world.maintain();
-
-        // AbilityUpgrade：消耗 skill point 並在 script dispatch 前排入 SkillLearn，
-        // 與 authoritative runtime 使用相同 boundary。
-        omoba_core::runtime::drain_pending_ability_upgrades(&mut world);
-        world.maintain();
-
-        // AbilityCast：在 script dispatch 前排入 SkillCast。保留在 upgrades 後面，
-        // 讓同 tick learn+cast 行為與 host 相符。
-        omoba_core::runtime::drain_pending_ability_casts(&mut world);
-        world.maintain();
-
-        // MoveTo (右鍵移動): drain `PendingMoveQueue`，在玩家英雄寫入 MoveTarget。
-        omoba_core::runtime::drain_pending_moves(&mut world);
-        world.maintain();
-
-        profile_drains_ns += t_drains.elapsed().as_nanos();
-        drop(drains_span);
-
-        // 階段 3 調度程序僅調度滴答系統；它不包括
-        // GameProcessor::process_outcomes。如果沒有這個，`creep_wave`會產生
-        // `Outcome::Creep { cd }` 行堆積在 `Vec<Outcome>` 中，但沒有
-        // 實體在本機 sim 中產生 → snapshot.creep 保持 0。
-        let pre_script_outcomes_span = tracing::trace_span!(
-            "omfx::sim_runner::process_outcomes_pre_script",
-            perfetto = true,
-        )
-        .entered();
-        let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
-        if let Err(e) = omoba_core::runtime::process_outcomes(&mut world, &mut event_sink) {
-            log::warn!("sim_runner: process_outcomes failed: {}", e);
-        }
-        world.maintain();
-        drop(pre_script_outcomes_span);
-
-        // Mirror the authoritative active-ability phase exactly: upgrades ->
-        // casts -> scheduler -> callbacks -> ordinary unit script ticks. The
-        // maintain above closes pre-script outcomes; the next maintain remains
-        // after post-script outcomes so no ECS lifecycle boundary can split
-        // this phase.
-        omoba_core::runtime::drain_pending_tower_upgrades(&mut world);
-        omoba_core::runtime::drain_pending_tower_ability_casts(&mut world);
-        let scaled_dt = world
-            .read_resource::<omoba_core::comp::resources::DeltaTime>()
-            .0;
-        omoba_core::runtime::tick_tower_abilities(&mut world, scaled_dt);
-        omoba_core::runtime::drain_pending_tower_ability_callbacks(
-            &mut world,
-            &script_registry,
-            batch.tick as u64,
-        );
-
-        let t_script = Instant::now();
-        let script_span =
-            tracing::trace_span!("omfx::sim_runner::script_dispatch", perfetto = true).entered();
-        // 運行腳本調度，以便塔/英雄/召喚`on_tick`鉤子火。
-        // 塔是 ScriptUnitTag 驅動的 - 沒有這個， tower_dart / tower_
-        // 炸彈/ tower_ice從未決定攻擊，所以projectile_tick有
-        // 沒有什麼可以提前的，damage_tick 也沒有什麼可以應用的。
-        // backend 的 `State::tick` 在 `run_systems` 之後執行相同的操作（請參閱
-        // `scripting::run_script_dispatch` 周圍的 backend tick loop
-        // 稱呼）。副本需要相同的呼叫來保持 sim 等效。
-        omoba_core::runtime::run_script_dispatch(
-            &mut world,
-            &script_registry,
-            batch.tick as u64,
-            scaled_dt,
-        );
-        // 處理推送的任何結果腳本（投射物/損壞/等）。
-        let mut event_sink = omoba_core::runtime::RuntimeEventVecSink::default();
-        if let Err(e) = omoba_core::runtime::process_outcomes(&mut world, &mut event_sink) {
-            log::warn!("sim_runner: process_outcomes (post-script) failed: {}", e);
-        }
-        world.maintain();
-        profile_script_ns += t_script.elapsed().as_nanos();
-        drop(script_span);
+        let phase_result: Result<(), ()> =
+            omoba_core::runtime::run_deterministic_gameplay_phases(&mut |phase| {
+                use omoba_core::runtime::DeterministicGameplayPhase as P;
+                let started = Instant::now();
+                match phase {
+                    P::Dispatcher => dispatcher.dispatch(&world),
+                    P::RuntimeEventBoundary => world
+                        .write_resource::<omoba_core::runtime::RuntimeEvents>()
+                        .clear(),
+                    P::HeroCommandClears => {
+                        omoba_core::runtime::drain_pending_hero_command_clears(&mut world)
+                    }
+                    P::TowerSpawns => omoba_core::runtime::drain_pending_tower_spawns(&mut world),
+                    P::TowerSells => omoba_core::runtime::drain_pending_tower_sells(&mut world),
+                    P::TowerTargetPriorities => {
+                        omoba_core::runtime::drain_pending_tower_target_priorities(&mut world)
+                    }
+                    P::ItemUses => omoba_core::runtime::drain_pending_item_uses(&mut world),
+                    P::AbilityUpgrades => {
+                        omoba_core::runtime::drain_pending_ability_upgrades(&mut world)
+                    }
+                    P::AbilityCasts => omoba_core::runtime::drain_pending_ability_casts(&mut world),
+                    P::Moves => omoba_core::runtime::drain_pending_moves(&mut world),
+                    P::PreScriptOutcomes | P::PostScriptOutcomes => {
+                        let mut sink = omoba_core::runtime::RuntimeEventVecSink::default();
+                        if let Err(error) =
+                            omoba_core::runtime::process_outcomes(&mut world, &mut sink)
+                        {
+                            log::warn!("sim_runner: process_outcomes failed: {}", error);
+                        }
+                    }
+                    P::TowerUpgrades => {
+                        omoba_core::runtime::drain_pending_tower_upgrades(&mut world)
+                    }
+                    P::TowerAbilityCasts => {
+                        omoba_core::runtime::drain_pending_tower_ability_casts(&mut world)
+                    }
+                    P::TowerAbilityScheduler => {
+                        let dt = world
+                            .read_resource::<omoba_core::comp::resources::DeltaTime>()
+                            .0;
+                        omoba_core::runtime::tick_tower_abilities(&mut world, dt);
+                    }
+                    P::TowerAbilityCallbacks => {
+                        let global_seed =
+                            world.read_resource::<omoba_core::runtime::MasterSeed>().0;
+                        omoba_core::runtime::drain_pending_tower_ability_callbacks(
+                            &mut world,
+                            &script_registry,
+                            global_seed,
+                        );
+                    }
+                    P::ScriptDispatch => {
+                        let dt = world
+                            .read_resource::<omoba_core::comp::resources::DeltaTime>()
+                            .0;
+                        let global_seed =
+                            world.read_resource::<omoba_core::runtime::MasterSeed>().0;
+                        omoba_core::runtime::run_script_dispatch(
+                            &mut world,
+                            &script_registry,
+                            global_seed,
+                            dt,
+                        );
+                    }
+                    // Authoritative ResourceManager currently defines this as a
+                    // deterministic no-op; retaining the phase prevents ordering drift.
+                    P::CreepWave => {}
+                }
+                if matches!(phase, P::PreScriptOutcomes | P::PostScriptOutcomes) {
+                    world.maintain();
+                }
+                let elapsed = started.elapsed().as_nanos();
+                match phase {
+                    P::Dispatcher => profile_dispatch_ns += elapsed,
+                    P::ScriptDispatch => profile_script_ns += elapsed,
+                    _ => profile_drains_ns += elapsed,
+                }
+                Ok(())
+            });
+        debug_assert!(phase_result.is_ok());
 
         // Metadata is static after init except DEV Lua reload, where the reload
         // path rebuilds these Arcs explicitly.
@@ -1761,56 +1742,15 @@ mod tests {
     #[test]
     fn replica_runner_keeps_tower_ability_phase_order_and_scaled_delta() {
         let source = include_str!("sim_runner.rs");
-        let upgrades = source
-            .find(concat!(
-                "omoba_core::runtime::drain_pending_tower_",
-                "upgrades(&mut world)"
-            ))
-            .expect("tower upgrade drain");
-        let suffix = &source[upgrades..];
-        let casts = suffix
-            .find(concat!(
-                "omoba_core::runtime::drain_pending_tower_ability_",
-                "casts(&mut world)"
-            ))
-            .expect("tower ability cast drain");
-        let scheduler = suffix
-            .find(concat!(
-                "omoba_core::runtime::tick_tower_",
-                "abilities(&mut world, scaled_dt)"
-            ))
-            .expect("tower ability scheduler");
-        let callbacks = suffix
-            .find(concat!(
-                "omoba_core::runtime::drain_pending_tower_ability_",
-                "callbacks("
-            ))
-            .expect("tower ability callback drain");
-        let ordinary_ticks = suffix
-            .find(concat!("omoba_core::runtime::run_script_", "dispatch("))
-            .expect("ordinary unit script ticks");
-
-        assert!(casts < scheduler);
-        assert!(scheduler < callbacks);
-        assert!(callbacks < ordinary_ticks);
-        let phase = &suffix[..ordinary_ticks];
-        assert_eq!(phase.matches("drain_pending_").count(), 3);
-        assert_eq!(
-            phase
-                .matches(concat!("drain_pending_tower_ability_", "callbacks("))
-                .count(),
-            1
-        );
-        assert_eq!(phase.matches("tick_tower_abilities(").count(), 1);
-        assert!(!phase.contains(concat!("world.", "maintain()")));
-        assert!(!phase.contains(concat!("process_", "outcomes(")));
-        assert!(!phase.contains(concat!("dispatcher.", "dispatch(")));
-        let before_scheduler = &suffix[..scheduler];
-        assert!(before_scheduler.contains(concat!("let scaled_", "dt = world")));
-        assert!(before_scheduler.contains(concat!(
-            "read_resource::<omoba_core::comp::resources::",
-            "DeltaTime>()"
-        )));
+        assert!(source.contains("run_deterministic_gameplay_phases"));
+        let phases = omoba_core::runtime::DETERMINISTIC_GAMEPLAY_PHASES;
+        let index = |wanted| phases.iter().position(|phase| *phase == wanted).unwrap();
+        use omoba_core::runtime::DeterministicGameplayPhase as P;
+        assert!(index(P::TowerUpgrades) < index(P::TowerAbilityCasts));
+        assert!(index(P::TowerAbilityCasts) < index(P::TowerAbilityScheduler));
+        assert!(index(P::TowerAbilityScheduler) < index(P::TowerAbilityCallbacks));
+        assert!(index(P::TowerAbilityCallbacks) < index(P::ScriptDispatch));
+        assert!(source.contains("read_resource::<omoba_core::comp::resources::DeltaTime>()"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ fn main() -> Result<(), String> {
     let tick = 90;
     let canonical = (5u64 << 32) | 8;
     let mut projector = TeamViewProjector::new(team, TeamProjectorConfig::default());
-    let start = projector.build_team_game_start(tick, 120);
+    let start = projector.build_team_game_start(tick, 120, 1);
     let mut replica = SelectiveReplicaRuntime::bootstrap_from_team_game_start(
         &start,
         BTreeSet::new(),

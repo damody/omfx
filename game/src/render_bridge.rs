@@ -19,6 +19,7 @@ use fyrox::scene::dim2::rectangle::RectangleBuilder;
 use fyrox::scene::transform::TransformBuilder;
 use fyrox::scene::{node::Node, Scene};
 use omoba_core::lockstep_timing::LOCKSTEP_ONE_SECOND_TICKS_U32;
+use std::collections::BTreeSet;
 
 use crate::sim_runner::{EntityKind, EntityRenderData, SimWorldSnapshot};
 use crate::sprite_resources::{BatchedSpriteMesh, QuadParams};
@@ -71,6 +72,7 @@ pub struct RenderBridge {
     fog_slots: Vec<u32>,
     fog_origin_cell: Option<(i32, i32)>,
     fog_occluders: Vec<crate::sim_runner::BlockedRegionSnapshot>,
+    authoritative_fog: Option<((i32, i32), BTreeSet<(i32, i32)>)>,
 }
 
 impl RenderBridge {
@@ -91,6 +93,7 @@ impl RenderBridge {
         self.fog_slots.clear();
         self.fog_origin_cell = None;
         self.fog_occluders.clear();
+        self.authoritative_fog = None;
         self.last_applied_tick = None;
         self.paths_drawn = false;
         self.regions_drawn = false;
@@ -304,6 +307,65 @@ impl RenderBridge {
                     && !segment_blocked(hero, center, &self.fog_occluders);
                 let slot = self.fog_slots[(row * FOG_COLUMNS + column) as usize];
                 let (size, color) = fog_tile_style(visible, tile_render);
+                batch.write_quad(
+                    slot,
+                    &QuadParams {
+                        center: Vector2::new(-center.x * WORLD_SCALE, center.y * WORLD_SCALE),
+                        size,
+                        color,
+                        rotation: 0.0,
+                        z: Z_FOG,
+                    },
+                );
+            }
+        }
+        batch.flush(scene);
+    }
+
+    pub fn set_authoritative_fog(
+        &mut self,
+        center_raw: Option<(i64, i64)>,
+        visible: Vec<(i32, i32)>,
+    ) {
+        let Some((x_raw, y_raw)) = center_raw else {
+            return;
+        };
+        let scale = omoba_sim::fixed::SCALE;
+        let tile_raw = 10_i64 * scale;
+        self.authoritative_fog = Some((
+            (
+                x_raw.div_euclid(tile_raw) as i32,
+                y_raw.div_euclid(tile_raw) as i32,
+            ),
+            visible.into_iter().collect(),
+        ));
+        self.fog_origin_cell = None;
+    }
+
+    pub fn update_authoritative_fog(&mut self, scene: &mut Scene) {
+        let Some((hero_cell, visible)) = self.authoritative_fog.clone() else {
+            return;
+        };
+        if self.fog_origin_cell == Some(hero_cell) {
+            return;
+        }
+        self.fog_origin_cell = Some(hero_cell);
+        self.ensure_fog_tiles(scene);
+        let Some(batch) = self.fog_batch.as_mut() else {
+            return;
+        };
+        let tile_render = FOG_TILE_BACKEND * WORLD_SCALE * 1.02;
+        for row in 0..FOG_ROWS {
+            for column in 0..FOG_COLUMNS {
+                let cell_x = hero_cell.0 + column - FOG_COLUMNS / 2;
+                let cell_y = hero_cell.1 + row - FOG_ROWS / 2;
+                let center = Vector2::new(
+                    (cell_x as f32 + 0.5) * FOG_TILE_BACKEND,
+                    (cell_y as f32 + 0.5) * FOG_TILE_BACKEND,
+                );
+                let slot = self.fog_slots[(row * FOG_COLUMNS + column) as usize];
+                let (size, color) =
+                    fog_tile_style(visible.contains(&(cell_x, cell_y)), tile_render);
                 batch.write_quad(
                     slot,
                     &QuadParams {

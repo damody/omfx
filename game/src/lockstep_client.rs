@@ -543,6 +543,10 @@ async fn run_client(
                     warn!("secure selective session denied global SnapshotResp fallback");
                     continue;
                 }
+                Ok(Some(LockstepInbound::SecureTargetInputResult { .. })) => {
+                    // Embedded migration path does not submit secure target IPC.
+                    continue;
+                }
             }
 
             // 非阻塞清空待送輸入。`InputSubmit` 的位元組也會納入同一個
