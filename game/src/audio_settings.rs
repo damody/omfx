@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{table, value, DocumentMut};
 
-pub const DEFAULT_MUSIC_VOLUME: f32 = 0.2;
+pub const DEFAULT_MUSIC_VOLUME: f32 = 0.0;
 const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -23,17 +23,19 @@ impl Default for AudioSettings {
 impl AudioSettings {
     pub fn load_or_create() -> Self {
         let Ok(path) = config_path() else {
-            log::warn!("無法取得執行檔路徑，音樂音量使用預設值 20%");
-            return Self::default();
+            log::warn!("無法取得執行檔路徑，音樂音量使用預設值 0%");
+            return Self::default().muted_for_startup();
         };
 
-        match load_or_create_at(&path) {
+        let settings = match load_or_create_at(&path) {
             Ok(settings) => settings,
             Err(err) => {
                 log::warn!("讀取音效設定失敗（{}）：{}", path.display(), err);
                 Self::default()
             }
-        }
+        };
+
+        settings.muted_for_startup()
     }
 
     pub fn save(self) {
@@ -45,6 +47,11 @@ impl AudioSettings {
         if let Err(err) = save_at(&path, self) {
             log::warn!("儲存音效設定失敗（{}）：{}", path.display(), err);
         }
+    }
+
+    fn muted_for_startup(mut self) -> Self {
+        self.music_volume = 0.0;
+        self
     }
 }
 
@@ -122,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_is_created_with_twenty_percent_music() {
+    fn missing_config_is_created_muted() {
         let path = test_path("create");
         let _ = std::fs::remove_file(&path);
 
@@ -131,7 +138,27 @@ mod tests {
 
         assert_eq!(settings.music_volume, DEFAULT_MUSIC_VOLUME);
         assert!(text.contains("[audio]"));
-        assert!(text.contains("music_volume = 0.2\n"));
+        assert!(text.contains("music_volume = 0.0\n"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stored_volume_is_muted_for_startup_without_rewriting_config() {
+        let path = test_path("startup_muted");
+        std::fs::write(
+            &path,
+            "[audio]\nmusic_volume = 0.65\n[video]\nfullscreen = true\n",
+        )
+        .expect("seed config");
+
+        let settings = load_or_create_at(&path)
+            .expect("settings load")
+            .muted_for_startup();
+        let text = std::fs::read_to_string(&path).expect("config is readable");
+
+        assert_eq!(settings.music_volume, 0.0);
+        assert!(text.contains("music_volume = 0.65"));
+        assert!(text.contains("fullscreen = true"));
         let _ = std::fs::remove_file(path);
     }
 
