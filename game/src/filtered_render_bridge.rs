@@ -6,6 +6,32 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use omoba_core::runtime::{FilteredRenderEntity, FilteredRenderSnapshot, RenderMemoryDirective};
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OwnedHeroPresentation {
+    pub render_id: u64,
+    pub name: String,
+    pub title: String,
+    pub level: i32,
+    pub experience: i32,
+    pub experience_to_next: i32,
+    pub skill_points: i32,
+    pub strength: i32,
+    pub agility: i32,
+    pub intelligence: i32,
+    pub primary_attribute: String,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub armor: f32,
+    pub magic_resist: f32,
+    pub move_speed: f32,
+    pub attack_damage: f32,
+    pub attack_interval: f32,
+    pub attack_range: f32,
+    pub bullet_speed: f32,
+    pub abilities: Vec<String>,
+    pub ability_levels: std::collections::HashMap<String, i32>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RememberedAssociationKey {
     pub replica_id: u64,
@@ -92,6 +118,91 @@ impl FilteredRenderBridge {
                 .get(&omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID)
                 .and_then(|bytes| omoba_core::runtime::decode_demo_render_state(bytes))
                 .map(|state| (*id, state))
+        })
+    }
+
+    pub fn owned_hero_presentation(&self, player_id: u32) -> Option<OwnedHeroPresentation> {
+        use omoba_core::runtime::{
+            CProperty, Hero, TAttack, DEMO_RENDER_COMPONENT_SCHEMA_ID,
+            DISCLOSED_ATTACK_COMPONENT_SCHEMA_ID, DISCLOSED_HERO_COMPONENT_SCHEMA_ID,
+            DISCLOSED_PROPERTY_COMPONENT_SCHEMA_ID,
+        };
+        self.deterministic.iter().find_map(|(render_id, entity)| {
+            let render = entity
+                .components
+                .get(&DEMO_RENDER_COMPONENT_SCHEMA_ID)
+                .and_then(|bytes| omoba_core::runtime::decode_demo_render_state(bytes))?;
+            if render.kind != 1 || render.owner_player_id != player_id {
+                return None;
+            }
+            let hero: Hero =
+                serde_json::from_slice(entity.components.get(&DISCLOSED_HERO_COMPONENT_SCHEMA_ID)?)
+                    .ok()?;
+            let property_bytes = entity
+                .components
+                .get(&DISCLOSED_PROPERTY_COMPONENT_SCHEMA_ID)?;
+            if property_bytes.len() != 40 {
+                return None;
+            }
+            let raw = |offset| {
+                omoba_sim::Fixed64::from_raw(i64::from_be_bytes(
+                    property_bytes[offset..offset + 8].try_into().unwrap(),
+                ))
+                .to_f32_for_render()
+            };
+            let property = CProperty {
+                hp: omoba_sim::Fixed64::from_raw(i64::from_be_bytes(
+                    property_bytes[0..8].try_into().unwrap(),
+                )),
+                mhp: omoba_sim::Fixed64::from_raw(i64::from_be_bytes(
+                    property_bytes[8..16].try_into().unwrap(),
+                )),
+                msd: omoba_sim::Fixed64::from_raw(i64::from_be_bytes(
+                    property_bytes[16..24].try_into().unwrap(),
+                )),
+                def_physic: omoba_sim::Fixed64::from_raw(i64::from_be_bytes(
+                    property_bytes[24..32].try_into().unwrap(),
+                )),
+                def_magic: omoba_sim::Fixed64::from_raw(i64::from_be_bytes(
+                    property_bytes[32..40].try_into().unwrap(),
+                )),
+            };
+            let attack: Option<TAttack> = entity
+                .components
+                .get(&DISCLOSED_ATTACK_COMPONENT_SCHEMA_ID)
+                .and_then(|bytes| serde_json::from_slice(bytes).ok());
+            Some(OwnedHeroPresentation {
+                render_id: *render_id,
+                name: hero.name,
+                title: hero.title,
+                level: hero.level,
+                experience: hero.experience,
+                experience_to_next: hero.experience_to_next,
+                skill_points: hero.skill_points,
+                strength: hero.strength,
+                agility: hero.agility,
+                intelligence: hero.intelligence,
+                primary_attribute: format!("{:?}", hero.primary_attribute).to_lowercase(),
+                hp: property.hp.to_f32_for_render(),
+                max_hp: property.mhp.to_f32_for_render(),
+                armor: property.def_physic.to_f32_for_render(),
+                magic_resist: property.def_magic.to_f32_for_render(),
+                move_speed: raw(16),
+                attack_damage: attack
+                    .as_ref()
+                    .map_or(0.0, |value| value.atk_physic.v.to_f32_for_render()),
+                attack_interval: attack
+                    .as_ref()
+                    .map_or(0.0, |value| value.asd.v.to_f32_for_render()),
+                attack_range: attack
+                    .as_ref()
+                    .map_or(0.0, |value| value.range.v.to_f32_for_render()),
+                bullet_speed: attack
+                    .as_ref()
+                    .map_or(0.0, |value| value.bullet_speed.to_f32_for_render()),
+                abilities: hero.abilities,
+                ability_levels: hero.ability_levels,
+            })
         })
     }
 
@@ -199,5 +310,70 @@ impl FilteredRenderBridge {
         key: RememberedAssociationKey,
     ) -> Option<&RememberedPresentation> {
         self.remembered.get(&key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omoba_core::runtime::{
+        encode_disclosed_property, CProperty, DemoRenderState, Hero,
+        DEMO_RENDER_COMPONENT_SCHEMA_ID, DISCLOSED_HERO_COMPONENT_SCHEMA_ID,
+        DISCLOSED_PROPERTY_COMPONENT_SCHEMA_ID,
+    };
+    use omoba_sim::Fixed64;
+
+    #[test]
+    fn owned_hero_hud_comes_from_disclosed_components() {
+        let hero = Hero::new("hero_test".into(), "測試英雄".into(), "守霧者".into());
+        let property = CProperty {
+            hp: Fixed64::from_i32(80),
+            mhp: Fixed64::from_i32(100),
+            msd: Fixed64::from_i32(325),
+            def_physic: Fixed64::from_i32(12),
+            def_magic: Fixed64::from_i32(9),
+        };
+        let components = BTreeMap::from([
+            (
+                DEMO_RENDER_COMPONENT_SCHEMA_ID,
+                omoba_core::runtime::encode_demo_render_state(DemoRenderState {
+                    x_raw: 0,
+                    y_raw: 0,
+                    team_id: 1,
+                    kind: 1,
+                    owner_player_id: 7,
+                }),
+            ),
+            (
+                DISCLOSED_HERO_COMPONENT_SCHEMA_ID,
+                serde_json::to_vec(&hero).unwrap(),
+            ),
+            (
+                DISCLOSED_PROPERTY_COMPONENT_SCHEMA_ID,
+                encode_disclosed_property(&property),
+            ),
+        ]);
+        let mut bridge = FilteredRenderBridge::default();
+        bridge.apply(&FilteredRenderSnapshot {
+            team_id: 1,
+            replica_tick: 10,
+            entities: vec![FilteredRenderEntity {
+                replica_id: 42,
+                disclosure_epoch: 1,
+                entity_kind: 1,
+                components,
+            }],
+            public_events: Vec::new(),
+            external_effects: Vec::new(),
+            memory_directives: Vec::new(),
+        });
+
+        let hud = bridge.owned_hero_presentation(7).unwrap();
+        assert_eq!(hud.render_id, 42);
+        assert_eq!(hud.name, "測試英雄");
+        assert_eq!(hud.hp, 80.0);
+        assert_eq!(hud.max_hp, 100.0);
+        assert_eq!(hud.move_speed, 325.0);
+        assert!(bridge.owned_hero_presentation(8).is_none());
     }
 }

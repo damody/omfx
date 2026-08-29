@@ -3423,6 +3423,12 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     presentation_handle: Option<presentation_client::RendererPresentationHandle>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    renderer_test_move_sent: bool,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    renderer_test_capture_frozen: bool,
     /// Uncapped local TD 1-100 autoplay worker used only when
     /// `OMFX_AUTOPLAY_100=1`. It never connects to the KCP backend.
     #[visit(skip)]
@@ -6560,20 +6566,119 @@ impl Plugin for Game {
         // - 斷開連接 → 記錄。
         // TickBatch 每秒採樣一次，以避免日誌垃圾郵件。
         let mut forwarded_pending_input_ids: Vec<u32> = Vec::new();
+        let mut presentation_tick_for_speed = None;
+        let mut renderer_test_move = None;
         if let Some(handle) = self.presentation_handle.as_ref() {
             self.connection_status = if handle.is_ready() {
                 ConnectionStatus::Connected
             } else {
                 ConnectionStatus::Connecting
             };
-            while let Ok(update) = handle.snapshots.try_recv() {
+            while !self.renderer_test_capture_frozen {
+                let Ok(update) = handle.snapshots.try_recv() else {
+                    break;
+                };
                 let snapshot = update.snapshot;
                 self.current_sim_tick = snapshot.replica_tick.min(u64::from(u32::MAX)) as u32;
                 self.current_sim_tick_observed_at = Some(now);
                 self.local_team_id = snapshot.team_id;
+                self.heartbeat.tick = update.authoritative_tick;
+                self.heartbeat.game_time =
+                    update.authoritative_tick as f64 / f64::from(self.server_timing().step_fps());
+                self.heartbeat.entity_count = snapshot.entities.len() as u64;
+                self.heartbeat.hero_count = snapshot
+                    .entities
+                    .iter()
+                    .filter(|entity| entity.entity_kind == 1)
+                    .count() as u64;
+                self.heartbeat.creep_count = snapshot
+                    .entities
+                    .iter()
+                    .filter(|entity| entity.entity_kind == 2)
+                    .count() as u64;
+                presentation_tick_for_speed = Some(self.current_sim_tick);
+                if !self.renderer_test_move_sent
+                    && std::env::var("OMFX_TEST_MOVE_TICK")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|tick| snapshot.replica_tick >= tick)
+                {
+                    self.renderer_test_move_sent = true;
+                    renderer_test_move = Some(snapshot.replica_tick);
+                }
                 let _scene_actions = self.filtered_render_bridge.apply(&snapshot);
+                if let Some(hero) = self
+                    .filtered_render_bridge
+                    .owned_hero_presentation(self.local_player_id)
+                {
+                    self.hero_state.entity_id = u32::try_from(hero.render_id).ok();
+                    self.hero_state.name = hero.name;
+                    self.hero_state.title = hero.title;
+                    self.hero_state.level = hero.level;
+                    self.hero_state.xp = hero.experience;
+                    self.hero_state.xp_next = hero.experience_to_next;
+                    self.hero_state.skill_points = hero.skill_points;
+                    self.hero_state.strength = hero.strength;
+                    self.hero_state.agility = hero.agility;
+                    self.hero_state.intelligence = hero.intelligence;
+                    self.hero_state.primary_attribute = hero.primary_attribute;
+                    self.hero_state.hp = hero.hp;
+                    self.hero_state.max_hp = hero.max_hp;
+                    self.hero_state.armor = hero.armor;
+                    self.hero_state.magic_resist = hero.magic_resist;
+                    self.hero_state.move_speed = hero.move_speed;
+                    self.hero_state.attack_damage = hero.attack_damage;
+                    self.hero_state.attack_interval = hero.attack_interval;
+                    self.hero_state.attack_range = hero.attack_range;
+                    self.hero_state.bullet_speed = hero.bullet_speed;
+                    self.hero_state.abilities = hero.abilities;
+                    self.hero_state.ability_levels = hero.ability_levels;
+                }
                 self.render_bridge
                     .set_authoritative_fog(update.vision_center_raw, update.visible_fog_cells);
+                if std::env::var("OMFX_TEST_SCREENSHOT_TICK")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|tick| snapshot.replica_tick >= tick)
+                {
+                    self.renderer_test_capture_frozen = true;
+                    if let Ok(root) = std::env::var("OMOBA_FOG_EVIDENCE_DIR") {
+                        let marker = std::path::Path::new(&root).join(format!(
+                            "team-{}-renderer-screenshot.tick",
+                            self.local_team_id
+                        ));
+                        if let Err(error) =
+                            std::fs::write(&marker, snapshot.replica_tick.to_string())
+                        {
+                            log::warn!("renderer screenshot evidence failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(tick) = presentation_tick_for_speed {
+            self.update_sim_speed(tick);
+        }
+        if let Some(tick) = renderer_test_move {
+            let (x_raw, y_raw) = if self.local_team_id == 1 {
+                (900 * 1024, 700 * 1024)
+            } else {
+                (-900 * 1024, -700 * 1024)
+            };
+            self.send_lockstep_input(omoba_core::kcp::game_proto::PlayerInput {
+                action: Some(omoba_core::kcp::game_proto::player_input::Action::MoveTo(
+                    omoba_core::kcp::game_proto::MoveTo {
+                        target: Some(omoba_core::kcp::game_proto::Vec2I { x: x_raw, y: y_raw }),
+                        queued: false,
+                    },
+                )),
+            });
+            if let Ok(root) = std::env::var("OMOBA_FOG_EVIDENCE_DIR") {
+                let marker = std::path::Path::new(&root)
+                    .join(format!("team-{}-renderer-move.tick", self.local_team_id));
+                if let Err(error) = std::fs::write(&marker, tick.to_string()) {
+                    log::warn!("renderer move evidence failed: {error}");
+                }
             }
         }
         let t_lockstep = std::time::Instant::now();

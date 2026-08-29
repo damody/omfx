@@ -1,11 +1,14 @@
 use std::{
     collections::BTreeMap,
+    fs::OpenOptions,
+    io::Write,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
+    time::Instant,
 };
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -34,11 +37,13 @@ pub struct RendererPresentationHandle {
     request_id: Arc<AtomicU64>,
     view_epoch: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
+    pending_inputs: Arc<Mutex<BTreeMap<u64, Instant>>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RendererPresentationUpdate {
     pub snapshot: FilteredRenderSnapshot,
+    pub authoritative_tick: u64,
     pub visible_fog_cells: Vec<(i32, i32)>,
     pub vision_center_raw: Option<(i64, i64)>,
 }
@@ -52,7 +57,12 @@ impl RendererPresentationHandle {
         let request_id = self.request_id.fetch_add(1, Ordering::Relaxed).max(1);
         let intent = convert_input(input)
             .ok_or_else(|| "renderer-only input is not supported by IPC".to_string())?;
-        self.inputs
+        self.pending_inputs
+            .lock()
+            .map_err(|_| "renderer latency map poisoned".to_string())?
+            .insert(request_id, Instant::now());
+        if let Err(error) = self
+            .inputs
             .send(envelope(
                 request_id,
                 renderer_ipc_envelope::Payload::RendererInput(RendererInput {
@@ -62,7 +72,13 @@ impl RendererPresentationHandle {
                     intent: Some(intent),
                 }),
             ))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+        {
+            if let Ok(mut pending) = self.pending_inputs.lock() {
+                pending.remove(&request_id);
+            }
+            return Err(error);
+        }
         Ok(request_id)
     }
 
@@ -85,6 +101,8 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
     let view_epoch = Arc::new(AtomicU64::new(0));
     let worker_view_epoch = Arc::clone(&view_epoch);
     let ready = Arc::new(AtomicBool::new(false));
+    let pending_inputs = Arc::new(Mutex::new(BTreeMap::new()));
+    let worker_pending_inputs = Arc::clone(&pending_inputs);
     let worker_ready = Arc::clone(&ready);
     thread::Builder::new()
         .name("omfx-presentation-ipc".into())
@@ -104,6 +122,7 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
                                 &input_rx,
                                 &worker_view_epoch,
                                 &worker_ready,
+                                &worker_pending_inputs,
                             )
                             .await
                             {
@@ -123,6 +142,7 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
         request_id,
         view_epoch,
         ready,
+        pending_inputs,
     }
 }
 
@@ -133,6 +153,7 @@ async fn run_connection(
     inputs: &Receiver<RendererIpcEnvelope>,
     view_epoch: &AtomicU64,
     ready: &AtomicBool,
+    pending_inputs: &Mutex<BTreeMap<u64, Instant>>,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = stream.into_split();
     write_envelope(
@@ -150,15 +171,31 @@ async fn run_connection(
         tokio::select! {
             inbound = read_envelope(&mut reader) => {
                 let inbound = inbound?;
-                let snapshot_epoch=match &inbound.payload { Some(renderer_ipc_envelope::Payload::Snapshot(snapshot))=>Some(snapshot.view_epoch), _=>None };
-                validate_presentation_order(&mut accepted_sequence, view_epoch, inbound.sequence, snapshot_epoch)?;
                 if matches!(&inbound.payload, Some(renderer_ipc_envelope::Payload::RuntimeReady(_))) { ready.store(true, Ordering::Relaxed); continue; }
+                if let Some(renderer_ipc_envelope::Payload::CriticalInputResult(result)) = &inbound.payload {
+                    if result.result_code == "APPLIED_TO_PRESENTATION" {
+                        if let Ok(mut pending) = pending_inputs.lock() {
+                            if let Some(started) = pending.remove(&result.request_id) {
+                                let total_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                log::info!("input_to_presentation: request_id={} input_id={} authoritative_tick={} total_us={} total_ms={:.3}", result.request_id, result.input_id, result.authoritative_tick, total_us, total_us as f64 / 1000.0);
+                                append_latency_log(result.request_id, result.input_id, result.authoritative_tick, total_us);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(renderer_ipc_envelope::Payload::Snapshot(snapshot)) = inbound.payload {
+                    if !accept_presentation_snapshot(
+                        &mut accepted_sequence,
+                        view_epoch,
+                        inbound.sequence,
+                        snapshot.view_epoch,
+                    ) {
+                        continue;
+                    }
                     ready.store(true, Ordering::Relaxed);
                     view_epoch.store(snapshot.view_epoch, Ordering::Relaxed);
-                    let visible_fog_cells = snapshot.fog_tiles.iter().filter(|tile| tile.visible).map(|tile| (tile.column, tile.row)).collect();
-                    let vision_center_raw = snapshot.vision_circles.first().map(|circle| (circle.x_raw, circle.y_raw));
-                    let converted = RendererPresentationUpdate { snapshot: convert_snapshot(snapshot), visible_fog_cells, vision_center_raw };
+                    let converted = convert_update(snapshot);
                     if let Err(error) = snapshots.try_send(converted) {
                         if error.is_full() {
                             let latest = error.into_inner();
@@ -176,20 +213,30 @@ async fn run_connection(
     }
 }
 
-fn validate_presentation_order(
+fn append_latency_log(request_id: u64, input_id: u32, authoritative_tick: u64, total_us: u64) {
+    let Ok(path) = std::env::var("OMFX_INPUT_LATENCY_LOG") else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{{\"request_id\":{request_id},\"input_id\":{input_id},\"authoritative_tick\":{authoritative_tick},\"input_to_presentation_us\":{total_us}}}");
+}
+
+fn accept_presentation_snapshot(
     accepted_sequence: &mut u64,
     view_epoch: &AtomicU64,
     sequence: u64,
-    snapshot_epoch: Option<u64>,
-) -> Result<(), String> {
+    snapshot_epoch: u64,
+) -> bool {
     if sequence < *accepted_sequence || (sequence == *accepted_sequence && sequence != 0) {
-        return Err("presentation sequence did not advance".into());
+        return false;
     }
-    if snapshot_epoch.is_some_and(|epoch| epoch < view_epoch.load(Ordering::Relaxed)) {
-        return Err("presentation view epoch regressed".into());
+    if snapshot_epoch < view_epoch.load(Ordering::Relaxed) {
+        return false;
     }
     *accepted_sequence = (*accepted_sequence).max(sequence);
-    Ok(())
+    true
 }
 
 async fn next_input(inputs: &Receiver<RendererIpcEnvelope>) -> Option<RendererIpcEnvelope> {
@@ -201,6 +248,28 @@ async fn next_input(inputs: &Receiver<RendererIpcEnvelope>) -> Option<RendererIp
                 tokio::time::sleep(std::time::Duration::from_millis(4)).await;
             }
         }
+    }
+}
+
+fn convert_update(
+    snapshot: omoba_core::game_proto::TeamPresentationSnapshot,
+) -> RendererPresentationUpdate {
+    let authoritative_tick = snapshot.authoritative_tick;
+    let visible_fog_cells = snapshot
+        .fog_tiles
+        .iter()
+        .filter(|tile| tile.visible)
+        .map(|tile| (tile.column, tile.row))
+        .collect();
+    let vision_center_raw = snapshot
+        .vision_circles
+        .first()
+        .map(|circle| (circle.x_raw, circle.y_raw));
+    RendererPresentationUpdate {
+        snapshot: convert_snapshot(snapshot),
+        authoritative_tick,
+        visible_fog_cells,
+        vision_center_raw,
     }
 }
 
@@ -361,13 +430,42 @@ async fn write_envelope(
 #[cfg(test)]
 mod delay_safety_tests {
     use super::*;
+    use omoba_core::game_proto::{player_input, MoveTo, TeamPresentationSnapshot, Vec2I};
+
     #[test]
-    fn stale_sequence_and_epoch_are_rejected() {
+    fn stale_snapshot_sequence_and_epoch_are_ignored_without_disconnect() {
         let epoch = AtomicU64::new(7);
         let mut sequence = 10;
-        assert!(validate_presentation_order(&mut sequence, &epoch, 9, Some(7)).is_err());
-        assert!(validate_presentation_order(&mut sequence, &epoch, 11, Some(6)).is_err());
-        assert!(validate_presentation_order(&mut sequence, &epoch, 11, Some(7)).is_ok());
+        assert!(!accept_presentation_snapshot(&mut sequence, &epoch, 9, 7));
+        assert!(!accept_presentation_snapshot(&mut sequence, &epoch, 11, 6));
+        assert!(accept_presentation_snapshot(&mut sequence, &epoch, 11, 7));
         assert_eq!(sequence, 11)
+    }
+
+    #[test]
+    fn renderer_update_preserves_remote_ticks() {
+        let update = convert_update(TeamPresentationSnapshot {
+            team_id: 2,
+            authoritative_tick: 720,
+            replica_tick: 719,
+            ..Default::default()
+        });
+        assert_eq!(update.authoritative_tick, 720);
+        assert_eq!(update.snapshot.replica_tick, 719);
+        assert_eq!(update.snapshot.team_id, 2);
+    }
+
+    #[test]
+    fn move_to_is_encoded_as_renderer_ipc_intent() {
+        let intent = convert_input(omoba_core::game_proto::PlayerInput {
+            action: Some(player_input::Action::MoveTo(MoveTo {
+                target: Some(Vec2I { x: 123, y: -456 }),
+                queued: false,
+            })),
+        });
+        let Some(renderer_input::Intent::MoveTo(move_to)) = intent else {
+            panic!("MoveTo must be forwarded through renderer IPC");
+        };
+        assert_eq!((move_to.x_raw, move_to.y_raw), (123, -456));
     }
 }
