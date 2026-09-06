@@ -14,11 +14,11 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender};
 use omoba_core::{
     game_proto::{
-        player_input, renderer_input, renderer_ipc_envelope, AbilityCastIntent, AttackMoveIntent,
-        ItemUseIntent, MoveToIntent, RendererInput, RendererIpcEnvelope, RendererReady,
-        RendererShutdown, TowerActionIntent,
+        player_input, render_lifecycle_event, renderer_input, renderer_ipc_envelope,
+        AbilityCastIntent, AttackMoveIntent, ItemUseIntent, MoveToIntent, RendererInput,
+        RendererIpcEnvelope, RendererReady, RendererShutdown, TowerActionIntent,
     },
-    runtime::{FilteredRenderEntity, FilteredRenderSnapshot, RenderMemoryDirective},
+    runtime::{FilteredRenderEntity, FilteredRenderSnapshot},
 };
 use prost::Message;
 use tokio::{
@@ -27,17 +27,30 @@ use tokio::{
 };
 
 const MAGIC: u32 = 0x4f4d_5254;
-const VERSION: u32 = 1;
+use crate::filtered_render_bridge::{
+    RenderLifecycleAction, RenderLifecycleBatch as BridgeLifecycleBatch,
+};
+
+const VERSION: u32 = 2;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedInputLatency {
+    pub request_id: u64,
+    pub input_id: u32,
+    pub total_us: u64,
+}
 
 #[derive(Debug)]
 pub struct RendererPresentationHandle {
     pub snapshots: Receiver<RendererPresentationUpdate>,
+    pub lifecycles: Receiver<BridgeLifecycleBatch>,
     inputs: Sender<RendererIpcEnvelope>,
     request_id: Arc<AtomicU64>,
     view_epoch: Arc<AtomicU64>,
     ready: Arc<AtomicBool>,
     pending_inputs: Arc<Mutex<BTreeMap<u64, Instant>>>,
+    completed_latencies: Arc<Mutex<Vec<CompletedInputLatency>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +59,7 @@ pub struct RendererPresentationUpdate {
     pub authoritative_tick: u64,
     pub visible_fog_cells: Vec<(i32, i32)>,
     pub vision_center_raw: Option<(i64, i64)>,
+    pub runtime_rtt_us: Option<u64>,
 }
 
 impl RendererPresentationHandle {
@@ -91,18 +105,33 @@ impl RendererPresentationHandle {
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
+
+    pub fn drain_completed_latencies(&self) -> Vec<CompletedInputLatency> {
+        self.completed_latencies
+            .lock()
+            .map(|mut values| std::mem::take(&mut *values))
+            .unwrap_or_default()
+    }
+
+    pub fn oldest_pending_age_ms(&self) -> Option<u32> {
+        let pending = self.pending_inputs.lock().ok()?;
+        oldest_pending_age_ms(&pending)
+    }
 }
 
 pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
     let (snapshot_tx, snapshots) = bounded(1);
     let stale_snapshots = snapshots.clone();
+    let (lifecycle_tx, lifecycles) = bounded(1024);
     let (inputs, input_rx) = bounded(256);
     let request_id = Arc::new(AtomicU64::new(1));
     let view_epoch = Arc::new(AtomicU64::new(0));
     let worker_view_epoch = Arc::clone(&view_epoch);
     let ready = Arc::new(AtomicBool::new(false));
     let pending_inputs = Arc::new(Mutex::new(BTreeMap::new()));
+    let completed_latencies = Arc::new(Mutex::new(Vec::new()));
     let worker_pending_inputs = Arc::clone(&pending_inputs);
+    let worker_completed_latencies = Arc::clone(&completed_latencies);
     let worker_ready = Arc::clone(&ready);
     thread::Builder::new()
         .name("omfx-presentation-ipc".into())
@@ -115,14 +144,17 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
                 loop {
                     match TcpStream::connect(addr).await {
                         Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
                             if let Err(error) = run_connection(
                                 stream,
                                 &snapshot_tx,
                                 &stale_snapshots,
+                                &lifecycle_tx,
                                 &input_rx,
                                 &worker_view_epoch,
                                 &worker_ready,
                                 &worker_pending_inputs,
+                                &worker_completed_latencies,
                             )
                             .await
                             {
@@ -138,11 +170,13 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
         .expect("presentation client thread");
     RendererPresentationHandle {
         snapshots,
+        lifecycles,
         inputs,
         request_id,
         view_epoch,
         ready,
         pending_inputs,
+        completed_latencies,
     }
 }
 
@@ -150,10 +184,12 @@ async fn run_connection(
     stream: TcpStream,
     snapshots: &Sender<RendererPresentationUpdate>,
     stale_snapshots: &Receiver<RendererPresentationUpdate>,
+    lifecycles: &Sender<BridgeLifecycleBatch>,
     inputs: &Receiver<RendererIpcEnvelope>,
     view_epoch: &AtomicU64,
     ready: &AtomicBool,
     pending_inputs: &Mutex<BTreeMap<u64, Instant>>,
+    completed_latencies: &Mutex<Vec<CompletedInputLatency>>,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = stream.into_split();
     write_envelope(
@@ -166,7 +202,9 @@ async fn run_connection(
         ),
     )
     .await?;
-    let mut accepted_sequence = 0_u64;
+    let mut accepted_snapshot_sequence = 0_u64;
+    let mut accepted_lifecycle_sequence = 0_u64;
+    let mut last_received_heroes = Vec::<String>::new();
     loop {
         tokio::select! {
             inbound = read_envelope(&mut reader) => {
@@ -174,19 +212,44 @@ async fn run_connection(
                 if matches!(&inbound.payload, Some(renderer_ipc_envelope::Payload::RuntimeReady(_))) { ready.store(true, Ordering::Relaxed); continue; }
                 if let Some(renderer_ipc_envelope::Payload::CriticalInputResult(result)) = &inbound.payload {
                     if result.result_code == "APPLIED_TO_PRESENTATION" {
-                        if let Ok(mut pending) = pending_inputs.lock() {
-                            if let Some(started) = pending.remove(&result.request_id) {
-                                let total_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                                log::info!("input_to_presentation: request_id={} input_id={} authoritative_tick={} total_us={} total_ms={:.3}", result.request_id, result.input_id, result.authoritative_tick, total_us, total_us as f64 / 1000.0);
-                                append_latency_log(result.request_id, result.input_id, result.authoritative_tick, total_us);
-                            }
+                        if let Some(sample) = record_applied_input_latency(
+                            pending_inputs,
+                            completed_latencies,
+                            result.request_id,
+                            result.input_id,
+                        ) {
+                            log::info!("input_to_presentation: request_id={} input_id={} authoritative_tick={} total_us={} total_ms={:.3}", result.request_id, result.input_id, result.authoritative_tick, sample.total_us, sample.total_us as f64 / 1000.0);
+                            append_latency_log(result.request_id, result.input_id, result.authoritative_tick, sample.total_us);
                         }
                     }
                     continue;
                 }
+                if let Some(renderer_ipc_envelope::Payload::Lifecycle(batch)) = &inbound.payload {
+                    if inbound.sequence <= accepted_lifecycle_sequence
+                        || batch.view_epoch < view_epoch.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    accepted_lifecycle_sequence = inbound.sequence;
+                    let converted = convert_lifecycle(inbound.sequence, batch.clone())?;
+                    if converted.events.iter().any(|event| matches!(event, RenderLifecycleAction::ResetView)) {
+                        view_epoch.store(converted.view_epoch, Ordering::Relaxed);
+                    }
+                    if presentation_trace_enabled() {
+                        log::warn!(
+                            "presentation_trace stage=renderer_lifecycle_enqueue sequence={} view_epoch={} replica_tick={} events={:?}",
+                            converted.sequence,
+                            converted.view_epoch,
+                            converted.replica_tick,
+                            converted.events,
+                        );
+                    }
+                    enqueue_lifecycle(lifecycles, converted)?;
+                    continue;
+                }
                 if let Some(renderer_ipc_envelope::Payload::Snapshot(snapshot)) = inbound.payload {
                     if !accept_presentation_snapshot(
-                        &mut accepted_sequence,
+                        &mut accepted_snapshot_sequence,
                         view_epoch,
                         inbound.sequence,
                         snapshot.view_epoch,
@@ -196,6 +259,20 @@ async fn run_connection(
                     ready.store(true, Ordering::Relaxed);
                     view_epoch.store(snapshot.view_epoch, Ordering::Relaxed);
                     let converted = convert_update(snapshot);
+                    if presentation_trace_enabled() {
+                        let hero_identities = hero_identity_labels(&converted.snapshot);
+                        let heroes = hero_labels(&converted.snapshot);
+                        if hero_identities != last_received_heroes {
+                            log::warn!(
+                                "presentation_trace stage=renderer_snapshot_receive sequence={} authoritative_tick={} replica_tick={} heroes={:?}",
+                                inbound.sequence,
+                                converted.authoritative_tick,
+                                converted.snapshot.replica_tick,
+                                heroes,
+                            );
+                            last_received_heroes = hero_identities;
+                        }
+                    }
                     if let Err(error) = snapshots.try_send(converted) {
                         if error.is_full() {
                             let latest = error.into_inner();
@@ -211,6 +288,65 @@ async fn run_connection(
             }
         }
     }
+}
+
+fn enqueue_lifecycle(
+    lifecycles: &Sender<BridgeLifecycleBatch>,
+    batch: BridgeLifecycleBatch,
+) -> Result<(), String> {
+    lifecycles.send(batch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn presentation_trace_enabled() -> bool {
+    std::env::var("OMOBA_PRESENTATION_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn hero_labels(snapshot: &FilteredRenderSnapshot) -> Vec<String> {
+    snapshot
+        .entities
+        .iter()
+        .filter_map(|entity| {
+            let payload = entity
+                .components
+                .get(&omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID)?;
+            let state = omoba_core::runtime::decode_demo_render_state(payload)?;
+            (state.kind == 1).then(|| {
+                format!(
+                    "{}@{}:player{}:team{}:pos({}, {})",
+                    entity.replica_id,
+                    entity.disclosure_epoch,
+                    state.owner_player_id,
+                    state.team_id,
+                    state.x_raw,
+                    state.y_raw,
+                )
+            })
+        })
+        .collect()
+}
+
+fn hero_identity_labels(snapshot: &FilteredRenderSnapshot) -> Vec<String> {
+    snapshot
+        .entities
+        .iter()
+        .filter_map(|entity| {
+            let payload = entity
+                .components
+                .get(&omoba_core::runtime::DEMO_RENDER_COMPONENT_SCHEMA_ID)?;
+            let state = omoba_core::runtime::decode_demo_render_state(payload)?;
+            (state.kind == 1).then(|| {
+                format!(
+                    "{}@{}:player{}:team{}",
+                    entity.replica_id,
+                    entity.disclosure_epoch,
+                    state.owner_player_id,
+                    state.team_id,
+                )
+            })
+        })
+        .collect()
 }
 
 fn append_latency_log(request_id: u64, input_id: u32, authoritative_tick: u64, total_us: u64) {
@@ -265,33 +401,47 @@ fn convert_update(
         .vision_circles
         .first()
         .map(|circle| (circle.x_raw, circle.y_raw));
+    let runtime_rtt_us = (snapshot.runtime_rtt_us > 0).then_some(snapshot.runtime_rtt_us);
     RendererPresentationUpdate {
         snapshot: convert_snapshot(snapshot),
         authoritative_tick,
         visible_fog_cells,
         vision_center_raw,
+        runtime_rtt_us,
     }
+}
+
+fn record_applied_input_latency(
+    pending: &Mutex<BTreeMap<u64, Instant>>,
+    completed: &Mutex<Vec<CompletedInputLatency>>,
+    request_id: u64,
+    input_id: u32,
+) -> Option<CompletedInputLatency> {
+    let started = pending.lock().ok()?.remove(&request_id)?;
+    let sample = CompletedInputLatency {
+        request_id,
+        input_id,
+        total_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+    };
+    if let Ok(mut values) = completed.lock() {
+        values.push(CompletedInputLatency {
+            request_id: sample.request_id,
+            input_id: sample.input_id,
+            total_us: sample.total_us,
+        });
+    }
+    Some(sample)
+}
+
+fn oldest_pending_age_ms(pending: &BTreeMap<u64, Instant>) -> Option<u32> {
+    pending.values().map(|started| {
+        started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+    }).max()
 }
 
 fn convert_snapshot(
     snapshot: omoba_core::game_proto::TeamPresentationSnapshot,
 ) -> FilteredRenderSnapshot {
-    let mut directives = snapshot
-        .removed_render_ids
-        .into_iter()
-        .map(|replica_id| RenderMemoryDirective::Forget {
-            replica_id,
-            disclosure_epoch: 0,
-        })
-        .collect::<Vec<_>>();
-    directives.extend(snapshot.remembered_ghosts.into_iter().map(|ghost| {
-        RenderMemoryDirective::Hide {
-            replica_id: ghost.render_id,
-            disclosure_epoch: ghost.disclosure_epoch,
-            remember_policy: 1,
-            sanitized_presentation: ghost.sanitized_presentation,
-        }
-    }));
     FilteredRenderSnapshot {
         team_id: snapshot.team_id,
         replica_tick: snapshot.replica_tick,
@@ -311,8 +461,44 @@ fn convert_snapshot(
             .collect(),
         public_events: Vec::new(),
         external_effects: Vec::new(),
-        memory_directives: directives,
+        memory_directives: Vec::new(),
     }
+}
+
+fn convert_lifecycle(
+    sequence: u64,
+    batch: omoba_core::game_proto::RenderLifecycleBatch,
+) -> Result<BridgeLifecycleBatch, String> {
+    let events = batch
+        .events
+        .into_iter()
+        .map(|event| {
+            let action = event
+                .action
+                .ok_or_else(|| "lifecycle action missing".to_string())?;
+            Ok(match action {
+                render_lifecycle_event::Action::Hide(hide) => RenderLifecycleAction::Hide {
+                    replica_id: event.replica_id,
+                    disclosure_epoch: event.disclosure_epoch,
+                    remember_policy: hide.remember_policy,
+                    sanitized_presentation: hide.sanitized_presentation,
+                },
+                render_lifecycle_event::Action::Forget(_) => RenderLifecycleAction::Forget {
+                    replica_id: event.replica_id,
+                    disclosure_epoch: event.disclosure_epoch,
+                },
+                render_lifecycle_event::Action::ResetView(_) => RenderLifecycleAction::ResetView,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(BridgeLifecycleBatch {
+        sequence,
+        team_id: batch.team_id,
+        authoritative_tick: batch.authoritative_tick,
+        replica_tick: batch.replica_tick,
+        view_epoch: batch.view_epoch,
+        events,
+    })
 }
 
 fn convert_input(input: omoba_core::game_proto::PlayerInput) -> Option<renderer_input::Intent> {
@@ -424,7 +610,7 @@ async fn write_envelope(
         .write_all(&bytes)
         .await
         .map_err(|error| error.to_string())?;
-    writer.flush().await.map_err(|error| error.to_string())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -448,11 +634,39 @@ mod delay_safety_tests {
             team_id: 2,
             authoritative_tick: 720,
             replica_tick: 719,
+            runtime_rtt_us: 1_500,
             ..Default::default()
         });
         assert_eq!(update.authoritative_tick, 720);
         assert_eq!(update.snapshot.replica_tick, 719);
         assert_eq!(update.snapshot.team_id, 2);
+        assert_eq!(update.runtime_rtt_us, Some(1_500));
+    }
+
+    #[test]
+    fn missing_runtime_rtt_stays_unset() {
+        let update = convert_update(TeamPresentationSnapshot::default());
+        assert_eq!(update.runtime_rtt_us, None);
+    }
+
+    #[test]
+    fn applied_input_latency_moves_pending_to_completed() {
+        let pending = Mutex::new(BTreeMap::from([(7_u64, Instant::now())]));
+        let completed = Mutex::new(Vec::new());
+        let sample = record_applied_input_latency(&pending, &completed, 7, 42).unwrap();
+        assert_eq!(sample.request_id, 7);
+        assert_eq!(sample.input_id, 42);
+        assert!(pending.lock().unwrap().is_empty());
+        assert_eq!(completed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oldest_pending_age_uses_the_oldest_request() {
+        let mut pending = BTreeMap::new();
+        pending.insert(1, Instant::now() - std::time::Duration::from_millis(40));
+        pending.insert(2, Instant::now() - std::time::Duration::from_millis(12));
+        let age = oldest_pending_age_ms(&pending).unwrap();
+        assert!(age >= 40);
     }
 
     #[test]
@@ -467,5 +681,109 @@ mod delay_safety_tests {
             panic!("MoveTo must be forwarded through renderer IPC");
         };
         assert_eq!((move_to.x_raw, move_to.y_raw), (123, -456));
+    }
+
+    fn lifecycle(sequence: u64) -> BridgeLifecycleBatch {
+        BridgeLifecycleBatch {
+            sequence,
+            team_id: 2,
+            authoritative_tick: sequence,
+            replica_tick: sequence,
+            view_epoch: 7,
+            events: vec![RenderLifecycleAction::Forget {
+                replica_id: sequence,
+                disclosure_epoch: 9,
+            }],
+        }
+    }
+
+    #[test]
+    fn lifecycle_fifo_keeps_order_when_snapshot_latest_is_replaced() {
+        let (lifecycle_tx, lifecycle_rx) = bounded(2);
+        let (snapshot_tx, snapshot_rx) = bounded(1);
+        enqueue_lifecycle(&lifecycle_tx, lifecycle(1)).unwrap();
+        snapshot_tx.send(1_u64).unwrap();
+        let _ = snapshot_rx.try_recv().unwrap();
+        snapshot_tx.send(2_u64).unwrap();
+        enqueue_lifecycle(&lifecycle_tx, lifecycle(2)).unwrap();
+        assert_eq!(lifecycle_rx.recv().unwrap().sequence, 1);
+        assert_eq!(lifecycle_rx.recv().unwrap().sequence, 2);
+        assert_eq!(snapshot_rx.recv().unwrap(), 2);
+    }
+
+    #[test]
+    fn lifecycle_queue_applies_backpressure_without_discarding() {
+        let (tx, rx) = bounded(1);
+        enqueue_lifecycle(&tx, lifecycle(1)).unwrap();
+        let producer = std::thread::spawn(move || {
+            enqueue_lifecycle(&tx, lifecycle(2)).unwrap();
+        });
+        assert_eq!(rx.recv().unwrap().sequence, 1);
+        producer.join().unwrap();
+        assert_eq!(rx.recv().unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn slow_renderer_drains_every_forget_without_leaving_clones() {
+        use crate::filtered_render_bridge::FilteredRenderBridge;
+
+        let (tx, rx) = bounded(64);
+        let mut bridge = FilteredRenderBridge::default();
+        bridge.apply_lifecycle(&BridgeLifecycleBatch {
+            sequence: 1,
+            team_id: 2,
+            authoritative_tick: 1,
+            replica_tick: 1,
+            view_epoch: 7,
+            events: vec![RenderLifecycleAction::ResetView],
+        });
+        let mut stale_entities = Vec::new();
+        for replica_id in 100..120 {
+            stale_entities.push(FilteredRenderEntity {
+                replica_id,
+                disclosure_epoch: 9,
+                entity_kind: 1,
+                components: BTreeMap::new(),
+            });
+            enqueue_lifecycle(
+                &tx,
+                BridgeLifecycleBatch {
+                    sequence: replica_id,
+                    team_id: 2,
+                    authoritative_tick: replica_id,
+                    replica_tick: replica_id,
+                    view_epoch: 7,
+                    events: vec![RenderLifecycleAction::Forget {
+                        replica_id,
+                        disclosure_epoch: 9,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+        bridge.apply(&FilteredRenderSnapshot {
+            team_id: 2,
+            replica_tick: 99,
+            entities: stale_entities.clone(),
+            public_events: Vec::new(),
+            external_effects: Vec::new(),
+            memory_directives: Vec::new(),
+        });
+        assert_eq!(bridge.deterministic_count(), 20);
+
+        while let Ok(batch) = rx.try_recv() {
+            bridge.apply_lifecycle(&batch);
+        }
+        assert_eq!(bridge.deterministic_count(), 0);
+
+        bridge.apply(&FilteredRenderSnapshot {
+            team_id: 2,
+            replica_tick: 99,
+            entities: stale_entities,
+            public_events: Vec::new(),
+            external_effects: Vec::new(),
+            memory_directives: Vec::new(),
+        });
+        assert_eq!(bridge.deterministic_count(), 0);
     }
 }
