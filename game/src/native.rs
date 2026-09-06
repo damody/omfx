@@ -96,6 +96,7 @@ const AUTOPLAY_LOCAL_PLAYER_ID: u32 = omoba_core::runtime::AUTOPLAY_PLAYER_ID;
 
 const PENDING_INPUT_MAX_AGE_MS: u64 = 5_000;
 const INPUT_LATENCY_CAPACITY: usize = (LOCKSTEP_TPS as usize) * 2;
+const INPUT_LATENCY_WINDOW: Duration = Duration::from_secs(2);
 const RENDER_UPDATE_TPS: u32 = LOCKSTEP_TPS;
 const INPUT_LOOKAHEAD_TICKS: u32 = 2;
 const INPUT_SAME_FRAME_WAIT_US: u64 = 2_000;
@@ -514,6 +515,7 @@ impl InputLatencyMeter {
     pub fn push(&mut self, sample: LatencySample) {
         self.cached_latest_ms = sample.total_ms;
         self.samples.push_back(sample);
+        self.expire_old(Instant::now());
         while self.samples.len() > INPUT_LATENCY_CAPACITY {
             self.samples.pop_front();
         }
@@ -524,15 +526,22 @@ impl InputLatencyMeter {
         }
     }
 
+    fn expire_old(&mut self, now: Instant) {
+        self.samples
+            .retain(|sample| now.saturating_duration_since(sample.submitted_at) <= INPUT_LATENCY_WINDOW);
+    }
+
     pub fn maybe_recompute(&mut self, now: Instant) {
         if now.duration_since(self.last_compute_at) < Duration::from_secs(1) {
             return;
         }
         self.last_compute_at = now;
+        self.expire_old(now);
         if self.samples.is_empty() {
             self.cached_p50_ms = 0;
             self.cached_p99_ms = 0;
             self.cached_max_ms = 0;
+            self.cached_latest_ms = 0;
             return;
         }
         let mut values: Vec<u32> = self.samples.iter().map(|s| s.total_ms).collect();
@@ -585,6 +594,41 @@ fn pending_input_diagnostic(
         server_receive_tick: pending.server_receive_tick,
         server_drain_tick: pending.server_drain_tick,
         server_queue_us: pending.server_queue_us,
+    }
+}
+
+fn windowed_sim_tps(delta_ticks: u32, elapsed: Duration) -> Option<f32> {
+    if delta_ticks == 0 || elapsed < Duration::from_millis(250) {
+        return None;
+    }
+    let seconds = elapsed.as_secs_f32();
+    if seconds <= 0.0 {
+        return None;
+    }
+    Some(delta_ticks as f32 / seconds)
+}
+
+fn format_ping_status(rtt_us: Option<u64>) -> String {
+    match rtt_us {
+        Some(us) => format!("{:.1} ms", us as f64 / 1000.0),
+        None => "—".into(),
+    }
+}
+
+fn presentation_latency_sample(sample: presentation_client::CompletedInputLatency) -> LatencySample {
+    let total_ms = (sample.total_us / 1_000).min(u64::from(u32::MAX)) as u32;
+    LatencySample {
+        input_id: sample.input_id,
+        action_kind: InputActionKind::NoOp,
+        total_ms,
+        submitted_at: Instant::now()
+            .checked_sub(Duration::from_micros(sample.total_us))
+            .unwrap_or_else(Instant::now),
+        origin_kind: lockstep_client::InputOriginKind::Direct,
+        target_tick: 0,
+        server_receive_tick: None,
+        server_drain_tick: None,
+        phases: LatencyPhaseDurations::default(),
     }
 }
 
@@ -1124,6 +1168,24 @@ fn td_round_status_label(_round_is_running: bool, current_round: u32, total_roun
 
 fn td_mode_from_snapshot(lives: i32, total_rounds: u32) -> bool {
     lives > 0 || total_rounds > 0
+}
+
+/// TD 右側商店只在單人 TD 顯示。`run_2player.bat` 會把 `local_team_id`
+/// 設成 1 或 2，那種 session 不需要買塔面板。
+fn should_show_td_shop(is_td_mode: bool, local_team_id: u32) -> bool {
+    is_td_mode && local_team_id == 0
+}
+
+/// `run_2player.bat` 是兩人對戰測試局，不顯示返回選單按鈕。
+fn should_show_in_game_return_button(local_team_id: u32) -> bool {
+    local_team_id == 0
+}
+
+/// 英雄技能槽只在該格有非空 ability id 時顯示。
+fn hero_ability_slot_visible(abilities: &[String], index: usize) -> bool {
+    abilities
+        .get(index)
+        .is_some_and(|id| !id.is_empty())
 }
 
 const TOWER_ABILITY_BAR_PAGE_SIZE: usize = 6;
@@ -3457,6 +3519,12 @@ pub struct Game {
     #[visit(skip)]
     #[reflect(hidden)]
     sim_speed_last_at: Option<Instant>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_speed_window_tick: u32,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    sim_speed_window_at: Option<Instant>,
     #[visit(skip)]
     #[reflect(hidden)]
     sim_speed_tps: f32,
@@ -6405,7 +6473,11 @@ impl Plugin for Game {
         {
             let ui = context.user_interfaces.first_mut();
             self.hide_pregame_ui(ui);
-            self.update_in_game_return_button(ui);
+            if should_show_in_game_return_button(self.local_team_id) {
+                self.update_in_game_return_button(ui);
+            } else {
+                self.hide_in_game_return_button(ui);
+            }
         }
         if self.game_ended && self.visual_autoplay_handle.is_none() {
             log::info!("game ended; tearing down active session");
@@ -6575,10 +6647,28 @@ impl Plugin for Game {
                 ConnectionStatus::Connecting
             };
             while !self.renderer_test_capture_frozen {
+                let Ok(lifecycle) = handle.lifecycles.try_recv() else {
+                    break;
+                };
+                if presentation_client::presentation_trace_enabled() {
+                    log::warn!(
+                        "presentation_trace stage=renderer_lifecycle_apply sequence={} view_epoch={} replica_tick={} events={:?}",
+                        lifecycle.sequence,
+                        lifecycle.view_epoch,
+                        lifecycle.replica_tick,
+                        lifecycle.events,
+                    );
+                }
+                let _scene_actions = self.filtered_render_bridge.apply_lifecycle(&lifecycle);
+            }
+            while !self.renderer_test_capture_frozen {
                 let Ok(update) = handle.snapshots.try_recv() else {
                     break;
                 };
                 let snapshot = update.snapshot;
+                if let Some(rtt_us) = update.runtime_rtt_us {
+                    self.latest_rtt_us = Some(rtt_us);
+                }
                 self.current_sim_tick = snapshot.replica_tick.min(u64::from(u32::MAX)) as u32;
                 self.current_sim_tick_observed_at = Some(now);
                 self.local_team_id = snapshot.team_id;
@@ -7395,6 +7485,12 @@ impl Plugin for Game {
             self.pair_applied_inputs(inputs);
         } else {
             self.evict_stale_pending_inputs();
+        }
+        if let Some(handle) = self.presentation_handle.as_ref() {
+            for sample in handle.drain_completed_latencies() {
+                self.input_latency_meter
+                    .push(presentation_latency_sample(sample));
+            }
         }
         self.input_latency_meter.maybe_recompute(now);
 
@@ -8549,14 +8645,15 @@ impl Plugin for Game {
                 };
                 let wire_str = fmt_bps(self.net_wire_bytes_last_sec); // 真實 UDP wire (壓縮後)
                 let logical_str = fmt_bps(self.net_bytes_last_sec); // 解壓後 logical
-                let ping_str = match self.latest_rtt_us {
-                    Some(us) => format!("{:.1} ms", us as f64 / 1000.0),
-                    None => "—".into(),
-                };
-                let lag_str = format_input_lag_status(
-                    &self.input_latency_meter,
-                    oldest_pending_input_age_ms(&self.pending_inputs, wall_clock_us()),
-                );
+                let ping_str = format_ping_status(self.latest_rtt_us);
+                let oldest_pending_ms = self
+                    .presentation_handle
+                    .as_ref()
+                    .and_then(presentation_client::RendererPresentationHandle::oldest_pending_age_ms)
+                    .or_else(|| {
+                        oldest_pending_input_age_ms(&self.pending_inputs, wall_clock_us())
+                    });
+                let lag_str = format_input_lag_status(&self.input_latency_meter, oldest_pending_ms);
                 let sim_lag_ticks = self
                     .current_sim_tick
                     .saturating_sub(self.heartbeat.tick as u32);
@@ -8624,7 +8721,45 @@ impl Plugin for Game {
                 let total_w = spacing * 3.0 + icon_size;
                 let base_x = (self.window_size.x - total_w) * 0.5;
                 let icon_y = self.window_size.y - icon_size - 32.0;
+                let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
                 for i in 0..4 {
+                    if !hero_ability_slot_visible(&self.hero_state.abilities, i) {
+                        self.ability_icon_rects[i] =
+                            (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+                        self.ability_upgrade_button_rects[i] =
+                            (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+                        if self.ui_ability_icons[i] != Handle::<UiNode>::NONE {
+                            ui.send(
+                                self.ui_ability_icons[i],
+                                WidgetMessage::DesiredPosition(hidden),
+                            );
+                        }
+                        if self.ui_ability_level_text[i] != Handle::<Text>::NONE {
+                            ui.send(
+                                self.ui_ability_level_text[i],
+                                WidgetMessage::DesiredPosition(hidden),
+                            );
+                        }
+                        if self.ui_ability_key_text[i] != Handle::<Text>::NONE {
+                            ui.send(
+                                self.ui_ability_key_text[i],
+                                WidgetMessage::DesiredPosition(hidden),
+                            );
+                        }
+                        if self.ui_ability_cd_text[i] != Handle::<Text>::NONE {
+                            ui.send(
+                                self.ui_ability_cd_text[i],
+                                WidgetMessage::DesiredPosition(hidden),
+                            );
+                        }
+                        if self.ui_ability_upgrade_buttons[i] != Handle::<Text>::NONE {
+                            ui.send(
+                                self.ui_ability_upgrade_buttons[i],
+                                WidgetMessage::DesiredPosition(hidden),
+                            );
+                        }
+                        continue;
+                    }
                     let x = base_x + (i as f32) * spacing;
                     self.ability_icon_rects[i] = (x, icon_y, icon_size, icon_size);
                     if self.ui_ability_icons[i] != Handle::<UiNode>::NONE {
@@ -8661,7 +8796,7 @@ impl Plugin for Game {
             }
 
             // ===== BTD-style 右側 shop/control panel =====
-            {
+            if should_show_td_shop(self.is_td_mode, self.local_team_id) {
                 let (sx, sy) = td_ui_ref_scale(self.window_size);
                 let right_panel_x_ref = 1555.0f32;
                 let right_panel_w_ref = 365.0f32;
@@ -9133,6 +9268,8 @@ impl Plugin for Game {
                         TextMessage::Text(start_label.to_string()),
                     );
                 }
+            } else {
+                self.hide_td_right_shop_panel(ui);
             }
 
             // ===== BTD-style selected tower context panel（依塔所在半邊自動換邊） =====
@@ -12182,13 +12319,23 @@ impl Game {
         }
 
         let now = Instant::now();
-        if let Some(prev_at) = self.sim_speed_last_at {
-            let elapsed = now.duration_since(prev_at).as_secs_f32();
-            let delta_ticks = tick.saturating_sub(self.sim_speed_last_tick);
-            if elapsed > 0.0 && delta_ticks > 0 {
-                self.sim_speed_tps = delta_ticks as f32 / elapsed;
-                fyrox::engine::executor::set_render_target_tps(RENDER_UPDATE_TPS);
-            }
+        if self.sim_speed_window_at.is_none() {
+            self.sim_speed_window_tick = tick;
+            self.sim_speed_window_at = Some(now);
+            self.sim_speed_last_tick = tick;
+            self.sim_speed_last_at = Some(now);
+            return;
+        }
+        let origin = self.sim_speed_window_at.unwrap_or(now);
+        let elapsed = now.saturating_duration_since(origin);
+        let delta_ticks = tick.saturating_sub(self.sim_speed_window_tick);
+        if let Some(tps) = windowed_sim_tps(delta_ticks, elapsed) {
+            self.sim_speed_tps = tps;
+            fyrox::engine::executor::set_render_target_tps(RENDER_UPDATE_TPS);
+        }
+        if elapsed >= Duration::from_secs(1) {
+            self.sim_speed_window_tick = tick;
+            self.sim_speed_window_at = Some(now);
         }
         self.sim_speed_last_tick = tick;
         self.sim_speed_last_at = Some(now);
@@ -12765,6 +12912,8 @@ impl Game {
         self.sim_dev_lua_reload_error = None;
         self.sim_speed_last_tick = 0;
         self.sim_speed_last_at = None;
+        self.sim_speed_window_tick = 0;
+        self.sim_speed_window_at = None;
         self.sim_speed_tps = 0.0;
         self.visual_autoplay_overlay_text.clear();
         self.render_pacing_last_frame_at = None;
@@ -13079,6 +13228,9 @@ impl Game {
 
     fn handle_in_game_return_click(&mut self, screen: Vector2<f32>) -> bool {
         if self.pregame_runtime.state != pregame::PregameState::InGame {
+            return false;
+        }
+        if !should_show_in_game_return_button(self.local_team_id) {
             return false;
         }
         if !self.return_to_title_button_rect.contains(screen) {
@@ -14867,6 +15019,59 @@ impl Game {
             };
             ui.send(row_ui.value_text, TextMessage::Text(display_value));
         }
+    }
+
+    fn hide_td_right_shop_panel(&mut self, ui: &mut UserInterface) {
+        let hidden = Vector2::new(UI_HIDDEN_POS, UI_HIDDEN_POS);
+        let hidden_rect = UiRect {
+            x: UI_HIDDEN_POS,
+            y: UI_HIDDEN_POS,
+            w: 0.0,
+            h: 0.0,
+        };
+        for handle in [
+            self.ui_td_right_panel.bg,
+            self.ui_td_right_panel.viewport_bg,
+            self.ui_td_right_panel.scroll_track,
+            self.ui_td_right_panel.scroll_thumb,
+            self.ui_td_right_panel.pause_icon,
+            self.ui_td_right_panel.start_icon,
+        ] {
+            ui.send(handle, WidgetMessage::DesiredPosition(hidden));
+        }
+        for handle in [
+            self.ui_td_right_panel.title_text,
+            self.ui_td_right_panel.pause_text,
+            self.ui_start_round_button,
+            self.ui_td_auto_start_checkbox_text,
+        ] {
+            ui.send(handle, WidgetMessage::DesiredPosition(hidden));
+        }
+        for card in &self.ui_td_tower_cards {
+            for node in [card.bg, card.icon] {
+                ui.send(node, WidgetMessage::DesiredPosition(hidden));
+            }
+            for text in [card.key_text, card.name_text, card.price_text] {
+                ui.send(text, WidgetMessage::DesiredPosition(hidden));
+            }
+        }
+        for button in &self.ui_td_tower_buttons {
+            ui.send(*button, WidgetMessage::DesiredPosition(hidden));
+        }
+        for rect in &mut self.td_tower_button_rects {
+            *rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        }
+        self.ui_td_right_panel.panel_rect = hidden_rect;
+        self.ui_td_right_panel.viewport_rect = hidden_rect;
+        self.ui_td_right_panel.scroll_track_rect = hidden_rect;
+        self.ui_td_right_panel.scroll_thumb_rect = hidden_rect;
+        self.ui_td_right_panel.pause_rect = hidden_rect;
+        self.ui_td_right_panel.start_rect = hidden_rect;
+        self.start_round_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.auto_start_checkbox_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.pause_button_rect = (UI_HIDDEN_POS, UI_HIDDEN_POS, 0.0, 0.0);
+        self.td_shop_max_scroll = 0.0;
+        self.td_shop_scroll_dragging = false;
     }
 
     fn clear_td_tower_shop_cards(&mut self, ui: &mut UserInterface) {
@@ -20463,6 +20668,21 @@ mod input_latency_tests {
     }
 
     #[test]
+    fn outlier_sample_ages_out_and_p99_recovers() {
+        let mut meter = InputLatencyMeter::default();
+        let mut outlier = sample(1, 300);
+        outlier.submitted_at = Instant::now() - Duration::from_secs(3);
+        meter.samples.push_back(outlier);
+        meter.push(sample(2, 20));
+        let now = meter.last_compute_at + Duration::from_secs(1);
+        meter.maybe_recompute(now);
+        assert_eq!(meter.samples.len(), 1);
+        assert_eq!(meter.cached_p50_ms, 20);
+        assert_eq!(meter.cached_p99_ms, 20);
+        assert_eq!(meter.cached_latest_ms, 20);
+    }
+
+    #[test]
     fn input_latency_meter_recomputes_p50_p99_max_latest() {
         let mut meter = InputLatencyMeter::default();
         for i in 0..100 {
@@ -20525,6 +20745,37 @@ mod input_latency_tests {
         let lag = format_input_lag_status(&meter, Some(40));
 
         assert_eq!(lag, "p50 80 / p99 80 ms");
+    }
+
+    #[test]
+    fn windowed_sim_tps_ignores_single_render_frame_jitter() {
+        assert_eq!(
+            windowed_sim_tps(2, Duration::from_millis(12)),
+            None,
+            "2 ticks in one ~72Hz render frame must not report 167Hz"
+        );
+        let tps = windowed_sim_tps(120, Duration::from_secs(1)).unwrap();
+        assert!((tps - 120.0).abs() < 0.01);
+        let tps = windowed_sim_tps(62, Duration::from_millis(512)).unwrap();
+        assert!((tps - 121.09).abs() < 1.0);
+    }
+
+    #[test]
+    fn ping_status_formats_measured_rtt() {
+        assert_eq!(format_ping_status(Some(1_500)), "1.5 ms");
+        assert_eq!(format_ping_status(Some(0)), "0.0 ms");
+        assert_eq!(format_ping_status(None), "—");
+    }
+
+    #[test]
+    fn presentation_latency_sample_converts_microseconds_to_hud_ms() {
+        let sample = presentation_latency_sample(presentation_client::CompletedInputLatency {
+            request_id: 9,
+            input_id: 3,
+            total_us: 12_400,
+        });
+        assert_eq!(sample.input_id, 3);
+        assert_eq!(sample.total_ms, 12);
     }
 
     #[test]
@@ -21032,5 +21283,65 @@ mod input_latency_tests {
     fn td_pause_control_opacity_dims_when_paused() {
         assert_eq!(td_pause_control_opacity(true), Some(0.35));
         assert_eq!(td_pause_control_opacity(false), Some(1.0));
+    }
+
+    #[test]
+    fn td_shop_stays_visible_in_single_player_td() {
+        assert!(should_show_td_shop(true, 0));
+    }
+
+    #[test]
+    fn td_shop_hides_during_two_player_run() {
+        assert!(!should_show_td_shop(true, 1));
+        assert!(!should_show_td_shop(true, 2));
+        assert!(!should_show_td_shop(false, 1));
+        assert!(!should_show_td_shop(false, 0));
+    }
+
+    #[test]
+    fn hero_ability_bar_slots_only_show_when_hero_has_skills() {
+        assert!(!hero_ability_slot_visible(&[], 0));
+        assert!(!hero_ability_slot_visible(&[String::new(), String::new()], 0));
+        assert!(hero_ability_slot_visible(
+            &["fireball".to_string(), String::new()],
+            0
+        ));
+        assert!(!hero_ability_slot_visible(
+            &["fireball".to_string(), String::new()],
+            1
+        ));
+        assert!(!hero_ability_slot_visible(&["fireball".to_string()], 3));
+    }
+
+    #[test]
+    fn in_game_return_button_shows_in_single_player() {
+        assert!(should_show_in_game_return_button(0));
+    }
+
+    #[test]
+    fn in_game_return_button_hides_during_two_player_run() {
+        assert!(!should_show_in_game_return_button(1));
+        assert!(!should_show_in_game_return_button(2));
+    }
+
+    #[test]
+    fn in_game_return_click_is_ignored_during_two_player_run() {
+        let mut game = Game::default();
+        game.pregame_runtime =
+            pregame::PregameRuntime::new_for_menu(pregame::PregameCatalog::fallback());
+        game.pregame_runtime.mark_in_game();
+        game.local_team_id = 1;
+        game.return_to_title_button_rect = UiRect {
+            x: 8.0,
+            y: 10.0,
+            w: 96.0,
+            h: 40.0,
+        };
+
+        assert!(!game.handle_in_game_return_click(Vector2::new(24.0, 24.0)));
+        assert!(matches!(
+            game.pregame_runtime.state,
+            pregame::PregameState::InGame
+        ));
     }
 }
