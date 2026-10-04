@@ -563,6 +563,7 @@ mod tests {
             public_events: Vec::new(),
             external_effects: Vec::new(),
             memory_directives: Vec::new(),
+            remembered_presentations: Default::default(),
         }
     }
 
@@ -755,6 +756,7 @@ mod tests {
             public_events: Vec::new(),
             external_effects: Vec::new(),
             memory_directives: Vec::new(),
+            remembered_presentations: Default::default(),
         });
 
         let hud = bridge.owned_hero_presentation(7).unwrap();

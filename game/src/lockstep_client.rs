@@ -447,6 +447,11 @@ async fn run_client(
                         break 'inner;
                     }
                 }
+                Ok(Some(LockstepInbound::ShopReceiptReplay { .. })) => {
+                    // This legacy gameplay frontend does not issue shop recovery
+                    // queries. Never reinterpret a recovered result as input.
+                    log::warn!("shop receipt replay unsupported in legacy Fyrox lockstep path");
+                }
                 Ok(None) => {
                     warn!("lockstep-client stream closed");
                     send_or_return!(LockstepEvent::Disconnected {

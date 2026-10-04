@@ -339,11 +339,14 @@ fn attack_cancel_fx_key(cue: &sim_runner::AttackCancelFx) -> AttackCancelFxKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputActionKind {
+    Recall,
     TowerPlace,
     TowerSell,
     TowerUpgrade,
     TowerAbilityCast,
     ItemUse,
+    ItemBuy,
+    ItemSell,
     StartRound,
     TogglePause,
     ToggleGameSpeed,
@@ -361,11 +364,14 @@ impl InputActionKind {
     fn from_player_input(input: &omoba_core::kcp::game_proto::PlayerInput) -> Self {
         use omoba_core::kcp::game_proto::player_input::Action;
         match input.action.as_ref() {
+            Some(Action::Recall(_)) => Self::Recall,
             Some(Action::TowerPlace(_)) => Self::TowerPlace,
             Some(Action::TowerSell(_)) => Self::TowerSell,
             Some(Action::TowerUpgrade(_)) => Self::TowerUpgrade,
             Some(Action::TowerAbilityCast(_)) => Self::TowerAbilityCast,
             Some(Action::ItemUse(_)) => Self::ItemUse,
+            Some(Action::ItemBuy(_)) => Self::ItemBuy,
+            Some(Action::ItemSell(_)) => Self::ItemSell,
             Some(Action::StartRound(_)) => Self::StartRound,
             Some(Action::TogglePause(_)) => Self::TogglePause,
             Some(Action::ToggleGameSpeed(_)) => Self::ToggleGameSpeed,
@@ -12787,7 +12793,8 @@ impl Game {
                 .and_then(|value| value.parse().ok())
                 .filter(|team| matches!(team, 1 | 2))
                 .ok_or_else(|| "OMB_TEAM_ID must be 1 or 2 in renderer-only mode".to_string())?;
-            self.presentation_handle = Some(presentation_client::spawn(presentation_addr));
+            self.presentation_handle = Some(presentation_client::spawn(
+                presentation_addr, self.local_player_id, self.local_team_id));
             self.match_statistics.start();
             self.pregame_runtime.mark_in_game();
             self.connection_status = ConnectionStatus::Connected;

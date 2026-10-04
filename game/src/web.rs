@@ -384,6 +384,12 @@ fn send_initial_join(socket: &WebSocket, player_name: &str) -> Result<(), String
             supported_protocols: vec![1],
             secure_fog_capability: false,
             view_epoch: 0,
+            shop_catalog_version: 0,
+            shop_catalog_hash: String::new(),
+            shop_protocol_version: 0,
+            shop_rules_hash: String::new(),
+            recall_protocol_version: 0,
+            recall_rules_hash: String::new(),
         },
     )
 }

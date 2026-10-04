@@ -4000,6 +4000,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "omoba-content-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omoba-core"
 version = "0.1.0"
 dependencies = [
@@ -4055,6 +4063,7 @@ name = "omoba-template-ids"
 version = "0.1.0"
 dependencies = [
  "mlua",
+ "omoba-content-model",
  "omoba-sim",
  "serde",
  "serde_json",

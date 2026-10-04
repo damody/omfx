@@ -31,7 +31,7 @@ use crate::filtered_render_bridge::{
     RenderLifecycleAction, RenderLifecycleBatch as BridgeLifecycleBatch,
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +119,7 @@ impl RendererPresentationHandle {
     }
 }
 
-pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
+pub fn spawn(addr: SocketAddr, player_id: u32, team_id: u32) -> RendererPresentationHandle {
     let (snapshot_tx, snapshots) = bounded(1);
     let stale_snapshots = snapshots.clone();
     let (lifecycle_tx, lifecycles) = bounded(1024);
@@ -147,6 +147,8 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
                             let _ = stream.set_nodelay(true);
                             if let Err(error) = run_connection(
                                 stream,
+                                player_id,
+                                team_id,
                                 &snapshot_tx,
                                 &stale_snapshots,
                                 &lifecycle_tx,
@@ -182,6 +184,8 @@ pub fn spawn(addr: SocketAddr) -> RendererPresentationHandle {
 
 async fn run_connection(
     stream: TcpStream,
+    player_id: u32,
+    team_id: u32,
     snapshots: &Sender<RendererPresentationUpdate>,
     stale_snapshots: &Receiver<RendererPresentationUpdate>,
     lifecycles: &Sender<BridgeLifecycleBatch>,
@@ -198,6 +202,8 @@ async fn run_connection(
             0,
             renderer_ipc_envelope::Payload::RendererReady(RendererReady {
                 latest_snapshot_sequence: 0,
+                player_id,
+                team_id,
             }),
         ),
     )
@@ -462,6 +468,9 @@ fn convert_snapshot(
         public_events: Vec::new(),
         external_effects: Vec::new(),
         memory_directives: Vec::new(),
+        remembered_presentations: snapshot.remembered_ghosts.into_iter()
+            .map(|ghost| ((ghost.render_id, ghost.disclosure_epoch), ghost.sanitized_presentation))
+            .collect(),
     }
 }
 
@@ -768,6 +777,7 @@ mod delay_safety_tests {
             public_events: Vec::new(),
             external_effects: Vec::new(),
             memory_directives: Vec::new(),
+            remembered_presentations: Default::default(),
         });
         assert_eq!(bridge.deterministic_count(), 20);
 
@@ -783,6 +793,7 @@ mod delay_safety_tests {
             public_events: Vec::new(),
             external_effects: Vec::new(),
             memory_directives: Vec::new(),
+            remembered_presentations: Default::default(),
         });
         assert_eq!(bridge.deterministic_count(), 0);
     }
