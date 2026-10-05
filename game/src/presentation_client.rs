@@ -14,9 +14,8 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender};
 use omoba_core::{
     game_proto::{
-        player_input, render_lifecycle_event, renderer_input, renderer_ipc_envelope,
-        AbilityCastIntent, AttackMoveIntent, ItemUseIntent, MoveToIntent, RendererInput,
-        RendererIpcEnvelope, RendererReady, RendererShutdown, TowerActionIntent,
+        render_lifecycle_event, renderer_input, renderer_ipc_envelope, RendererInput,
+        RendererIpcEnvelope, RendererReady, RendererShutdown,
     },
     runtime::{FilteredRenderEntity, FilteredRenderSnapshot},
 };
@@ -26,13 +25,14 @@ use tokio::{
     net::TcpStream,
 };
 
-const MAGIC: u32 = 0x4f4d_5254;
+use omoba_core::renderer_protocol::{
+    PRESENTATION_MAGIC as MAGIC, PRESENTATION_PROTOCOL_VERSION as VERSION,
+    MAX_PRESENTATION_FRAME_BYTES as MAX_FRAME,
+};
 use crate::filtered_render_bridge::{
     RenderLifecycleAction, RenderLifecycleBatch as BridgeLifecycleBatch,
 };
 
-const VERSION: u32 = 3;
-const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompletedInputLatency {
@@ -511,70 +511,7 @@ fn convert_lifecycle(
 }
 
 fn convert_input(input: omoba_core::game_proto::PlayerInput) -> Option<renderer_input::Intent> {
-    match input.action? {
-        player_input::Action::MoveTo(value) => value.target.map(|target| {
-            renderer_input::Intent::MoveTo(MoveToIntent {
-                x_raw: i64::from(target.x),
-                y_raw: i64::from(target.y),
-            })
-        }),
-        player_input::Action::AttackMove(value) => value.target.map(|target| {
-            renderer_input::Intent::AttackMove(AttackMoveIntent {
-                x_raw: i64::from(target.x),
-                y_raw: i64::from(target.y),
-            })
-        }),
-        player_input::Action::CastAbility(value) => {
-            Some(renderer_input::Intent::AbilityCast(AbilityCastIntent {
-                ability_index: value.ability_index,
-                target_render_id: u64::from(value.target_entity.unwrap_or(0)),
-                x_raw: i64::from(value.target_pos.as_ref().map_or(0, |pos| pos.x)),
-                y_raw: i64::from(value.target_pos.as_ref().map_or(0, |pos| pos.y)),
-            }))
-        }
-        player_input::Action::ItemUse(value) => {
-            Some(renderer_input::Intent::ItemUse(ItemUseIntent {
-                item_slot: value.item_slot,
-                target_render_id: u64::from(value.target_entity.unwrap_or(0)),
-                x_raw: i64::from(value.target_pos.as_ref().map_or(0, |pos| pos.x)),
-                y_raw: i64::from(value.target_pos.as_ref().map_or(0, |pos| pos.y)),
-            }))
-        }
-        player_input::Action::TowerPlace(value) => value.pos.map(|pos| {
-            renderer_input::Intent::TowerAction(TowerActionIntent {
-                action_kind: 1,
-                tower_render_id: 0,
-                tower_kind_id: value.tower_kind_id,
-                path: 0,
-                level: 0,
-                x_raw: i64::from(pos.x),
-                y_raw: i64::from(pos.y),
-            })
-        }),
-        player_input::Action::TowerUpgrade(value) => {
-            Some(renderer_input::Intent::TowerAction(TowerActionIntent {
-                action_kind: 2,
-                tower_render_id: u64::from(value.tower_entity_id),
-                tower_kind_id: 0,
-                path: value.path,
-                level: value.level,
-                x_raw: 0,
-                y_raw: 0,
-            }))
-        }
-        player_input::Action::TowerSell(value) => {
-            Some(renderer_input::Intent::TowerAction(TowerActionIntent {
-                action_kind: 3,
-                tower_render_id: u64::from(value.tower_entity_id),
-                tower_kind_id: 0,
-                path: 0,
-                level: 0,
-                x_raw: 0,
-                y_raw: 0,
-            }))
-        }
-        _ => None,
-    }
+    omoba_core::renderer_protocol::player_input_to_renderer_intent(&input)
 }
 
 fn envelope(sequence: u64, payload: renderer_ipc_envelope::Payload) -> RendererIpcEnvelope {
@@ -683,13 +620,14 @@ mod delay_safety_tests {
         let intent = convert_input(omoba_core::game_proto::PlayerInput {
             action: Some(player_input::Action::MoveTo(MoveTo {
                 target: Some(Vec2I { x: 123, y: -456 }),
-                queued: false,
+                queued: true,
             })),
         });
         let Some(renderer_input::Intent::MoveTo(move_to)) = intent else {
             panic!("MoveTo must be forwarded through renderer IPC");
         };
         assert_eq!((move_to.x_raw, move_to.y_raw), (123, -456));
+        assert!(move_to.queued);
     }
 
     fn lifecycle(sequence: u64) -> BridgeLifecycleBatch {

@@ -358,6 +358,7 @@ pub enum InputActionKind {
     CastAbility,
     UpgradeAbility,
     NoOp,
+    HoldPosition,
 }
 
 impl InputActionKind {
@@ -365,6 +366,7 @@ impl InputActionKind {
         use omoba_core::kcp::game_proto::player_input::Action;
         match input.action.as_ref() {
             Some(Action::Recall(_)) => Self::Recall,
+            Some(Action::HoldPosition(_)) => Self::HoldPosition,
             Some(Action::TowerPlace(_)) => Self::TowerPlace,
             Some(Action::TowerSell(_)) => Self::TowerSell,
             Some(Action::TowerUpgrade(_)) => Self::TowerUpgrade,

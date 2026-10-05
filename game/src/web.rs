@@ -392,6 +392,8 @@ fn send_initial_join(socket: &WebSocket, player_name: &str) -> Result<(), String
             recall_rules_hash: String::new(),
             mana_protocol_version: 0,
             mana_rules_hash: String::new(),
+            command_protocol_version: 0,
+            command_rules_hash: String::new(),
         },
     )
 }
